@@ -7,21 +7,15 @@ bool haveBackend()
 #ifdef HAVE_TRITON_BACKEND
     if (cuda::getCudaEnabledDeviceCount() < 1)
         return false;
-
-    // A CUDA context may not exist yet: cuCtxGetCurrent() returns null until
-    // the runtime has been touched, so probing on a cold process would report
-    // false for an otherwise working backend. That caught both the test suite
-    // (4800/4800 silently skipped) and the sample, so the query establishes
-    // the context itself rather than making every caller remember to.
-    try
-    {
-        cuda::GpuMat probe(1, 1, CV_8UC1);
-        probe.setTo(Scalar::all(0));
-    }
-    catch (const cv::Exception&)
-    {
-        return false;
-    }
+    // Pure query: no device memory is allocated and no work is submitted.
+    //
+    // It previously allocated a 1x1 GpuMat and called setTo purely to force a
+    // CUDA context into existence, because cuCtxGetCurrent() returns null on a
+    // cold process and the probe then reported false for a working backend
+    // (the test suite silently skipped all of its cases). Side-effecting
+    // "have" predicates are the wrong fix: no other cv::cuda:: predicate
+    // allocates. Context readiness is now the CUDA backend's concern, where
+    // the driver API it needs already lives.
     return backend::available(cuda::getDevice());
 #else
     return false;
@@ -47,6 +41,15 @@ void resize(InputArray, OutputArray, Size, double, double, int, cuda::Stream&)
 }
 
 #else
+
+/** Is this GpuMat a view into a larger allocation? */
+static bool isRoiView(const cuda::GpuMat& m)
+{
+    Size whole;
+    Point ofs;
+    m.locateROI(whole, ofs);
+    return ofs.x != 0 || ofs.y != 0 || whole != m.size();
+}
 
 static backend::ImageView viewOf(const cuda::GpuMat& m)
 {
@@ -96,14 +99,20 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
         CV_Error(Error::StsUnsupportedFormat,
                  "cv::triton::resize: fx/fy must be 0 while only explicit dsize is supported");
 
-    // A ROI source has a different addressing contract; reject rather than
-    // silently copying it to a contiguous buffer.
+    // A ROI view has a different addressing contract; reject rather than
+    // silently copying it to a contiguous buffer. Checked on BOTH sides: only
+    // the source was checked before, so a ROI destination reached the kernel
+    // with a pitch the artifact selection had not accounted for.
+    if (isRoiView(src))
+        CV_Error(Error::StsUnsupportedFormat,
+                 "cv::triton::resize: ROI source views are not supported in this round");
+    if (_dst.kind() == _InputArray::CUDA_GPU_MAT)
     {
-        Size whole; Point ofs;
-        src.locateROI(whole, ofs);
-        if (ofs.x != 0 || ofs.y != 0 || whole != src.size())
+        const cuda::GpuMat preDst = _dst.getGpuMat();
+        if (!preDst.empty() && isRoiView(preDst))
             CV_Error(Error::StsUnsupportedFormat,
-                     "cv::triton::resize: ROI source views are not supported in this round");
+                     "cv::triton::resize: ROI destination views are not supported "
+                     "in this round");
     }
 
     // Detect in-place BEFORE _dst.create(): create() may reallocate dst when
@@ -130,6 +139,13 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
     cuda::GpuMat dst = _dst.getGpuMat();
     CV_Assert(dst.rows == dsize.height && dst.cols == dsize.width);
     CV_Assert(dst.type() == src.type());
+    // create() returns the caller's buffer unchanged when the size already
+    // matches, so a ROI destination can still arrive here even though the
+    // pre-create check passed on an empty dst.
+    if (isRoiView(dst))
+        CV_Error(Error::StsUnsupportedFormat,
+                 "cv::triton::resize: ROI destination views are not supported "
+                 "in this round");
 
     if (dst.cudaPtr() == src.cudaPtr())
         CV_Error(Error::StsBadArg, "cv::triton::resize: in-place resize is not supported");

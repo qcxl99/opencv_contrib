@@ -174,6 +174,45 @@ CUDA_TEST_P(TritonResize, RejectsUnsupportedInputs)
         cuda::GpuMat roi = parent(Rect(8, 8, 64, 64));
         EXPECT_THROW(cv::triton::resize(roi, dst, Size(32, 32)), cv::Exception);
     }
+    // ROI DESTINATION. Checked separately because only the source was
+    // validated at first: a ROI dst reached the kernel with a pitch the
+    // artifact selection had not accounted for.
+    {
+        cuda::GpuMat parent(128, 128, CV_8UC1, Scalar::all(0));
+        cuda::GpuMat roiDst = parent(Rect(8, 8, 32, 32));
+        EXPECT_THROW(cv::triton::resize(u8c1, roiDst, Size(32, 32)), cv::Exception);
+    }
+    // A ROI dst whose size already matches dsize: create() returns it
+    // unchanged, so the post-create check is the one that must catch it.
+    {
+        cuda::GpuMat parent(256, 256, CV_8UC3, Scalar::all(0));
+        cuda::GpuMat roiDst = parent(Rect(16, 16, 64, 64));
+        cuda::GpuMat src3(128, 128, CV_8UC3, Scalar::all(7));
+        EXPECT_THROW(cv::triton::resize(src3, roiDst, Size(64, 64)), cv::Exception);
+    }
+}
+
+/** haveBackend() must be a pure query: no allocation, no submitted work.
+ *
+ *  It used to allocate a 1x1 GpuMat and call setTo just to force a context
+ *  into existence. Verified by comparing free device memory across repeated
+ *  calls, so a reintroduced allocation is caught rather than reviewed for. */
+CUDA_TEST_P(TritonResize, HaveBackendAllocatesNothing)
+{
+    if (!tritonReady())
+        throw SkipTestException("no Triton backend available");
+
+    size_t freeBefore = 0, totalBefore = 0;
+    cuda::DeviceInfo().queryMemory(freeBefore, totalBefore);
+
+    for (int i = 0; i < 64; ++i)
+        EXPECT_TRUE(cv::triton::haveBackend());
+    EXPECT_FALSE(cv::triton::backendName().empty());
+
+    size_t freeAfter = 0, totalAfter = 0;
+    cuda::DeviceInfo().queryMemory(freeAfter, totalAfter);
+    EXPECT_EQ(freeBefore, freeAfter)
+        << "haveBackend() changed free device memory; it must not allocate";
 }
 
 }}  // namespace opencv_test::<anonymous>

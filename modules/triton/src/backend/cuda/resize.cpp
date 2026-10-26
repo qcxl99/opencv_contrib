@@ -107,17 +107,33 @@ const char* name() { return "cuda-triton-aot"; }
 
 bool available(int device)
 {
-    CUcontext ctx = nullptr;
-    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || ctx == nullptr)
-        return false;
     // The artifact directory must exist and hold at least one variant.
     const std::string probe = std::string(artifactDir()) + "/linear_c1_sp1dp1ss1ds1.cubin";
     FILE* f = std::fopen(probe.c_str(), "rb");
     if (f == nullptr)
         return false;
     std::fclose(f);
-    (void)device;
-    return true;
+
+    // Context readiness WITHOUT allocating or submitting work. A cold process
+    // has no current context, so cuCtxGetCurrent() alone reported false for a
+    // perfectly usable backend. The driver's primary context for the device
+    // answers the real question -- can this device run our artifacts -- and
+    // retain/release is reference-counted, not an allocation.
+    if (cuInit(0) != CUDA_SUCCESS)
+        return false;
+
+    CUcontext current = nullptr;
+    if (cuCtxGetCurrent(&current) == CUDA_SUCCESS && current != nullptr)
+        return true;   // caller already has a context; nothing to probe
+
+    CUdevice dev = 0;
+    if (cuDeviceGet(&dev, device) != CUDA_SUCCESS)
+        return false;
+    CUcontext primary = nullptr;
+    if (cuDevicePrimaryCtxRetain(&primary, dev) != CUDA_SUCCESS)
+        return false;
+    cuDevicePrimaryCtxRelease(dev);
+    return primary != nullptr;
 }
 
 LaunchResult launchResize(const Context& c, const ResizeRequest& req)
