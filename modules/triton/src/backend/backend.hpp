@@ -17,8 +17,9 @@
 namespace cv { namespace triton { namespace backend {
 
 /** Device image description. Carries byte pitch, not element stride, because
- *  that is what the device pointer arithmetic needs. whole_* records the parent
- *  allocation so a ROI can be rejected rather than silently mis-addressed. */
+ *  that is what the device pointer arithmetic needs. whole_* records the
+ *  parent allocation so a ROI view addresses correctly rather than being
+ *  mistaken for a full, densely packed buffer. */
 struct ImageView
 {
     std::uintptr_t ptr = 0;
