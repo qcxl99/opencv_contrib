@@ -87,20 +87,34 @@ INSTANTIATE_TEST_CASE_P(CUDA_Triton, TritonResize, testing::Combine(
     testing::Values((int)INTER_NEAREST, (int)INTER_LINEAR),
     testing::Values(0, 1, 2, 3, 4)));
 
-// --- interop ------------------------------------------------------------
+// --- interop --------------------------------------------------------------
+//
+// These three were previously CUDA_TEST_P on the SAME 960-combination
+// TritonResize fixture as MatchesNativeCuda, but none of their bodies read
+// GetParam(): each ran the identical fixed check 960 times, so the reported
+// test count (and the 5760 total across all five tests in this file)
+// overstated how many distinct scenarios were actually exercised. They now
+// vary over channels x interpolation (4 combinations) -- real, cheap axes
+// each test's check plausibly depends on -- on their own small fixture.
 
-CUDA_TEST_P(TritonResize, ReusesOutputAndLeavesInputIntact)
+struct TritonResizeInterop : testing::TestWithParam<testing::tuple<int, int> > {};
+
+CUDA_TEST_P(TritonResizeInterop, ReusesOutputAndLeavesInputIntact)
 {
     if (!tritonReady())
         throw SkipTestException("no Triton backend available");
 
-    const Mat host = makePattern(480, 640, CV_8UC3, 0);
+    const int channels = testing::get<0>(GetParam());
+    const int interp    = testing::get<1>(GetParam());
+    const int type = CV_8UC(channels);
+
+    const Mat host = makePattern(480, 640, type, 0);
     cuda::GpuMat src(host);
-    cuda::GpuMat dst(240, 320, CV_8UC3);
+    cuda::GpuMat dst(240, 320, type);
     const void* addr = dst.cudaPtr();
 
     for (int i = 0; i < 3; ++i)
-        cv::triton::resize(src, dst, Size(320, 240), 0, 0, INTER_LINEAR);
+        cv::triton::resize(src, dst, Size(320, 240), 0, 0, interp);
     cuda::Stream::Null().waitForCompletion();
 
     EXPECT_EQ(addr, dst.cudaPtr()) << "preallocated output must not be reallocated";
@@ -110,40 +124,59 @@ CUDA_TEST_P(TritonResize, ReusesOutputAndLeavesInputIntact)
     EXPECT_EQ(0, cv::norm(host, back, NORM_INF)) << "input must not be modified";
 }
 
-CUDA_TEST_P(TritonResize, NonDefaultStreamMatches)
+CUDA_TEST_P(TritonResizeInterop, NonDefaultStreamMatches)
 {
     if (!tritonReady())
         throw SkipTestException("no Triton backend available");
 
-    const Mat host = makePattern(480, 640, CV_8UC1, 1);
+    const int channels = testing::get<0>(GetParam());
+    const int interp    = testing::get<1>(GetParam());
+    const int type = CV_8UC(channels);
+
+    const Mat host = makePattern(480, 640, type, 1);
     cuda::GpuMat src(host), a, b;
     cuda::Stream stream;
 
-    cv::triton::resize(src, a, Size(320, 240), 0, 0, INTER_LINEAR);
+    cv::triton::resize(src, a, Size(320, 240), 0, 0, interp);
     cuda::Stream::Null().waitForCompletion();
-    cv::triton::resize(src, b, Size(320, 240), 0, 0, INTER_LINEAR, stream);
+    cv::triton::resize(src, b, Size(320, 240), 0, 0, interp, stream);
     stream.waitForCompletion();
 
     EXPECT_MAT_NEAR(Mat(a), Mat(b), 0.0);
 }
 
-CUDA_TEST_P(TritonResize, OutputIsReallocatedWhenNeeded)
+CUDA_TEST_P(TritonResizeInterop, OutputIsReallocatedWhenNeeded)
 {
     if (!tritonReady())
         throw SkipTestException("no Triton backend available");
 
-    const Mat host = makePattern(64, 64, CV_8UC1, 0);
+    const int channels = testing::get<0>(GetParam());
+    const int interp    = testing::get<1>(GetParam());
+    const int type = CV_8UC(channels);
+
+    const Mat host = makePattern(64, 64, type, 0);
     cuda::GpuMat src(host);
     cuda::GpuMat dst;   // empty: create() must size it
-    cv::triton::resize(src, dst, Size(32, 32), 0, 0, INTER_NEAREST);
+    cv::triton::resize(src, dst, Size(32, 32), 0, 0, interp);
     cuda::Stream::Null().waitForCompletion();
     EXPECT_EQ(Size(32, 32), dst.size());
-    EXPECT_EQ(CV_8UC1, dst.type());
+    EXPECT_EQ(type, dst.type());
 }
 
-// --- declared error behaviour -------------------------------------------
+INSTANTIATE_TEST_CASE_P(CUDA_Triton, TritonResizeInterop, testing::Combine(
+    testing::Values(1, 3),
+    testing::Values((int)INTER_NEAREST, (int)INTER_LINEAR)));
 
-CUDA_TEST_P(TritonResize, RejectsUnsupportedInputs)
+// --- declared error behaviour -----------------------------------------
+//
+// Neither check below has a parameter it plausibly depends on: the inputs
+// EXERCISED are the point of the test (float depth, 4 channels, ROI, ...),
+// not an external axis like channels/interp/pattern. Previously CUDA_TEST_P
+// on the same 960-combination fixture for the same reason as the interop
+// tests above; now a single CUDA_TEST so the count reflects what is
+// actually checked.
+
+TEST(TritonResize, RejectsUnsupportedInputs)
 {
     if (!tritonReady())
         throw SkipTestException("no Triton backend available");
@@ -168,27 +201,67 @@ CUDA_TEST_P(TritonResize, RejectsUnsupportedInputs)
     EXPECT_THROW(cv::triton::resize(u8c1, dst, Size(), 0.5, 0.5), cv::Exception);
     // in-place
     EXPECT_THROW(cv::triton::resize(u8c1, u8c1, Size(32, 32)), cv::Exception);
-    // ROI source
+}
+
+/** ROI src/dst are supported, not rejected: viewOf() carries the real device
+ *  row pitch (step) and parent offset, which the CUDA backend already keys
+ *  artifact selection on (see backend/cuda/resize.cpp). Each sub-case here
+ *  used to be a rejection case before ROI support was added; now each is
+ *  checked for correctness against cuda::resize on the same ROI view. */
+TEST(TritonResize, AcceptsRoiSrcAndDst)
+{
+    if (!tritonReady())
+        throw SkipTestException("no Triton backend available");
+
+    // ROI source.
     {
-        cuda::GpuMat parent(128, 128, CV_8UC1, Scalar::all(0));
+        const Mat host = makePattern(128, 128, CV_8UC1, 0);
+        cuda::GpuMat parent(host);
         cuda::GpuMat roi = parent(Rect(8, 8, 64, 64));
-        EXPECT_THROW(cv::triton::resize(roi, dst, Size(32, 32)), cv::Exception);
+
+        cuda::GpuMat expected, actual;
+        cuda::resize(roi, expected, Size(32, 32), 0, 0, INTER_LINEAR);
+        cv::triton::resize(roi, actual, Size(32, 32), 0, 0, INTER_LINEAR);
+        cuda::Stream::Null().waitForCompletion();
+
+        EXPECT_MAT_NEAR(Mat(expected), Mat(actual), 0.0);
     }
-    // ROI DESTINATION. Checked separately because only the source was
-    // validated at first: a ROI dst reached the kernel with a pitch the
-    // artifact selection had not accounted for.
+    // ROI destination, empty on entry: create() must size it in place inside
+    // the parent allocation without disturbing the parent's other pixels.
     {
+        const Mat host = makePattern(64, 64, CV_8UC1, 1);
+        cuda::GpuMat src(host);
         cuda::GpuMat parent(128, 128, CV_8UC1, Scalar::all(0));
         cuda::GpuMat roiDst = parent(Rect(8, 8, 32, 32));
-        EXPECT_THROW(cv::triton::resize(u8c1, roiDst, Size(32, 32)), cv::Exception);
+
+        cv::triton::resize(src, roiDst, Size(32, 32), 0, 0, INTER_LINEAR);
+        cuda::Stream::Null().waitForCompletion();
+
+        cuda::GpuMat expected;
+        cuda::resize(src, expected, Size(32, 32), 0, 0, INTER_LINEAR);
+        EXPECT_MAT_NEAR(Mat(expected), Mat(roiDst), 0.0);
+
+        Mat parentHost;
+        parent.download(parentHost);
+        Mat outsideMask = Mat::ones(128, 128, CV_8UC1);
+        outsideMask(Rect(8, 8, 32, 32)).setTo(Scalar::all(0));
+        EXPECT_EQ(0, cv::countNonZero(parentHost.mul(outsideMask)))
+            << "resize into a ROI destination must not touch pixels outside the ROI";
     }
     // A ROI dst whose size already matches dsize: create() returns it
-    // unchanged, so the post-create check is the one that must catch it.
+    // unchanged, so this exercises the post-create path specifically.
     {
         cuda::GpuMat parent(256, 256, CV_8UC3, Scalar::all(0));
         cuda::GpuMat roiDst = parent(Rect(16, 16, 64, 64));
-        cuda::GpuMat src3(128, 128, CV_8UC3, Scalar::all(7));
-        EXPECT_THROW(cv::triton::resize(src3, roiDst, Size(64, 64)), cv::Exception);
+        const Mat host = makePattern(128, 128, CV_8UC3, 2);
+        cuda::GpuMat src3(host);
+
+        cv::triton::resize(src3, roiDst, Size(64, 64), 0, 0, INTER_LINEAR);
+        cuda::Stream::Null().waitForCompletion();
+
+        cuda::GpuMat expected;
+        cuda::resize(src3, expected, Size(64, 64), 0, 0, INTER_LINEAR);
+        EXPECT_MAT_NEAR(Mat(expected), Mat(roiDst), 0.0);
     }
 }
 
@@ -197,7 +270,7 @@ CUDA_TEST_P(TritonResize, RejectsUnsupportedInputs)
  *  It used to allocate a 1x1 GpuMat and call setTo just to force a context
  *  into existence. Verified by comparing free device memory across repeated
  *  calls, so a reintroduced allocation is caught rather than reviewed for. */
-CUDA_TEST_P(TritonResize, HaveBackendAllocatesNothing)
+TEST(TritonResize, HaveBackendAllocatesNothing)
 {
     if (!tritonReady())
         throw SkipTestException("no Triton backend available");

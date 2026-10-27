@@ -42,15 +42,6 @@ void resize(InputArray, OutputArray, Size, double, double, int, cuda::Stream&)
 
 #else
 
-/** Is this GpuMat a view into a larger allocation? */
-static bool isRoiView(const cuda::GpuMat& m)
-{
-    Size whole;
-    Point ofs;
-    m.locateROI(whole, ofs);
-    return ofs.x != 0 || ofs.y != 0 || whole != m.size();
-}
-
 static backend::ImageView viewOf(const cuda::GpuMat& m)
 {
     Size whole;
@@ -99,21 +90,12 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
         CV_Error(Error::StsUnsupportedFormat,
                  "cv::triton::resize: fx/fy must be 0 while only explicit dsize is supported");
 
-    // A ROI view has a different addressing contract; reject rather than
-    // silently copying it to a contiguous buffer. Checked on BOTH sides: only
-    // the source was checked before, so a ROI destination reached the kernel
-    // with a pitch the artifact selection had not accounted for.
-    if (isRoiView(src))
-        CV_Error(Error::StsUnsupportedFormat,
-                 "cv::triton::resize: ROI source views are not supported in this round");
-    if (_dst.kind() == _InputArray::CUDA_GPU_MAT)
-    {
-        const cuda::GpuMat preDst = _dst.getGpuMat();
-        if (!preDst.empty() && isRoiView(preDst))
-            CV_Error(Error::StsUnsupportedFormat,
-                     "cv::triton::resize: ROI destination views are not supported "
-                     "in this round");
-    }
+    // ROI src/dst are supported: viewOf() carries whole_rows/whole_cols/offset_*
+    // and the real device row pitch (step), which the CUDA backend already uses
+    // for addressing and artifact selection (see backend/cuda/resize.cpp). A
+    // GpuMat ROI is always row-sliced with dense, channel-packed rows -- the
+    // same row-pitched contract the Python kernel's _check_row_pitched enforces
+    // for strided tensor views -- so no additional validation is needed here.
 
     // Detect in-place BEFORE _dst.create(): create() may reallocate dst when
     // the requested size differs, after which dst.cudaPtr() no longer equals
@@ -139,13 +121,6 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
     cuda::GpuMat dst = _dst.getGpuMat();
     CV_Assert(dst.rows == dsize.height && dst.cols == dsize.width);
     CV_Assert(dst.type() == src.type());
-    // create() returns the caller's buffer unchanged when the size already
-    // matches, so a ROI destination can still arrive here even though the
-    // pre-create check passed on an empty dst.
-    if (isRoiView(dst))
-        CV_Error(Error::StsUnsupportedFormat,
-                 "cv::triton::resize: ROI destination views are not supported "
-                 "in this round");
 
     if (dst.cudaPtr() == src.cudaPtr())
         CV_Error(Error::StsBadArg, "cv::triton::resize: in-place resize is not supported");
