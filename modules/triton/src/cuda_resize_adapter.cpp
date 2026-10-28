@@ -82,6 +82,29 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
     // ROI src/dst are supported -- see the note in core_resize.cpp's
     // resizeCore() for why no addressing gate is needed here either.
 
+    // Detect in-place BEFORE _dst.create(): create() may reallocate dst when
+    // the requested size differs from its current size, after which
+    // dst.cudaPtr() no longer equals src.cudaPtr() and the aliasing is
+    // invisible to resizeCore()'s post-create pointer check below. Compare
+    // the caller's arrays as given, not the post-create buffers.
+    //
+    // This check was dropped when this file was split out of the former
+    // resize.cpp (see opencv_contrib@b8a2073, which added it originally),
+    // and its loss was silent: resizeCore()'s own overlap check is correct
+    // on its own terms, it just runs too late to see this specific case.
+    // Caught by TritonResize.RejectsUnsupportedInputs's in-place sub-case
+    // (`cv::triton::resize(u8c1, u8c1, Size(32, 32))` on a 64x64 u8c1 --
+    // dsize differs from src's size, so create() reallocates dst to a new
+    // address before resizeCore() ever sees it, and the post-create check
+    // then compares two already-different pointers and finds nothing wrong).
+    if (_dst.kind() == _InputArray::CUDA_GPU_MAT)
+    {
+        const cuda::GpuMat preDst = _dst.getGpuMat();
+        if (!preDst.empty() && preDst.cudaPtr() == src.cudaPtr())
+            CV_Error(Error::StsBadArg,
+                     "cv::triton::resize: in-place resize is not supported");
+    }
+
     // --- prepare the output, THEN read its address -------------------------
     // create() may reallocate, so the pointer, step and ownership must be
     // re-read afterwards rather than captured before.
