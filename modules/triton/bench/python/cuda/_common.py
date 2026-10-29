@@ -30,12 +30,13 @@ from pathlib import Path
 # Default assumes this file sits two levels inside a kernelforge-lab-shaped
 # checkout (<repo>/bench/_common.py), which is true in kernelforge-lab
 # itself but NOT here (this copy lives at
-# modules/triton/bench/_common.py, inside the opencv_contrib tree, not
-# inside kernelforge-lab). Point KERNELFORGE_LAB_ROOT at a kernelforge-lab
-# checkout to run these from here; the bare default is kept so this file
-# stays otherwise identical to the one in kernelforge-lab's own bench/.
+# modules/triton/bench/python/cuda/_common.py, inside the opencv_contrib
+# tree, three levels deeper than kernelforge-lab's own bench/_common.py).
+# Point KERNELFORGE_LAB_ROOT at a kernelforge-lab checkout to run these
+# from here; the bare default mirrors kernelforge-lab's own two-levels-up
+# derivation, adjusted for this copy's extra depth (python/cuda/).
 _override = os.environ.get("KERNELFORGE_LAB_ROOT")
-REPO = Path(_override).resolve() if _override else Path(__file__).resolve().parent.parent
+REPO = Path(_override).resolve() if _override else Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "operators" / "resize"))
 
@@ -82,12 +83,12 @@ def print_correctness_result(mode: str, res) -> bool:
 
 def print_performance_result(result: dict) -> None:
     """Print every metric benchmark_case() actually collected, not just
-    graph_replay. A case's own CaseTiming.summarise() always carries all
-    four auxiliary metrics (host_wall_sync, host_issue_cost, graph_replay,
-    cold_start) in `auxiliary`, keyed by kernelforge.benchmark's own
-    M_HOST_WALL/M_HOST_ISSUE/M_GRAPH_REPLAY/M_COLD_START constants --
-    printing only graph_replay (as this function originally did) threw
-    the other three away even though they were already computed, not
+    graph_replay. A case's own CaseTiming.summarise() always carries five
+    auxiliary metrics (host_wall_sync, host_issue_cost, graph_replay,
+    cold_start, device_steady_state_cold) in `auxiliary`, keyed by
+    kernelforge.benchmark's own M_HOST_WALL/M_HOST_ISSUE/M_GRAPH_REPLAY/
+    M_COLD_START/M_DEVICE_STEADY_COLD constants -- printing only a subset
+    throws the rest away even though they were already computed, not
     missing.
     """
     for r in result["per_case"]:
@@ -132,6 +133,15 @@ def print_performance_result(result: dict) -> None:
         if cold.get("candidate_ms") is not None:
             parts.append(f"cold_start: cand={cold['candidate_ms']:.4f}ms")
 
+        steady_cold = aux.get(B.M_DEVICE_STEADY_COLD, {})
+        if steady_cold.get("speedup") is not None:
+            parts.append(f"device_steady_state_cold: cand={steady_cold['candidate_ms']:.4f}ms "
+                         f"base={steady_cold['baseline_ms']:.4f}ms "
+                         f"speedup={steady_cold['speedup']:.3f}x")
+        elif steady_cold.get("candidate_ms") is not None:
+            parts.append(f"device_steady_state_cold: cand={steady_cold['candidate_ms']:.4f}ms "
+                         f"(no baseline)")
+
         for p in parts:
             print(f"      {p}")
 
@@ -166,6 +176,36 @@ def paired_alternating_graph_replay(fn_a, fn_b, stream, block_iters: int,
         else:
             tb = B._graph_replay_ms(fn_b, stream, block_iters, graph_batch)
             ta = B._graph_replay_ms(fn_a, stream, block_iters, graph_batch)
+        if ta and tb:
+            ratios.append(tb / ta)
+    if not ratios:
+        return None, None, None
+    ratios.sort()
+    lo, hi, med = ratios[0], ratios[-1], ratios[len(ratios) // 2]
+    return lo, hi, med
+
+
+def paired_alternating_device_steady_cold(fn_a, fn_b, stream, block_iters: int,
+                                          blocks: int = 7):
+    """Median speedup of fn_b/fn_a over `blocks` alternating-order repeats,
+    on the device_steady_state_cold boundary (_device_block_ms_cold: same
+    device-event-timed boundary as the primary metric, 60MB L2 flushed
+    before every call -- see kernelforge.benchmark.M_DEVICE_STEADY_COLD).
+
+    Structural twin of paired_alternating_graph_replay above, for the same
+    reason batch needs its own helper (no cases.yaml entry, so
+    benchmark_case() is not reachable) and with the same two disciplines:
+    alternate which side runs first, take the median not a mean.
+    """
+    ratios = []
+    for b in range(blocks):
+        a_first = (b % 2 == 0)
+        if a_first:
+            ta = B._device_block_ms_cold(fn_a, stream, block_iters)
+            tb = B._device_block_ms_cold(fn_b, stream, block_iters)
+        else:
+            tb = B._device_block_ms_cold(fn_b, stream, block_iters)
+            ta = B._device_block_ms_cold(fn_a, stream, block_iters)
         if ta and tb:
             ratios.append(tb / ta)
     if not ratios:

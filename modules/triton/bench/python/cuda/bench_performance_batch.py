@@ -24,7 +24,7 @@ import sys
 import numpy as np
 import torch
 
-from _common import K, paired_alternating_graph_replay
+from _common import K, paired_alternating_device_steady_cold, paired_alternating_graph_replay
 
 BATCH_CASES = [
     ("batch_linear_n8_c3", "INTER_LINEAR", 8, 480, 640, 240, 320, 3),
@@ -67,8 +67,24 @@ def main() -> int:
         if med is None:
             print(f"  {name:24s} ALL_GRAPH_CAPTURE_FAILED")
             continue
-        print(f"  {name:24s} n={n:3d} speedup(loop/batch)=[{lo:.3f},{hi:.3f}] "
+        print(f"  {name:24s} n={n:3d} graph_replay speedup(loop/batch)=[{lo:.3f},{hi:.3f}] "
               f"median={med:.3f}x")
+
+        clo, chi, cmed = paired_alternating_device_steady_cold(
+            batched, loop_of_singles, st, BLOCK_ITERS)
+        if cmed is None:
+            print(f"  {'':24s} device_steady_state_cold ALL_PAIRS_FAILED")
+        else:
+            print(f"  {'':24s} device_steady_state_cold speedup(loop/batch)="
+                  f"[{clo:.3f},{chi:.3f}] median={cmed:.3f}x")
+
+    print("\nNote: device_steady_state_cold gives each call one event pair, so the "
+          "loop-of-singles side brackets n separate launches including the host "
+          "submission gaps between them. That side is submission-bound, which "
+          "inflates this ratio far past the graph_replay one (the launch-gap "
+          "contamination benchmark_case() flags as launch_gap_dominated). Read "
+          "graph_replay as the batch-vs-loop comparison; this line is the "
+          "cache-cold cost, not a kernel-only ratio.")
     return 0
 
 

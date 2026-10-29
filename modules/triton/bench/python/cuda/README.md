@@ -1,9 +1,13 @@
-# bench/ -- CUDA-only, from kernelforge-lab
+# bench/python/cuda/ -- CUDA-only, from kernelforge-lab
 
 **Platform: CUDA (NVIDIA, e.g. H20) only.** Nothing in this directory runs
 on the HIP/BW1000 backend (`src/backend/hip/resize.cpp`,
-`TRITON_BACKEND_HIP`). These scripts call kernelforge-lab's own CUDA Triton
-kernel (`operators/resize/kernel.py`) and `cv::cuda::resize`
+`TRITON_BACKEND_HIP`). The `python/<platform>/` layout exists so a future
+HIP/BW1000 counterpart (if one is ever added) lives at `bench/python/hip/`
+as its own sibling directory, never mixed into this one.
+
+These scripts call kernelforge-lab's own CUDA Triton kernel
+(`operators/resize/kernel.py`) and `cv::cuda::resize`
 (`operators/resize/oracle_cuda.py`) through kernelforge-lab's own
 ctypes/AOT layer and `cases.yaml` suite -- not through this module's
 `cv::triton` C++ API, and not through this module's CMake build at all.
@@ -13,9 +17,9 @@ They are carried in here as reference/companion material from the sibling
 resize kernel this module's CUDA backend wraps), not as part of this
 module's own test/perf suite. For this module's own CUDA test/perf
 coverage (CMake-driven, `ocv_add_accuracy_tests`/`ocv_add_perf_tests`), see
-`../test/test_resize.cpp` and `../perf/perf_resize.cpp` -- those are also
-CUDA-only today; the HIP backend currently has no test or perf coverage at
-all (tracked separately, not addressed by this directory).
+`../../../test/test_resize.cpp` and `../../../perf/perf_resize.cpp` --
+those are also CUDA-only today; the HIP backend currently has no test or
+perf coverage at all (tracked separately, not addressed by this directory).
 
 ## Running
 
