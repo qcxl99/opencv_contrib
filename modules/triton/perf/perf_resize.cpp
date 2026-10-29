@@ -154,4 +154,78 @@ PERF_TEST_P(Sz_Dsize_Cn_Interp_Depth, NativeCudaResizeCubic_Reference, testing::
     CUDA_SANITY_CHECK(dst, 1e-10);
 }
 
+// AREA on its own fixture, same reasoning as CUBIC above: a cost profile
+// (two different compiled formulas, IntegerAreaFilter vs AreaFilter,
+// selected by whether the ratio is an exact integer) not comparable
+// case-for-case to LINEAR/NEAREST/CUBIC's fixtures. Downscale-only
+// geometries, deliberately: an upscale-or-identity-on-either-axis AREA
+// call aliases to LINEAR semantics before this module's backend ever
+// sees it (resize.cu:736-737), so an upscale case here would just
+// re-measure the LINEAR fixture above under a different name. The two
+// Dsize values are chosen to land on each of AREA's two branches at a
+// realistic ratio: 1280x720 is an exact 2x/3x-ish integer ratio from each
+// Sz value (IntegerAreaFilter), 853x480 is not (AreaFilter).
+PERF_TEST_P(Sz_Dsize_Cn_Interp, TritonResizeArea, testing::Combine(
+    testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
+    testing::Values(cv::Size(640, 360), cv::Size(853, 480)),
+    testing::Values(1, 3, 4),
+    testing::Values((int)cv::INTER_AREA)))
+{
+    const cv::Size srcSize = GET_PARAM(0);
+    const cv::Size dsize   = GET_PARAM(1);
+    const int channels     = GET_PARAM(2);
+    const int interp       = GET_PARAM(3);
+
+    if (!cv::triton::haveBackend())
+        throw SkipTestException("no Triton backend available");
+
+    cv::Mat host(srcSize, CV_8UC(channels));
+    declare.in(host, WARMUP_RNG);
+
+    const cv::cuda::GpuMat src(host);
+    cv::cuda::GpuMat dst(dsize, src.type());
+
+    for (int i = 0; i < 20; ++i)
+        cv::triton::resize(src, dst, dsize, 0, 0, interp);
+    cv::cuda::Stream::Null().waitForCompletion();
+
+    TEST_CYCLE()
+    {
+        cv::triton::resize(src, dst, dsize, 0, 0, interp);
+        cv::cuda::Stream::Null().waitForCompletion();
+    }
+
+    CUDA_SANITY_CHECK(dst, 1e-10);
+}
+
+PERF_TEST_P(Sz_Dsize_Cn_Interp, NativeCudaResizeArea_Reference, testing::Combine(
+    testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
+    testing::Values(cv::Size(640, 360), cv::Size(853, 480)),
+    testing::Values(1, 3, 4),
+    testing::Values((int)cv::INTER_AREA)))
+{
+    const cv::Size srcSize = GET_PARAM(0);
+    const cv::Size dsize   = GET_PARAM(1);
+    const int channels     = GET_PARAM(2);
+    const int interp       = GET_PARAM(3);
+
+    cv::Mat host(srcSize, CV_8UC(channels));
+    declare.in(host, WARMUP_RNG);
+
+    const cv::cuda::GpuMat src(host);
+    cv::cuda::GpuMat dst(dsize, src.type());
+
+    for (int i = 0; i < 20; ++i)
+        cv::cuda::resize(src, dst, dsize, 0, 0, interp);
+    cv::cuda::Stream::Null().waitForCompletion();
+
+    TEST_CYCLE()
+    {
+        cv::cuda::resize(src, dst, dsize, 0, 0, interp);
+        cv::cuda::Stream::Null().waitForCompletion();
+    }
+
+    CUDA_SANITY_CHECK(dst, 1e-10);
+}
+
 }}  // namespace opencv_test::<anonymous>

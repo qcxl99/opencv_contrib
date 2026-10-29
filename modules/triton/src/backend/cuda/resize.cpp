@@ -10,6 +10,7 @@
 
 #ifdef HAVE_TRITON_BACKEND
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,8 @@
 #include <string>
 
 #include <cuda.h>
+
+#include "opencv2/core/persistence.hpp"
 
 namespace cv { namespace triton { namespace backend {
 
@@ -32,6 +35,32 @@ struct Artifact
     int num_warps = 4;
     int shared_bytes = 0;
 };
+
+// AREA's INTEGER_RATIO classification -- an exact port of kernelforge-lab's
+// own check (abs(fx - round(fx)) < FLT_MIN), ported via the kernelforge-lab
+// bridge's area_integer_ratio() (bridge/triton_resize_launcher.cpp), not an
+// approximation: this selects between two DIFFERENT compiled formulas
+// (IntegerAreaFilter vs AreaFilter), so a looser or tighter threshold than
+// the kernel's own test would pick the wrong cubin for a borderline ratio.
+bool areaIntegerRatio(double scaleX, double scaleY)
+{
+    constexpr float kFltMin = 1.1754944e-38f;
+    const float fx = static_cast<float>(scaleX);
+    const float fy = static_cast<float>(scaleY);
+    const float ix = std::round(fx);
+    const float iy = std::round(fy);
+    return std::fabs(fx - ix) < kFltMin && std::fabs(fy - iy) < kFltMin;
+}
+
+// AREA's own tap-count computation -- an exact port of kernelforge-lab's
+// _area_tap_bucket()/area_tap_bucket(): max(1, ceil(scale)), a plain
+// runtime value, NOT a compiled-artifact key axis (see
+// tools/compile_resize.py's module docstring).
+int areaTapCount(double scale)
+{
+    int need = static_cast<int>(std::ceil(scale));
+    return (need < 1) ? 1 : need;
+}
 
 // Keyed by (context, variant) so a module is loaded once per context and
 // reused. Loading is first-use only and therefore outside steady-state timing.
@@ -65,7 +94,8 @@ const char* artifactDir()
 std::string variantName(const ResizeRequest& req)
 {
     const char* mode = (req.interpolation == INTER_CUBIC) ? "cubic"
-                      : (req.interpolation == INTER_LINEAR) ? "linear" : "nearest";
+                      : (req.interpolation == INTER_LINEAR) ? "linear"
+                      : (req.interpolation == INTER_AREA) ? "area" : "nearest";
     const char* dtype = (req.src.depth() == CV_32F) ? "f32" : "u8";
     // The stride divisibility bit must be computed on the SAME unit the
     // kernel argument actually carries -- element count, not bytes (see
@@ -79,7 +109,22 @@ std::string variantName(const ResizeRequest& req)
     const int elem_size = CV_ELEM_SIZE1(req.src.type);  // dst shares src's depth (checked in resizeCore)
     const long src_stride_elems = static_cast<long>(req.src.step) / elem_size;
     const long dst_stride_elems = static_cast<long>(req.dst.step) / elem_size;
-    char buf[64];
+    char buf[80];
+    if (req.interpolation == INTER_AREA)
+    {
+        // Fifth key axis vs the other three modes: INTEGER_RATIO, resolved
+        // from req.fx/req.fy -- the SAME scale_x/scale_y launchResize()
+        // computes its tap counts from, so key resolution and launch
+        // cannot disagree on a borderline ratio.
+        const bool integerRatio = areaIntegerRatio(req.fx, req.fy);
+        std::snprintf(buf, sizeof(buf), "area_%s_c%d_ir%d_sp%ddp%dss%dds%d",
+                      dtype, req.src.channels(), integerRatio ? 1 : 0,
+                      (req.src.ptr % 16 == 0) ? 1 : 0,
+                      (req.dst.ptr % 16 == 0) ? 1 : 0,
+                      (src_stride_elems % 16 == 0) ? 1 : 0,
+                      (dst_stride_elems % 16 == 0) ? 1 : 0);
+        return std::string(buf);
+    }
     std::snprintf(buf, sizeof(buf), "%s_%s_c%d_sp%ddp%dss%dds%d",
                   mode, dtype, req.src.channels(),
                   (req.src.ptr % 16 == 0) ? 1 : 0,
@@ -89,11 +134,70 @@ std::string variantName(const ResizeRequest& req)
     return std::string(buf);
 }
 
-int sharedBytesFor(const std::string& variant)
+// Per-variant block_h/block_w/num_warps/shared_bytes, read from
+// kernels_manifest.json rather than hardcoded: these are NOT a simple
+// function of the variant string. linear/nearest/cubic share one launch
+// config and shared_bytes==0 for all of them (compile_resize.py's BLOCK_H,
+// BLOCK_W, NUM_WARPS = 1, 256, 4), so a hardcoded heuristic happened to
+// work by accident for those three. AREA breaks that: it is compiled
+// under its OWN config (AREA_BLOCK_H/BLOCK_W/NUM_WARPS = 1, 128, 2,
+// different from the other three -- launching at the wrong one is a
+// grid/block mismatch, cuLaunchKernel returns CUDA_ERROR_INVALID_VALUE),
+// AND its shared-memory usage is genuinely data-dependent in a way no
+// variant-string pattern predicts: among channels=1, dst_ptr_div16=1,
+// dst_stride_div16=1 variants specifically, 4 have shared_bytes==0 and 12
+// have shared_bytes==512, with no other key bit distinguishing them --
+// confirmed by reading the real manifest, not inferred. The manifest is
+// the one place Triton's own compiled metadata (k.metadata.shared) is
+// recorded, so this reads it directly via cv::FileStorage (already an
+// opencv_core dependency, avoiding a new third-party JSON library) rather
+// than re-deriving a heuristic that would need to be correct for every
+// current AND future mode.
+struct ManifestEntry
 {
-    // Recorded per variant in the manifest; the aligned-destination variants
-    // request a small dynamic allocation.
-    return (variant.find("ds1") != std::string::npos) ? 256 : 0;
+    int block_h = 1;
+    int block_w = 256;
+    int num_warps = 4;
+    int shared_bytes = 0;
+};
+
+std::map<std::string, ManifestEntry> g_manifest;
+std::mutex g_manifest_mutex;
+bool g_manifest_loaded = false;
+
+bool loadManifestEntry(const std::string& variant, ManifestEntry& out)
+{
+    std::lock_guard<std::mutex> lock(g_manifest_mutex);
+    if (!g_manifest_loaded)
+    {
+        g_manifest_loaded = true;  // attempt exactly once; a missing/unreadable
+                                   // manifest falls back to the struct defaults
+                                   // below for every variant, same as before
+                                   // this fix existed for linear/nearest/cubic.
+        // artifactDir() is ".../generated/cuda"; the manifest is one level up.
+        const std::string manifestPath =
+            std::string(artifactDir()) + "/../kernels_manifest.json";
+        cv::FileStorage fs(manifestPath, cv::FileStorage::READ);
+        if (fs.isOpened())
+        {
+            cv::FileNode variants = fs["variants"];
+            for (cv::FileNodeIterator it = variants.begin(); it != variants.end(); ++it)
+            {
+                cv::FileNode v = *it;
+                ManifestEntry e;
+                e.block_h = (int)v["block_h"];
+                e.block_w = (int)v["block_w"];
+                e.num_warps = (int)v["num_warps"];
+                e.shared_bytes = (int)v["shared_bytes"];
+                g_manifest[v.name()] = e;
+            }
+        }
+    }
+    auto it = g_manifest.find(variant);
+    if (it == g_manifest.end())
+        return false;
+    out = it->second;
+    return true;
 }
 
 bool loadArtifact(CUcontext ctx, const std::string& variant, Artifact& out)
@@ -107,6 +211,7 @@ bool loadArtifact(CUcontext ctx, const std::string& variant, Artifact& out)
     // one function name serves both nearest_u8 and nearest_f32 variants.
     const char* fn = (variant.rfind("linear_", 0) == 0) ? "_resize_linear_kernel"
                     : (variant.rfind("cubic_", 0) == 0)  ? "_resize_cubic_kernel"
+                    : (variant.rfind("area_", 0) == 0)   ? "_resize_area_kernel"
                                                           : "_resize_nearest_kernel";
 
     CUresult r = cuModuleLoad(&out.module, path.c_str());
@@ -123,7 +228,21 @@ bool loadArtifact(CUcontext ctx, const std::string& variant, Artifact& out)
         std::snprintf(g_error, sizeof(g_error), "cuModuleGetFunction(%s) failed", fn);
         return false;
     }
-    out.shared_bytes = sharedBytesFor(variant);
+    ManifestEntry entry;
+    if (loadManifestEntry(variant, entry))
+    {
+        out.block_h = entry.block_h;
+        out.block_w = entry.block_w;
+        out.num_warps = entry.num_warps;
+        out.shared_bytes = entry.shared_bytes;
+    }
+    // else: manifest unreadable or variant not found in it -- out keeps the
+    // Artifact struct's default-member values (1, 256, 4, 0), the same
+    // values every variant silently launched at before this fix existed.
+    // That is a real risk for a variant genuinely needing something else,
+    // but a missing/corrupt manifest at this point means the artifact
+    // directory itself is suspect, and failing differently (wrong launch
+    // geometry vs. a hard error) is not this function's call to make.
     if (out.shared_bytes > 0)
         cuFuncSetAttribute(out.function,
                            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -247,11 +366,34 @@ LaunchResult launchResize(const Context& c, const ResizeRequest& req)
     void* dst_ptr = reinterpret_cast<void*>(req.dst.ptr);
     void* scratch = nullptr;
 
-    void* params[] = { &src_ptr, &dst_ptr,
-                       &src_h, &src_w, &dst_h, &dst_w,
-                       &src_step, &dst_step,
-                       &fx, &fy,
-                       &scratch, &scratch };
+    // AREA's parameter ABI differs from the other three modes: scale_x/
+    // scale_y (f32, same quantity as fx/fy above -- AREA's own kernel
+    // parameter names) are followed by max_taps_x/max_taps_y (u32,
+    // inserted here, no other mode's ABI has these two slots) before the
+    // trailing scratch pointers. Computed from the SAME fx/fy variantName()
+    // used to resolve integer_ratio, so key resolution and launch cannot
+    // disagree on a borderline ratio -- same discipline kernelforge-lab's
+    // own launch_area()/kf_launcher_resolve_area_key() apply.
+    int max_taps_x = areaTapCount(fx);
+    int max_taps_y = areaTapCount(fy);
+
+    // cuLaunchKernel's kernelParams has no sentinel or separate count: the
+    // driver reads exactly as many entries as the KERNEL's own compiled
+    // signature declares, so params must be sized and ordered to match
+    // whichever ABI this call's kernel was compiled with -- no shared
+    // fixed-size buffer across the two shapes.
+    void* area_params[] = { &src_ptr, &dst_ptr,
+                            &src_h, &src_w, &dst_h, &dst_w,
+                            &src_step, &dst_step,
+                            &fx, &fy,
+                            &max_taps_x, &max_taps_y,
+                            &scratch, &scratch };
+    void* other_params[] = { &src_ptr, &dst_ptr,
+                             &src_h, &src_w, &dst_h, &dst_w,
+                             &src_step, &dst_step,
+                             &fx, &fy,
+                             &scratch, &scratch };
+    void** params = (req.interpolation == INTER_AREA) ? area_params : other_params;
 
     const CUresult r = cuLaunchKernel(
         art.function,

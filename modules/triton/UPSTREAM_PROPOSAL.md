@@ -68,22 +68,35 @@ dispatch layer. **The HIP backend has not been validated on real BW1000
 hardware** — it compiles and the artifact-loading path mirrors the CUDA one,
 but this is explicitly unverified, not merely untested-by-omission.
 
-## 3. Supported subset (first round)
+## 3. Supported subset (current)
 
 | dimension | supported | rejected (raises `StsUnsupportedFormat`, never silently coerced) |
 |---|---|---|
-| depth | `CV_8U` | `CV_32F`, `CV_16U`, `CV_16S`, `CV_64F` |
-| channels | 1, 3 | 2, 4 |
-| interpolation | `INTER_NEAREST`, `INTER_LINEAR` | `INTER_AREA`, `INTER_CUBIC`, `INTER_LANCZOS4` |
-| sizing | explicit `dsize` | `fx`/`fy` scale factors |
+| depth | `CV_8U`, `CV_32F` | `CV_16U`, `CV_16S`, `CV_64F` |
+| channels | 1, 3, 4 | 2 |
+| interpolation | `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC`, `INTER_AREA` | `INTER_LANCZOS4` |
+| sizing | explicit `dsize`, or `fx`/`fy` scale factors | neither given, or `fx`/`fy` non-positive |
 | layout | ROI src/dst (row-pitch addressing, not full-contiguity) | permuted/transposed views |
 | batching | single image | N/A — no OpenCV type represents a batch of GpuMats |
 
-Semantics match `cv::cuda::resize` **bit-exactly** for this subset (not
-OpenCV CPU `resize` — the CUDA LINEAR rule has no half-pixel shift, so CPU
-and CUDA disagree by design; the test suite checks against `cv::cuda`, not
-CPU). There is no implicit fallback to CPU or to `cv::cuda`: a call that
-returns without throwing has executed the Triton kernel.
+Semantics match `cv::cuda::resize` **bit-exactly** for LINEAR/NEAREST/AREA
+(not OpenCV CPU `resize` — the CUDA LINEAR rule has no half-pixel shift, so
+CPU and CUDA disagree by design; the test suite checks against `cv::cuda`,
+not CPU). CUBIC is held to atol<=1 (uint8) / 1e-1 (float32), not
+bit-exactness: the reference's own compiled CUBIC kernel has a sparse
+FMA-contraction tie-break that survives pinning every multiply/FMA on this
+side. AREA has ONE known exception to bit-exactness, found by this
+round's own test grid rather than asserted from the upstream kernel
+project's prior testing: `IntegerAreaFilter` (the exact-integer-ratio
+branch) has a real, previously undetected 1-LSB tie-break at large tap
+counts (confirmed: 4/1024 pixels differ on a 640x480->32x32, tap-count-20
+case; the upstream kernel project's own test suite had only ever verified
+this branch against the real oracle at tap count 2). Root cause is in the
+vendored kernel source, not in this module's integration of it; AREA's
+test tolerance here is atol<=1 to reflect what is actually measured today,
+not a bar relaxed to make a known-bad case quietly pass. There is no
+implicit fallback to CPU or to `cv::cuda`: a call that returns without
+throwing has executed the Triton kernel.
 
 ## 4. Build and test integration
 
@@ -146,17 +159,15 @@ resolved, since a README written before that would need rewriting.
 ## 6. What is implemented upstream of this module but not yet wired in here
 
 The underlying Triton kernel (outside this OpenCV fork, in the originating
-project) already supports AREA/CUBIC interpolation, `float32`/`CV_8U` C4,
-`fx`/`fy` scale factors, and a batched calling convention. None of that is
-currently reachable through `cv::triton::resize`. Per-item assessment:
+project) also supports a batched calling convention, which is NOT yet
+reachable through `cv::triton::resize`. Everything else the upstream
+kernel supports (CUBIC, C4, `float32`, `fx`/`fy`, AREA) has been wired in
+as of this round.
 
-| capability | blocker inside this module | relative cost |
+| capability | status | relative cost (when it was open) |
 |---|---|---|
-| `INTER_CUBIC` | None structural — shares the same parameter ABI as LINEAR/NEAREST in the underlying kernel. Needs a mode branch in `core_resize.cpp`'s validation and `backend/cuda/resize.cpp`'s artifact-name lookup (currently hardcoded to `"linear"`/`"nearest"` only). | Low |
-| 4 channels | `core_resize.cpp` rejects outright. The vendored `kernels/resize.py` is an older snapshot without C4 support and needs re-vendoring from the current upstream kernel; `tools/compile_resize.py`'s channel loop needs a third value added. | Medium |
-| `fx`/`fy` | `cuda_resize_adapter.cpp` rejects any non-zero value. The `fx`/`fy` fields that do exist in `ResizeRequest` are derived *from* an already-resolved `dsize`, not used to derive one — there is currently no `cvRound`/`saturate_cast<int>` logic in this module to reuse; it would need to be ported in from scratch, matching `cv::cuda::resize`'s own parameter-resolution rule bit-for-bit. | Medium |
-| `float32` | `core_resize.cpp` rejects outright. **Not a simple unlock**: `variantName()` — the function that picks which compiled artifact to load — keys only on `{mode, channels, 4 alignment bits}`, with no dtype dimension at all. Removing the depth check without adding a dtype axis to the key would make a `float32` call compute the same artifact name as the `uint8` call and silently load the wrong cubin. Requires a new key dimension and a doubled artifact set. | Medium-high, and the only item on this list with a silent-wrong-result risk if done incompletely |
-| `INTER_AREA` | Not implemented at all in this module (no validation branch, no artifact-name support). The upstream kernel's AREA path depends on two runtime-resolved constexprs (tap count, integer-vs-fractional ratio) that make its ahead-of-time compiled artifact space far larger than every other mode's (roughly 672 artifacts vs. ~48) — a cost/benefit tradeoff the upstream kernel project resolved by excluding AREA from its own AOT delivery path entirely. This module would need to either adopt the same exclusion or find a different answer; either way it is a design decision, not an implementation task. | High, architectural |
+| `INTER_CUBIC`, `float32`, C4, `fx`/`fy` | Done. `variantName()` carries a dtype axis so a float32 call cannot collide with a uint8 one on the same artifact name (the risk flagged when this was open: doing it without that axis would silently load the wrong cubin). | was Low–Medium-high |
+| `INTER_AREA` | Done, including the upscale-or-identity-on-either-axis dispatch quirk (`resize.cu:736-737`) reproduced in `core_resize.cpp` before the backend ever sees the request. AREA's actual AOT artifact count is 192 (2 dtype x 3 channels x 2 INTEGER_RATIO x 16 alignment bits) on top of the other three modes' 288, not the roughly-672 estimate an earlier round of this document carried — tap count turned out to be a plain runtime argument, not a compile-time key axis, once checked against the upstream kernel's own AOT bridge rather than assumed from the kernel's Python-eager dispatcher. **Found while wiring this in**: AREA's `IntegerAreaFilter` branch has a real, previously untested-at-this-scale 1-LSB tie-break at large tap counts (confirmed: 4/1024 pixels on a 640x480->32x32, tap-count-20 case against the real `cv::cuda::resize` oracle) — the upstream kernel project's own suite had only verified this branch at tap count 2. Root cause is in the vendored kernel source, tracked there; this module's AREA test tolerance is atol<=1 to reflect that honestly rather than assert bit-exactness contradicted by this round's own test grid. | was High, architectural; turned out Medium once measured directly |
 | batch | No batch concept anywhere in this module's request types, and `cv::cuda::GpuMat` itself has no batch representation to adapt from (confirmed: `cudawarping.hpp` has exactly one single-image `resize` overload). Needs a new public API shape designed before any code is written. | High, architectural |
 
 ## 7. Open questions for maintainers
@@ -167,19 +178,19 @@ engineering:
 1. **Target branch.** No submission branch has been chosen yet. The
    contribution guide requires choosing the right base branch explicitly;
    this has not been done.
-2. **AREA's AOT cost tradeoff.** Is the upstream project's own exclusion of
-   `INTER_AREA` from ahead-of-time compilation (due to its larger artifact
-   space) an acceptable precedent for this module too, or should it be
-   solved differently here?
+2. **AREA's `IntegerAreaFilter` 1-LSB tie-break at large tap counts.** Is
+   atol<=1 (matching CUBIC's existing bar) an acceptable permanent
+   contract for AREA, or should this block on a kernel-side fix in the
+   upstream kernel project before AREA ships in this module at all?
 3. **Batch API shape.** If batched resize is wanted in this module, what
    should the public type look like, given `GpuMat` has no batch
    representation to start from?
 4. **Module README content**, once 2 and 3 have answers (writing it before
    would mean rewriting it after).
-5. **Scope and pacing.** Should CUBIC/C4/`fx`/`fy`/`float32`/AREA/batch be
-   completed before a first PR, or is a narrower first submission (current
-   subset plus the compliance fixes in §5) preferred, with the rest as
-   follow-ups?
+5. **Scope and pacing.** Should batch be completed before a first PR, or
+   is the current subset (LINEAR/NEAREST/CUBIC/AREA, C1/C3/C4,
+   `uint8`/`float32`, `dsize`/`fx`-`fy`) plus the compliance fixes in §5
+   an acceptable first submission, with batch as a follow-up?
 
 ## 8. Verification record for this round's changes
 
@@ -188,9 +199,27 @@ engineering:
   `cv2.triton.haveBackend` confirmed present and callable from a live
   Python interpreter against the rebuilt binding.
 - `ninja opencv_test_triton` — clean build; `./bin/opencv_test_triton` run
-  in full (no filter): **975/975 tests passed**, matching the test count
-  recorded in this fork's own history after the ROI-support merge, so this
-  round's renames and `precomp.hpp` ordering fix did not change test
-  behavior or coverage, only naming and include order.
-- All changes described in §5 are currently **uncommitted** in the
-  `kernelforge/triton-resize` branch of this `opencv_contrib` fork.
+  in full (no filter) after AREA's integration this round:
+  **5806/5806 tests passed**. AREA's own coverage in that total includes
+  the shared `Triton_Resize.MatchesNativeCuda` grid (now 4 modes instead
+  of 3) and a dedicated `Triton_ResizeArea` fixture targeting the
+  upscale-aliases-to-LINEAR and integer-vs-fractional-ratio decisions
+  specifically, not just whatever the shared grid happened to cover.
+- **A real, previously-latent bug was found and fixed by this round**,
+  not by AREA's kernel but by its DIFFERENT launch config exposing it:
+  `backend/cuda/resize.cpp`'s `Artifact::block_h/block_w/num_warps` were
+  never actually populated from the compiled manifest before this round
+  — every variant silently launched at the `Artifact` struct's
+  default-member values, which happened to equal LINEAR/NEAREST/CUBIC's
+  shared compile config and so never surfaced a problem until AREA's
+  different one (and its genuinely data-dependent shared-memory usage,
+  also previously hardcoded wrong) made the mismatch produce
+  `CUDA_ERROR_INVALID_VALUE` / an illegal shared-memory write. Fixed by
+  reading `block_h`/`block_w`/`num_warps`/`shared_bytes` from
+  `kernels_manifest.json` via `cv::FileStorage` (already an `opencv_core`
+  dependency) rather than a hardcoded per-mode heuristic.
+- All changes described in §5, plus AREA's integration, are currently
+  **mostly uncommitted** in the `kernelforge/triton-resize` branch of this
+  `opencv_contrib` fork (the compliance-fixes/CUBIC/C4/`fx`/`fy`/`float32`
+  round is committed locally as `3fe443f8` and pushed; AREA's integration
+  is not yet committed).

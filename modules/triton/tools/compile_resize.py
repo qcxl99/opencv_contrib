@@ -44,6 +44,20 @@ instead of 64/64, 33/31 instead of 32/32), so the compiled cubin carries no
 assumption about src_h/src_w/dst_h/dst_w beyond what the kernel source
 itself declares -- ptr/stride divisibility is still probed exactly as
 before, since those ARE meant to be compile-time specialized.
+
+AREA is keyed by one MORE axis than LINEAR/NEAREST/CUBIC: INTEGER_RATIO
+(IntegerAreaFilter vs AreaFilter are different compiled FORMULAS, selected
+at compile time -- see kernels/resize.py's _resize_area_kernel docstring),
+doubling AREA's own variant count relative to the other three modes but
+NOT multiplying the whole specialization space by it -- tap count
+(max_taps_x/y) is a plain runtime i32 argument, not a constexpr, and is
+therefore NOT a key axis at all (ported from kernelforge-lab's own
+bridge/triton_resize_launcher.cpp area_tap_bucket()/
+kf_launcher_resolve_area_key(), the reference this module's AREA key
+format matches). AREA also takes scale_x/scale_y (f32) where the other
+three modes take fx/fy -- same quantity, AREA's own kernel parameter
+names -- and two extra trailing runtime args (max_taps_x, max_taps_y)
+inserted before the scratch pointers.
 """
 
 import argparse
@@ -90,7 +104,10 @@ def main():
     # passing one would be a TypeError -- because its kernel body never
     # branches on dtype (plain tl.load/tl.store, no round/saturate step).
     # That does NOT make its two dtype cubins interchangeable; see the
-    # module docstring. Both are compiled below regardless.
+    # module docstring. Both are compiled below regardless. AREA is NOT
+    # in this list -- its parameter list and extra INTEGER_RATIO axis
+    # differ enough from the other three that it gets its own loop below
+    # rather than a branch inside this one.
     MODES = (
         ("linear", mod._resize_linear_kernel, True),
         ("nearest", mod._resize_nearest_kernel, False),
@@ -169,6 +186,71 @@ def main():
                     }
                     entries[variant] = entry
 
+    # AREA: same dtype x channels x 4-alignment-bit sweep as the MODES loop
+    # above, plus INTEGER_RATIO (2 values) as a fifth key axis. max_taps_x/y
+    # are plain runtime args for warmup() purposes -- any value works, they
+    # are not probed or baked in, so 2/2 is as good as any other choice (see
+    # module docstring: tap count is not a key axis at all).
+    AREA_BLOCK_H, AREA_BLOCK_W, AREA_NUM_WARPS = 1, 128, 2
+    for dtype_key, dtype_name in DTYPES:
+        torch_dtype = getattr(torch, dtype_name)
+        for ch in (1, 3, 4):
+            for integer_ratio in (True, False):
+                for sp, dp, ss, ds in itertools.product((1, 0), repeat=4):
+                    srow = 64 * ch + (0 if ss else 1)
+                    drow = 32 * ch + (0 if ds else 1)
+                    sbuf = torch.zeros((64, srow + 16), dtype=torch_dtype, device="cuda")
+                    dbuf = torch.zeros((32, drow + 16), dtype=torch_dtype, device="cuda")
+                    soff = 0 if sp else 1
+                    doff = 0 if dp else 1
+                    s = sbuf[:, soff:soff + srow]
+                    d = dbuf[:, doff:doff + drow]
+                    if (s.data_ptr() % 16 == 0) != bool(sp):
+                        continue
+                    if (d.data_ptr() % 16 == 0) != bool(dp):
+                        continue
+                    if (s.stride(0) % 16 == 0) != bool(ss):
+                        continue
+                    if (d.stride(0) % 16 == 0) != bool(ds):
+                        continue
+
+                    kwargs = {
+                        "BLOCK_H": AREA_BLOCK_H, "BLOCK_W": AREA_BLOCK_W,
+                        "num_warps": AREA_NUM_WARPS,
+                        "INTEGER_RATIO": integer_ratio,
+                        "OUT_FLOAT32": (dtype_key == "f32"),
+                    }
+                    # scale_x/scale_y (f32, not fx/fy -- AREA's own kernel
+                    # parameter names) and max_taps_x/max_taps_y (plain
+                    # runtime i32, not probed): 2.3/1.7/2/2 are placeholder
+                    # VALUES, same role as the 65/63/33/31 dims above --
+                    # not multiples of 16, so nothing is baked in.
+                    k = mod._resize_area_kernel.warmup(
+                        s, d, 65, 63, 33, 31, s.stride(0), d.stride(0), ch,
+                        2.3, 1.7, 2, 2, grid=(1, 1), **kwargs)
+                    k._init_handles()
+                    variant = (f"area_{dtype_key}_c{ch}_ir{int(integer_ratio)}_"
+                               f"sp{sp}dp{dp}ss{ss}ds{ds}")
+                    with open(os.path.join(args.out_dir, variant + ".cubin"), "wb") as fh:
+                        fh.write(k.asm["cubin"])
+                    entries[variant] = {
+                        "function": k.name,
+                        "mode": "area",
+                        "dtype": dtype_key,
+                        "channels": ch,
+                        "integer_ratio": integer_ratio,
+                        "src_ptr_div16": bool(sp),
+                        "dst_ptr_div16": bool(dp),
+                        "src_stride_div16": bool(ss),
+                        "dst_stride_div16": bool(ds),
+                        "block_h": AREA_BLOCK_H,
+                        "block_w": AREA_BLOCK_W,
+                        "num_warps": AREA_NUM_WARPS,
+                        "shared_bytes": k.metadata.shared,
+                        "n_regs": k.n_regs,
+                        "artifact_hash": k.metadata.hash,
+                    }
+
     manifest = {
         "kernel_source": os.path.basename(args.kernel),
         "kernel_source_sha256": src_hash,
@@ -179,6 +261,17 @@ def main():
         "param_abi": "ptr,ptr,u32x6,f32x2,ptr,ptr",
         "runtime_arguments": ["src_h", "src_w", "dst_h", "dst_w",
                               "src_step", "dst_step", "fx", "fy"],
+        # AREA's ABI differs from the one above: scale_x/scale_y in place of
+        # fx/fy (same quantity, AREA's own kernel parameter names) plus two
+        # extra trailing runtime args (max_taps_x, max_taps_y) before the
+        # scratch pointers. Each AREA variant entry also carries
+        # "integer_ratio", the fifth key axis the other three modes don't
+        # have.
+        "param_abi_area": "ptr,ptr,u32x6,f32x2,u32x2,ptr,ptr",
+        "runtime_arguments_area": ["src_h", "src_w", "dst_h", "dst_w",
+                                   "src_step", "dst_step",
+                                   "scale_x", "scale_y",
+                                   "max_taps_x", "max_taps_y"],
         "variants": entries,
         "variant_count": len(entries),
     }

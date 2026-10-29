@@ -59,10 +59,10 @@ void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
         CV_Error(Error::StsUnsupportedFormat,
                  "cv::triton::resizeCore: only 1, 3 or 4 channels are supported in this round");
     if (interpolation != INTER_NEAREST && interpolation != INTER_LINEAR
-            && interpolation != INTER_CUBIC)
+            && interpolation != INTER_CUBIC && interpolation != INTER_AREA)
         CV_Error(Error::StsUnsupportedFormat,
-                 "cv::triton::resizeCore: only INTER_NEAREST, INTER_LINEAR and "
-                 "INTER_CUBIC are supported");
+                 "cv::triton::resizeCore: only INTER_NEAREST, INTER_LINEAR, "
+                 "INTER_CUBIC and INTER_AREA are supported");
     if (dsize.width <= 0 || dsize.height <= 0)
         CV_Error(Error::StsUnsupportedFormat,
                  "cv::triton::resizeCore: dsize must be explicit and non-empty");
@@ -121,6 +121,20 @@ void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
     // from dsize once fx/fy support exists.
     req.fx = (scaleX > 0) ? scaleX : static_cast<double>(src.cols) / dsize.width;
     req.fy = (scaleY > 0) ? scaleY : static_cast<double>(src.rows) / dsize.height;
+
+    // cv::cuda::resize's own dispatcher rewrites AREA to LINEAR semantics
+    // whenever EITHER axis is upscale-or-identity (resize.cu:736-737,
+    // "if (interpolation == AREA && (fx <= 1.f || fy <= 1.f))
+    // interpolation = LINEAR" -- fx/fy there are req.fx/req.fy here, src
+    // units per dst pixel, so fx<=1 means dst is NOT smaller than src on
+    // that axis). The OR means a mixed up-x/down-y case rewrites BOTH
+    // axes, not just the upscaling one. This has to happen here, before
+    // req.interpolation is read by the backend, so the backend never has
+    // to re-derive it and cannot disagree with this check on a borderline
+    // case -- same reasoning kernelforge-lab's own launcher_api.py and
+    // triton_resize_api.cpp apply at their equivalent call sites.
+    if (req.interpolation == INTER_AREA && (req.fx <= 1.0 || req.fy <= 1.0))
+        req.interpolation = INTER_LINEAR;
 
     const backend::LaunchResult r = backend::launchResize(bctx, req);
     if (!r.submitted)

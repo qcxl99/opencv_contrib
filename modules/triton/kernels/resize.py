@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -687,6 +688,240 @@ AGGRESSIVE_DOWNSCALE_FX = 3.0
 LINEAR_WIDE_CONFIG = {
     1: {"BLOCK_H": 1, "BLOCK_W": 256, "num_warps": 2},
 }
+
+# ------------------------------------------------------------------- AREA
+# cv::cuda::resize INTER_AREA has THREE regimes (cudawarping/src/cuda/
+# resize.cu and core/cuda/filters.hpp):
+#   1. dst == src (both dims): identity, handled at the Python dispatch
+#      layer, no kernel needed.
+#   2. upscale-or-identity on EITHER axis: resize.cu rewrites AREA to
+#      LINEAR semantics --
+#         if (interpolation == AREA && (fx <= 1.f || fy <= 1.f)) interpolation = LINEAR;
+#      (fx/fy are src/dst here). The OR means a mixed up-x/down-y case
+#      rewrites BOTH axes to LINEAR. This module's resizeCore() reproduces
+#      that rewrite before choosing a kernel; it is not encoded here.
+#   3. true downscale on BOTH axes: the box-filter kernel below.
+#
+# Regime 3 splits again on whether the ratio is an exact integer
+# (ResizeAreaDispatcher::call, resize.cu):
+#   IntegerAreaFilter: uniform box sum over an iscale_x x iscale_y window,
+#     scaled by 1/(scale_x*scale_y).
+#   AreaFilter: fractional pixel-area weighting -- interior taps full
+#     weight, edge taps partial weight, 4 corners the product of both
+#     partials; scale normalized by the clipped window extent.
+# INTEGER_RATIO (below) selects between them per call, mirroring
+# ResizeAreaDispatcher's own std::abs(fx - round(fx)) < FLT_MIN test.
+@triton.jit
+def _resize_area_kernel(
+    src_ptr, dst_ptr,
+    src_h, src_w, dst_h, dst_w,
+    src_stride_h, dst_stride_h,
+    channels: tl.constexpr,
+    scale_x, scale_y,
+    max_taps_x, max_taps_y,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    INTEGER_RATIO: tl.constexpr,
+    OUT_FLOAT32: tl.constexpr = False,
+):
+    """True-AREA downscale (regime 3). One program per BLOCK_H x BLOCK_W
+    output tile; each output pixel independently computes its own window
+    bounds (sx1/sx2/sy1/sy2) since the window's integer extent is a
+    function of the output coordinate's fractional alignment, not a
+    kernel constant. max_taps_x/y bound the window with a RUNTIME loop
+    (tl.range, not tl.static_range) plus a per-tap mask, sized by the
+    caller as exactly ceil(scale) -- tl.static_range here would make
+    compile time scale combinatorially with tap count (channels *
+    MAX_TAPS_Y * MAX_TAPS_X unrolled load+FMA sequences), a real
+    compile-time cliff this kernel is built to avoid.
+
+    INTEGER_RATIO selects IntegerAreaFilter's plain box sum vs
+    AreaFilter's fractional weighting. This stays a compile-time branch:
+    the two filters are different FORMULAS, matching how the source
+    dispatches via two distinct C++ template instantiations rather than
+    one formula with a runtime switch.
+
+    Per-channel accumulators are a tuple built via concatenation and
+    updated via slice-and-splice (outs[:c] + (new,) + outs[c+1:]), not a
+    Python list with .append or index assignment -- Triton's AST
+    frontend supports neither inside a @triton.jit function body. The
+    channel loop is innermost (not outermost): row/column geometry
+    depends only on the tap index, never on the channel, so computing it
+    once per tap and looping channels only for the load+fma avoids
+    redundant per-channel geometry recomputation.
+    """
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask_h = offs_h < dst_h
+    mask_w = offs_w < dst_w
+    mask = mask_h[:, None] & mask_w[None, :]
+
+    x = offs_w.to(tl.float32)
+    y = offs_h.to(tl.float32)
+    fsx1 = _fmul(x, scale_x)
+    fsx2 = fsx1 + scale_x
+    fsy1 = _fmul(y, scale_y)
+    fsy2 = fsy1 + scale_y
+
+    # __float2int_ru / __float2int_rd: ceil and floor, as integers.
+    sx1 = libdevice.float2int_ru(fsx1).to(tl.int32)
+    sx2 = libdevice.float2int_rd(fsx2).to(tl.int32)
+    sy1 = libdevice.float2int_ru(fsy1).to(tl.int32)
+    sy2 = libdevice.float2int_rd(fsy2).to(tl.int32)
+
+    # `scale` matches the source's own variable: core/cuda/filters.hpp
+    # computes `float scale = 1.f / (...)` ONCE, then every weighted term
+    # is `(...) * scale` -- a multiply by a precomputed reciprocal, never
+    # a division (dividing by the un-inverted product at each term rounds
+    # differently in rare cases and is NOT the same float32 sequence).
+    if INTEGER_RATIO:
+        scale = tl.full((BLOCK_H, BLOCK_W), 1.0 / _fmul(scale_x, scale_y), dtype=tl.float32)
+    else:
+        # AreaFilter normalizes by the CLIPPED window extent, not the raw
+        # scale (source: fminf(scale_x, src.width - fsx1)).
+        wx_full = tl.minimum(scale_x, src_w.to(tl.float32) - fsx1)
+        wy_full = tl.minimum(scale_y, src_h.to(tl.float32) - fsy1)
+        scale = 1.0 / _fmul(wy_full[:, None], wx_full[None, :])  # (BLOCK_H, BLOCK_W)
+
+    # AreaFilter's (non-integer-ratio) edge/corner preamble, hoisted out
+    # of the channel loop: none of it depends on `c`, only on pixel
+    # geometry already computed above.
+    if not INTEGER_RATIO:
+        # Partial left/right columns across the full interior row range
+        # [sy1, sy2), and partial top/bottom rows across [sx1, sx2), each
+        # its own weight -- exact term order from AreaFilter. Every
+        # weight below is (partial_extent) * scale, built as an explicit
+        # 2D product rather than relying on broadcast.
+        left_in = fsx1 < sx1.to(tl.float32)
+        right_in = fsx2 > sx2.to(tl.float32)
+        top_in = fsy1 < sy1.to(tl.float32)
+        bottom_in = fsy2 > sy2.to(tl.float32)
+        x_left_frac = sx1.to(tl.float32) - fsx1       # (BLOCK_W,)
+        x_right_frac = fsx2 - sx2.to(tl.float32)       # (BLOCK_W,)
+        y_top_frac = sy1.to(tl.float32) - fsy1         # (BLOCK_H,)
+        y_bottom_frac = fsy2 - sy2.to(tl.float32)      # (BLOCK_H,)
+
+        # AreaFilter reads through BrdConstant (zero for out-of-range),
+        # NOT clamp (resize.cu: `BrdConstant<T> brd(src.rows, src.cols)`),
+        # distinct from CUBIC's BrdReplicate. The outer edge indices here
+        # (sx1-1, sx2, sy1-1, sy2) CAN fall outside [0,src_w)/[0,src_h)
+        # at the image boundary. Clamping these indices into range would
+        # read the WRONG (but real) pixel instead of the zero BrdConstant
+        # specifies, so the fix is to force the LOADED VALUE to 0 there
+        # (via the load mask), not to suppress the weight -- that is
+        # exactly what BrdConstant does.
+        x_left = sx1 - 1
+        x_right = sx2
+        y_top = sy1 - 1
+        y_bottom = sy2
+        x_left_valid = (x_left >= 0) & (x_left < src_w)
+        x_right_valid = (x_right >= 0) & (x_right < src_w)
+        y_top_valid = (y_top >= 0) & (y_top < src_h)
+        y_bottom_valid = (y_bottom >= 0) & (y_bottom < src_h)
+        # Clamped purely so the ADDRESS computation stays in-bounds
+        # memory (never dereferenced when the load mask is False); the
+        # correctness-relevant decision is the mask, not this clamp.
+        x_left_addr = tl.minimum(tl.maximum(x_left, 0), src_w - 1)
+        x_right_addr = tl.minimum(tl.maximum(x_right, 0), src_w - 1)
+        y_top_addr = tl.minimum(tl.maximum(y_top, 0), src_h - 1)
+        y_bottom_addr = tl.minimum(tl.maximum(y_bottom, 0), src_h - 1)
+
+    outs = ()
+    for _c in tl.static_range(channels):
+        outs = outs + (tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32),)
+
+    # tl.range, not tl.static_range: max_taps_y/x are runtime values.
+    for dy_i in tl.range(max_taps_y):
+        dy = sy1[:, None] + dy_i
+        row_in = (dy >= sy1[:, None]) & (dy < sy2[:, None])
+        row_clamped = tl.minimum(tl.maximum(dy, 0), src_h - 1)
+        row_base = row_clamped * src_stride_h
+        for dx_i in tl.range(max_taps_x):
+            dx = sx1[None, :] + dx_i
+            tap_in = row_in & (dx >= sx1[None, :]) & (dx < sx2[None, :])
+            dx_clamped = tl.minimum(tl.maximum(dx, 0), src_w - 1)
+            # w, then fma(v, w, out), both through the SAME pinned
+            # mul.f32 / fma.rn.f32 instructions as LINEAR/CUBIC -- w is
+            # built by MULTIPLYING by the precomputed reciprocal `scale`
+            # (matching the source's own `out = out + src(dy,dx)*scale`
+            # exactly), never by dividing by the un-inverted product.
+            w = _fmul(tl.where(tap_in, 1.0, 0.0), scale)
+            load_mask = mask & tap_in
+            addr_base = row_base + dx_clamped * channels
+            for c in tl.static_range(channels):
+                v = tl.load(src_ptr + addr_base + c, mask=load_mask, other=0).to(tl.float32)
+                outs = outs[:c] + (_ffma(v, w, outs[c]),) + outs[c + 1:]
+
+        if not INTEGER_RATIO:
+            m_left = mask & row_in & left_in[None, :] & x_left_valid[None, :]
+            w_left_2d = _fmul(tl.where(m_left, x_left_frac[None, :], 0.0), scale)
+            addr_left = row_base + x_left_addr[None, :] * channels
+            m_right = mask & row_in & right_in[None, :] & x_right_valid[None, :]
+            w_right_2d = _fmul(tl.where(m_right, x_right_frac[None, :], 0.0), scale)
+            addr_right = row_base + x_right_addr[None, :] * channels
+            for c in tl.static_range(channels):
+                v = tl.load(src_ptr + addr_left + c, mask=m_left, other=0).to(tl.float32)
+                outs = outs[:c] + (_ffma(v, w_left_2d, outs[c]),) + outs[c + 1:]
+                v = tl.load(src_ptr + addr_right + c, mask=m_right, other=0).to(tl.float32)
+                outs = outs[:c] + (_ffma(v, w_right_2d, outs[c]),) + outs[c + 1:]
+
+    if not INTEGER_RATIO:
+        for dx_i in tl.range(max_taps_x):
+            dx = sx1[None, :] + dx_i
+            col_in = (dx >= sx1[None, :]) & (dx < sx2[None, :])
+            col_clamped = tl.minimum(tl.maximum(dx, 0), src_w - 1)
+            m_top = mask & top_in[:, None] & col_in & y_top_valid[:, None]
+            w_top_2d = _fmul(tl.where(m_top, y_top_frac[:, None], 0.0), scale)
+            addr_top = y_top_addr[:, None] * src_stride_h + col_clamped * channels
+            m_bottom = mask & bottom_in[:, None] & col_in & y_bottom_valid[:, None]
+            w_bottom_2d = _fmul(tl.where(m_bottom, y_bottom_frac[:, None], 0.0), scale)
+            addr_bottom = y_bottom_addr[:, None] * src_stride_h + col_clamped * channels
+            for c in tl.static_range(channels):
+                v = tl.load(src_ptr + addr_top + c, mask=m_top, other=0).to(tl.float32)
+                outs = outs[:c] + (_ffma(v, w_top_2d, outs[c]),) + outs[c + 1:]
+                v = tl.load(src_ptr + addr_bottom + c, mask=m_bottom, other=0).to(tl.float32)
+                outs = outs[:c] + (_ffma(v, w_bottom_2d, outs[c]),) + outs[c + 1:]
+
+        # Four corners: product of both partial weights, multiplied by
+        # the precomputed reciprocal `scale` ONCE per corner term, gated
+        # on both the row and column partial condition AND both axes'
+        # in-bounds validity (BrdConstant: a corner tap one row AND one
+        # column past the edge is doubly out-of-range, reading 0).
+        m_tl = mask & top_in[:, None] & left_in[None, :] & y_top_valid[:, None] & x_left_valid[None, :]
+        w_tl = _fmul(tl.where(m_tl, _fmul(y_top_frac[:, None], x_left_frac[None, :]), 0.0), scale)
+        addr_tl = y_top_addr[:, None] * src_stride_h + x_left_addr[None, :] * channels
+
+        m_tr = mask & top_in[:, None] & right_in[None, :] & y_top_valid[:, None] & x_right_valid[None, :]
+        w_tr = _fmul(tl.where(m_tr, _fmul(y_top_frac[:, None], x_right_frac[None, :]), 0.0), scale)
+        addr_tr = y_top_addr[:, None] * src_stride_h + x_right_addr[None, :] * channels
+
+        m_br = mask & bottom_in[:, None] & right_in[None, :] & y_bottom_valid[:, None] & x_right_valid[None, :]
+        w_br = _fmul(tl.where(m_br, _fmul(y_bottom_frac[:, None], x_right_frac[None, :]), 0.0), scale)
+        addr_br = y_bottom_addr[:, None] * src_stride_h + x_right_addr[None, :] * channels
+
+        m_bl = mask & bottom_in[:, None] & left_in[None, :] & y_bottom_valid[:, None] & x_left_valid[None, :]
+        w_bl = _fmul(tl.where(m_bl, _fmul(y_bottom_frac[:, None], x_left_frac[None, :]), 0.0), scale)
+        addr_bl = y_bottom_addr[:, None] * src_stride_h + x_left_addr[None, :] * channels
+
+        for c in tl.static_range(channels):
+            v = tl.load(src_ptr + addr_tl + c, mask=m_tl, other=0).to(tl.float32)
+            outs = outs[:c] + (_ffma(v, w_tl, outs[c]),) + outs[c + 1:]
+            v = tl.load(src_ptr + addr_tr + c, mask=m_tr, other=0).to(tl.float32)
+            outs = outs[:c] + (_ffma(v, w_tr, outs[c]),) + outs[c + 1:]
+            v = tl.load(src_ptr + addr_br + c, mask=m_br, other=0).to(tl.float32)
+            outs = outs[:c] + (_ffma(v, w_br, outs[c]),) + outs[c + 1:]
+            v = tl.load(src_ptr + addr_bl + c, mask=m_bl, other=0).to(tl.float32)
+            outs = outs[:c] + (_ffma(v, w_bl, outs[c]),) + outs[c + 1:]
+
+    out_row = offs_h[:, None] * dst_stride_h + offs_w[None, :] * channels
+    for c in tl.static_range(channels):
+        # saturate_cast<float>(float) is identity -- the accumulator IS
+        # the output for float32, no rounding/saturation step.
+        out_val = outs[c] if OUT_FLOAT32 else _round_sat(outs[c])
+        tl.store(dst_ptr + out_row + c, out_val, mask=mask)
+
 
 VARIANT_ID = "v009_satcvt"
 ALGORITHM = ("per-output-pixel gather; loop-invariant address bases hoisted out of\n"

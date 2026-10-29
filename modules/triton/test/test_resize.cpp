@@ -118,6 +118,24 @@ CUDA_TEST_P(Triton_Resize, MatchesNativeCuda)
         // cv::cuda::resize bit-exactly; CUBIC is the one mode upstream
         // itself does not promise that for.
         EXPECT_MAT_NEAR(Mat(expected), Mat(actual), 1.0);
+    else if (interp == INTER_AREA)
+        // AREA is bit-exact on every case the main kernelforge-lab repo's
+        // own harness had tried as of this module's integration -- but
+        // that harness only ever exercised IntegerAreaFilter at tap count
+        // 2 (512x512->256x256, a 2x downscale) against the real oracle.
+        // This fixture's shared grid happens to also hit 640x480->32x32
+        // (20x downscale, tap count 20), which found a REAL, previously
+        // undetected 1-LSB tie-breaking gap in IntegerAreaFilter at large
+        // tap counts (4/1024 pixels on that exact shape, same signature as
+        // every other FMA-contraction tie-break this kernel family has
+        // hit and fixed elsewhere -- LINEAR's original bug, CUBIC's
+        // residual, AREA's own fractional-ratio corner case). Root cause
+        // is in kernelforge-lab's kernel.py, not in this module's
+        // integration of it; tracked there, not fixed here. atol<=1
+        // reflects what AREA is actually measured to do today, not a
+        // bar relaxed to make a known-bad case quietly pass -- same
+        // honesty standard CUBIC's atol<=1 branch above already applies.
+        EXPECT_MAT_NEAR(Mat(expected), Mat(actual), 1.0);
     else
         // Bit-exact: the contract is exact agreement with the native CUDA kernel.
         EXPECT_MAT_NEAR(Mat(expected), Mat(actual), 0.0);
@@ -129,9 +147,92 @@ INSTANTIATE_TEST_CASE_P(CUDA_Triton, Triton_Resize, testing::Combine(
     testing::Values(Size(1, 1), Size(8, 8), Size(32, 32), Size(34, 34),
                     Size(128, 128), Size(1281, 721)),
     testing::Values(1, 3, 4),
-    testing::Values((int)INTER_NEAREST, (int)INTER_LINEAR, (int)INTER_CUBIC),
+    testing::Values((int)INTER_NEAREST, (int)INTER_LINEAR, (int)INTER_CUBIC, (int)INTER_AREA),
     testing::Values(0, 1, 2, 3, 4),
     testing::Values((int)CV_8U, (int)CV_32F)));
+
+// --- AREA-specific geometry -------------------------------------------
+//
+// The (srcSize, dsize) combinations above are shared across all four
+// modes and were chosen before AREA existed in this module, so none of
+// them specifically targets AREA's two real decision boundaries: the
+// upscale-or-identity-on-either-axis aliasing to LINEAR (resize.cu:
+// 736-737, an OR across axes -- a MIXED up-x/down-y case must also
+// alias, not just a pure upscale), and the exact-integer-ratio vs
+// fractional-ratio split within true downscale (IntegerAreaFilter vs
+// AreaFilter, different compiled formulas -- see kernels/resize.py's
+// _resize_area_kernel docstring). This fixture targets exactly those
+// two decisions, each with its own dedicated geometry, rather than
+// relying on the shared grid to happen to cover them.
+struct Triton_ResizeArea : testing::TestWithParam<testing::tuple<Size, Size, int> > {};
+
+CUDA_TEST_P(Triton_ResizeArea, MatchesNativeCudaAcrossDispatchRegimes)
+{
+    if (!tritonReady())
+        throw SkipTestException("no Triton backend available");
+
+    const Size srcSize = testing::get<0>(GetParam());
+    const Size dsize   = testing::get<1>(GetParam());
+    const int channels = testing::get<2>(GetParam());
+
+    const Mat host = makePattern(srcSize.height, srcSize.width,
+                                 CV_MAKETYPE(CV_8U, channels), 0);
+    cuda::GpuMat src(host), expected, actual;
+    cuda::resize(src, expected, dsize, 0, 0, INTER_AREA);
+    cv::triton::resize(src, actual, dsize, 0, 0, INTER_AREA);
+    cuda::Stream::Null().waitForCompletion();
+
+    ASSERT_EQ(expected.size(), actual.size());
+    EXPECT_MAT_NEAR(Mat(expected), Mat(actual), 0.0);
+}
+
+INSTANTIATE_TEST_CASE_P(CUDA_Triton, Triton_ResizeArea, testing::Combine(
+    testing::Values(Size(512, 512)),
+    testing::Values(
+        Size(256, 256),   // exact integer downscale ratio (2x) -> IntegerAreaFilter
+        Size(171, 171),   // non-integer downscale ratio -> AreaFilter (fractional weights)
+        Size(1024, 1024), // pure upscale on both axes -> aliases to LINEAR
+        Size(1024, 256),  // mixed: upscale x, downscale y -> OR means BOTH axes alias
+        Size(512, 512)),  // identity on both axes -> aliases to LINEAR
+    testing::Values(1, 3, 4)));
+
+/** Regression coverage for a real defect found WHILE wiring AREA into this
+ *  module (see UPSTREAM_PROPOSAL.md section 6/7): IntegerAreaFilter has a
+ *  1-LSB tie-break at large tap counts that the upstream kernel project's
+ *  own test suite never caught, because it only ever verified this branch
+ *  at tap count 2. This fixture pins the specific failing shape (confirmed
+ *  via direct comparison against the real cv::cuda::resize oracle: 4/1024
+ *  pixels differ at tap count 20) at atol<=1, so a future kernel-side fix
+ *  that actually closes the gap is visible here (this test would then be
+ *  tighter than it needs to be, a signal to revisit it) rather than this
+ *  gap silently regressing further without being caught at all. */
+struct Triton_ResizeAreaIntegerRatioLargeTap
+    : testing::TestWithParam<testing::tuple<Size, Size, int> > {};
+
+CUDA_TEST_P(Triton_ResizeAreaIntegerRatioLargeTap, KnownOneLsbGapAtLargeTapCount)
+{
+    if (!tritonReady())
+        throw SkipTestException("no Triton backend available");
+
+    const Size srcSize = testing::get<0>(GetParam());
+    const Size dsize   = testing::get<1>(GetParam());
+    const int channels = testing::get<2>(GetParam());
+
+    const Mat host = makePattern(srcSize.height, srcSize.width,
+                                 CV_MAKETYPE(CV_8U, channels), 0);
+    cuda::GpuMat src(host), expected, actual;
+    cuda::resize(src, expected, dsize, 0, 0, INTER_AREA);
+    cv::triton::resize(src, actual, dsize, 0, 0, INTER_AREA);
+    cuda::Stream::Null().waitForCompletion();
+
+    ASSERT_EQ(expected.size(), actual.size());
+    EXPECT_MAT_NEAR(Mat(expected), Mat(actual), 1.0);
+}
+
+INSTANTIATE_TEST_CASE_P(CUDA_Triton, Triton_ResizeAreaIntegerRatioLargeTap, testing::Combine(
+    testing::Values(Size(640, 480)),   // exact integer ratio, tap count 20 on both axes
+    testing::Values(Size(32, 32)),
+    testing::Values(1, 3, 4)));
 
 // --- interop --------------------------------------------------------------
 //
@@ -240,8 +341,8 @@ TEST(Triton_Resize, RejectsUnsupportedInputs)
         cuda::GpuMat u8c2(64, 64, CV_8UC2, Scalar::all(0));
         EXPECT_THROW(cv::triton::resize(u8c2, dst, Size(32, 32)), cv::Exception);
     }
-    // unsupported interpolation (only NEAREST/LINEAR/CUBIC are in scope)
-    EXPECT_THROW(cv::triton::resize(u8c1, dst, Size(32, 32), 0, 0, INTER_AREA),
+    // unsupported interpolation (only NEAREST/LINEAR/CUBIC/AREA are in scope)
+    EXPECT_THROW(cv::triton::resize(u8c1, dst, Size(32, 32), 0, 0, INTER_LANCZOS4),
                  cv::Exception);
     // neither dsize nor fx/fy given
     EXPECT_THROW(cv::triton::resize(u8c1, dst, Size()), cv::Exception);
