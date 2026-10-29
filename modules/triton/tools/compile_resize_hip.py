@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """Build-time AOT compilation of the Triton resize kernels -- HIP/hcu backend.
 
-Sibling of compile_resize.py (CUDA). Same specialization space and the same
-manifest shape, with two platform differences recorded explicitly rather than
-reused silently:
+Sibling of compile_resize.py (CUDA), but the two have DIVERGED since this
+docstring originally called them "same specialization space, same manifest
+shape": CUDA's tool gained a third mode (CUBIC), a C4 channel count and a
+dtype axis (uint8/float32, each a FULLY SEPARATE compile pass -- see that
+file's own docstring for why reusing one cubin across dtypes is wrong) when
+cv::triton::resize grew CUBIC/C4/fx-fy/float32 support; this file, kernels/
+resize_hip.py and backend/hip/resize.cpp were left at the original LINEAR/
+NEAREST, uint8-only, 1/3-channel scope. The two platform differences below
+are the ones that were ALWAYS deliberate; the ones that are now ALSO true
+(no dtype axis, no CUBIC, no C4, variant key format "<mode>_cN_..." rather
+than "<mode>_<dtype>_cN_...") are a backlog item, not a design decision:
 
   - emits .hsaco artifacts (k.asm["hsaco"]), not .cubin
   - records warp_size from the kernel's own compiled metadata instead of

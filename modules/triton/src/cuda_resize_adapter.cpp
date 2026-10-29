@@ -1,3 +1,7 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
 // NVIDIA/OpenCV-GpuMat adapter over the platform-agnostic core (core_resize.cpp
 // / opencv2/triton/core.hpp). This file -- not the core -- is what requires
 // cuda::GpuMat, cuda::Stream and cuda_runtime.h: it unwraps a GpuMat pair into
@@ -66,18 +70,48 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
     CV_Assert(_src.kind() == _InputArray::CUDA_GPU_MAT);
     cuda::GpuMat src = _src.getGpuMat();
 
-    // Explicit dsize only. fx/fy derive dsize through a different rounding
-    // rule (saturate_cast<int>(src*scale)); accepting them silently would
-    // change results, so they are rejected while unsupported. Checked here
-    // (adapter-side) because resizeCore() takes dsize as already-resolved and
-    // has no fx/fy concept of its own.
+    // dsize/fx-fy precedence, matching cv::cuda::resize (cudawarping/src/
+    // resize.cpp:74-84) exactly: one of the two forms must be given, and
+    // when dsize IS given fx/fy are ignored rather than cross-checked
+    // against it (same rule this function already had before fx/fy were
+    // accepted, so passing both is not an error, it is just dsize winning).
+    //
+    // cvRound(double) is saturate_cast<int>(double) is round-half-to-even
+    // via SSE2 CVTSD2SI on x86_64 (core/fast_math.hpp, core/saturate.hpp) --
+    // the SAME function cv::cuda::resize's own derivation calls
+    // (saturate_cast<int>(src.cols * fx)), so this is bit-for-bit the
+    // upstream rounding rule, not an approximation of it.
+    //
+    // Subtlety verified against cudawarping/src/resize.cpp:76-84, NOT
+    // assumed: when fx/fy ARE given, upstream does NOT re-derive them from
+    // the rounded dsize afterwards -- it keeps the caller's original
+    // (possibly inexact) fx/fy and passes 1/fx, 1/fy straight to the
+    // kernel. Those two numbers can differ: e.g. fx=0.33 on cols=96 rounds
+    // to dsize.width=32, but 1/0.33 = 3.0303... != 96/32 = 3.0 exactly, and
+    // the kernel's bilinear weights are sensitive to which one it gets.
+    // Re-deriving fx/fy from dsize here (src.cols/dsize.width) would
+    // silently disagree with cv::cuda::resize on every non-exact scale
+    // factor, which is precisely the case this path exists to exercise --
+    // so the ORIGINAL fx/fy (when given) must reach the kernel unchanged,
+    // and only a dsize-given call computes kernel-space scale from dsize.
+    const bool fxfyGiven = dsize.empty();
+    if (dsize.empty() && !(fx > 0 && fy > 0))
+        CV_Error(Error::StsBadArg,
+                 "cv::triton::resize: either dsize or both fx and fy (> 0) must be given");
     if (dsize.empty())
-        CV_Error(Error::StsUnsupportedFormat,
-                 "cv::triton::resize: explicit non-empty dsize is required; the fx/fy "
-                 "scale-factor path is not supported in this round");
-    if (fx != 0 || fy != 0)
-        CV_Error(Error::StsUnsupportedFormat,
-                 "cv::triton::resize: fx/fy must be 0 while only explicit dsize is supported");
+        dsize = Size(cvRound(src.cols * fx), cvRound(src.rows * fy));
+    if (dsize.width <= 0 || dsize.height <= 0)
+        CV_Error(Error::StsBadArg,
+                 cv::format("cv::triton::resize: invalid resulting dsize %dx%d",
+                            dsize.width, dsize.height));
+    // Kernel-space scale (same convention as backend::launchResize's local
+    // fx/fy: src-per-dst-pixel), resolved HERE because this is the one
+    // place that knows whether the caller's original fx/fy must be
+    // preserved or dsize won. Passed through resizeCore() rather than
+    // recomputed from dsize at the backend, which has no way to tell the
+    // two cases apart once dsize alone reaches it.
+    const double scaleX = fxfyGiven ? 1.0 / fx : static_cast<double>(src.cols) / dsize.width;
+    const double scaleY = fxfyGiven ? 1.0 / fy : static_cast<double>(src.rows) / dsize.height;
 
     // ROI src/dst are supported -- see the note in core_resize.cpp's
     // resizeCore() for why no addressing gate is needed here either.
@@ -117,7 +151,7 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
     ctx.device = cuda::getDevice();
     ctx.stream = reinterpret_cast<std::uintptr_t>(cuda::StreamAccessor::getStream(stream));
 
-    resizeCore(toImageView(src), toImageView(dst), dsize, interpolation, ctx);
+    resizeCore(toImageView(src), toImageView(dst), dsize, interpolation, ctx, scaleX, scaleY);
     // Asynchronous: everything needed is on `stream`. No implicit sync here.
 }
 

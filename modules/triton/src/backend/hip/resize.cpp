@@ -1,3 +1,7 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
 // HIP backend: artifact selection, module load/cache, launch, error mapping.
 // Sibling of backend/cuda/resize.cpp. No hand-written pixel arithmetic lives
 // here -- the computation is entirely in the Triton-generated kernel.
@@ -54,9 +58,19 @@ const char* artifactDir()
     return (d != nullptr) ? d : OPENCV_TRITON_ARTIFACT_DIR;
 }
 
-/** Variant name from the runtime signature. Same key as the CUDA backend --
- *  the specialization space (divisibility-by-16 of pointer and stride) comes
- *  from how Triton itself specializes, which this backend did not change. */
+/** Variant name from the runtime signature.
+ *
+ * NOTE (left as-is, HIP/BW1000 is out of scope for the CUBIC/C4/fx-fy/
+ * float32 work that added the CUDA backend's dtype dimension): this key
+ * format ("<mode>_cN_sp.dp.ss.ds.") no longer matches the CUDA backend's
+ * ("<mode>_<dtype>_cN_sp.dp.ss.ds."), and kernels_hip.py/compile_resize_hip.py
+ * still only emit LINEAR/NEAREST over uint8, 1/3 channels -- CUBIC, C4 and
+ * float32 are CUDA-only right now. If this backend is ever extended to
+ * match, the stride-unit bug fixed in backend/cuda/resize.cpp's
+ * launchResize() (step is a BYTE pitch; the kernel's own stride argument is
+ * an ELEMENT pitch, and the two only coincide for uint8) applies here
+ * identically and would need the same CV_ELEM_SIZE1-based fix before any
+ * non-uint8 dtype could work. */
 std::string variantName(const ResizeRequest& req)
 {
     const char* mode = (req.interpolation == INTER_LINEAR) ? "linear" : "nearest";

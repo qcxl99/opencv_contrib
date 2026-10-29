@@ -1,3 +1,7 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
 // Stub for the GpuMat-based public API when no CUDA adapter is compiled in --
 // i.e. every build EXCEPT TRITON_BACKEND_CUDA (HIP/BW1000 builds included).
 // Compiled INSTEAD of cuda_resize_adapter.cpp, never alongside it (see

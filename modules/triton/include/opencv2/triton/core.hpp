@@ -1,3 +1,7 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
 // Platform-agnostic cv::triton core API.
 //
 // This header and the function it declares know nothing about cv::cuda::GpuMat
@@ -90,15 +94,27 @@ struct CV_EXPORTS_W_SIMPLE ExecutionContext
  * the GpuMat adapter, this layer never allocates (it has no OutputArray to
  * allocate through).
  *
- * @param src   Source image view, CV_8UC1 or CV_8UC3, non-ROI.
- * @param dst   Destination image view, already sized to dsize, non-ROI, not
- *              aliased with src.
+ * @param src   Source image view, CV_8U or CV_32F, 1/3/4 channels, ROI
+ *              views accepted.
+ * @param dst   Destination image view, already sized to dsize, ROI views
+ *              accepted, not aliased with src.
  * @param dsize Explicit output size. Must equal dst's size.
- * @param interpolation INTER_NEAREST or INTER_LINEAR.
+ * @param interpolation INTER_NEAREST, INTER_LINEAR or INTER_CUBIC.
  * @param ctx   Device and stream that own src/dst.
+ * @param scaleX Kernel-space horizontal scale (src cols per dst pixel). 0
+ *               derives it as src.cols / dsize.width. A caller resolving a
+ *               scale-factor (fx/fy) request must pass 1/fx here instead
+ *               of letting it be re-derived from the rounded dsize --
+ *               those two values can differ (see cv::triton::resize's
+ *               GpuMat adapter), and cv::cuda::resize's own fx/fy path
+ *               does NOT re-derive, so bit-exactness with it requires the
+ *               same choice here.
+ * @param scaleY Kernel-space vertical scale (src rows per dst pixel). 0
+ *               derives it as src.rows / dsize.height; see scaleX.
  */
 CV_EXPORTS_W void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
-                             int interpolation, const ExecutionContext& ctx);
+                             int interpolation, const ExecutionContext& ctx,
+                             double scaleX = 0, double scaleY = 0);
 
 //! @}
 

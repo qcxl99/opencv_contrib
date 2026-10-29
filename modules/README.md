@@ -88,6 +88,8 @@ $ cmake -D OPENCV_EXTRA_MODULES_PATH=<opencv_contrib>/modules -D BUILD_opencv_<r
 
 - **text**: Scene Text Detection and Recognition -- This module contains algorithms to perform text detection, words segmentation and text recognition in a visual scene.
 
+- **triton**: Triton-backed operations -- GPU operators generated and compiled via the Triton language, exposed through a separate cv::triton namespace so existing cv::cuda behaviour is never affected.
+
 - **tracking**: Vision Based Object Tracking -- Use and/or evaluate different visual object tracking techniques.
 
 - **videostab**: Video Stabilization

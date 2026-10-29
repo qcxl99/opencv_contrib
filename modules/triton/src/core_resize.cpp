@@ -1,3 +1,7 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
 // Platform-agnostic core: every cv::triton::resize validation rule, applied
 // directly to ImageView/ExecutionContext. No cuda::GpuMat, no cuda::Stream,
 // no CUDA/HIP header. The NVIDIA GpuMat adapter (resize.cpp) and any other
@@ -5,9 +9,7 @@
 // into resizeCore() after unwrapping their own buffer type into the two POD
 // structs below.
 
-#include "opencv2/triton/core.hpp"
-#include "opencv2/imgproc.hpp"   // INTER_LINEAR / INTER_NEAREST
-#include "backend/backend.hpp"
+#include "precomp.hpp"
 
 namespace cv { namespace triton {
 
@@ -44,20 +46,23 @@ static backend::ImageView toBackendView(const ImageView& v)
 }  // namespace detail
 
 void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
-                int interpolation, const ExecutionContext& ctx)
+                int interpolation, const ExecutionContext& ctx,
+                double scaleX, double scaleY)
 {
     // --- supported subset, enforced rather than coerced -------------------
     if (src.rows <= 0 || src.cols <= 0)
         CV_Error(Error::StsBadArg, "cv::triton::resizeCore: src must be non-empty");
-    if (src.depth() != CV_8U)
+    if (src.depth() != CV_8U && src.depth() != CV_32F)
         CV_Error(Error::StsUnsupportedFormat,
-                 "cv::triton::resizeCore: only CV_8U is supported in this round");
-    if (src.channels() != 1 && src.channels() != 3)
+                 "cv::triton::resizeCore: only CV_8U and CV_32F are supported in this round");
+    if (src.channels() != 1 && src.channels() != 3 && src.channels() != 4)
         CV_Error(Error::StsUnsupportedFormat,
-                 "cv::triton::resizeCore: only 1 or 3 channels are supported in this round");
-    if (interpolation != INTER_NEAREST && interpolation != INTER_LINEAR)
+                 "cv::triton::resizeCore: only 1, 3 or 4 channels are supported in this round");
+    if (interpolation != INTER_NEAREST && interpolation != INTER_LINEAR
+            && interpolation != INTER_CUBIC)
         CV_Error(Error::StsUnsupportedFormat,
-                 "cv::triton::resizeCore: only INTER_NEAREST and INTER_LINEAR are supported");
+                 "cv::triton::resizeCore: only INTER_NEAREST, INTER_LINEAR and "
+                 "INTER_CUBIC are supported");
     if (dsize.width <= 0 || dsize.height <= 0)
         CV_Error(Error::StsUnsupportedFormat,
                  "cv::triton::resizeCore: dsize must be explicit and non-empty");
@@ -108,8 +113,14 @@ void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
     req.dst = detail::toBackendView(dst);
     req.dsize = dsize;
     req.interpolation = interpolation;
-    req.fx = static_cast<double>(dsize.width) / src.cols;
-    req.fy = static_cast<double>(dsize.height) / src.rows;
+    // Kernel-space scale: src units per dst pixel, i.e. the SAME quantity
+    // the kernel itself calls fx/fy (dst_x * fx = src_x). 0 means "derive
+    // from dsize", the only option before the GpuMat adapter could pass a
+    // caller-given scale factor through -- see opencv2/triton/core.hpp's
+    // resizeCore() doc comment for why this must NOT always be re-derived
+    // from dsize once fx/fy support exists.
+    req.fx = (scaleX > 0) ? scaleX : static_cast<double>(src.cols) / dsize.width;
+    req.fy = (scaleY > 0) ? scaleY : static_cast<double>(src.rows) / dsize.height;
 
     const backend::LaunchResult r = backend::launchResize(bctx, req);
     if (!r.submitted)

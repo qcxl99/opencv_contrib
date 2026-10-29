@@ -13,7 +13,8 @@ int main(int argc, char** argv)
     }
     std::cout << "backend: " << cv::triton::backendName() << "\n";
 
-    // Supported subset: CV_8U, C1 or C3, explicit dsize, NEAREST or LINEAR.
+    // Supported subset: CV_8U or CV_32F, C1/C3/C4, explicit dsize or fx/fy,
+    // NEAREST, LINEAR or CUBIC -- see opencv2/triton.hpp's module doc comment.
     cv::Mat host = (argc > 1) ? cv::imread(argv[1], cv::IMREAD_COLOR)
                               : cv::Mat(720, 1280, CV_8UC3, cv::Scalar(64, 128, 192));
     if (host.empty()) { std::cerr << "failed to read input\n"; return 1; }

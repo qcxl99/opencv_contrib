@@ -1,0 +1,41 @@
+"""INTER_AREA performance vs cv::cuda::resize.
+
+Uses cases.yaml's `qualification` suite filtered to this mode (32 shapes,
+as of resize/0.11.0's matrix/0.4.0 expansion: both filter branches
+(IntegerAreaFilter/AreaFilter) and tap buckets 2/4/8/16, not just the 2
+named performance cases this suite had before that expansion), through
+kernelforge.benchmark.run_benchmark -- the project's real paired-
+alternating-blocks protocol. Device steady-state is the primary metric;
+graph_replay is reported alongside it, not substituted for it.
+
+Note: a subset of these shapes trigger cv::cuda::resize's own dispatch
+quirk (AREA aliases to LINEAR whenever either axis is upscale-or-
+identity) -- those cases are still valid AREA *dispatch* coverage, just
+not AREA *arithmetic* coverage; see cases.yaml's performance_matrix
+comment for which transforms alias and which do not.
+
+Run: LD_LIBRARY_PATH=/opt/ocv-cuda/lib:/usr/local/cuda-12.8/targets/x86_64-linux/lib \
+     python3 bench/bench_performance_area.py
+"""
+from __future__ import annotations
+
+import sys
+
+from _common import B, baseline_fn, candidate_fn, cases_for_mode, print_performance_result
+
+MODE = "INTER_AREA"
+
+
+def main() -> int:
+    cases = cases_for_mode("qualification", MODE)
+    print(f"{MODE} performance -- cases.yaml `qualification` suite ({len(cases)} shapes) "
+          f"vs cv::cuda::resize")
+    print("=" * 78)
+    result = B.run_benchmark(cases, candidate_fn, baseline_fn,
+                             baseline_provider="cv::cuda::resize")
+    print_performance_result(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -69,6 +69,27 @@ def _ffma(a, b, c):
 
 
 @triton.jit
+def _fadd(a, b):
+    """Single add.f32, not reassociable -- for accumulation chains (e.g.
+    CUBIC's wsum) that are a plain sum rather than a multiply-add, where
+    `_ffma` is not the right shape but an unpinned `+` is still a
+    compiler-visible reassociation point."""
+    return tl.inline_asm_elementwise(
+        "add.f32 $0, $1, $2;", "=f,f,f", [a, b],
+        dtype=tl.float32, is_pure=True, pack=1,
+    )
+
+
+@triton.jit
+def _fdiv(a, b):
+    """Single div.rn.f32, matching the CUDA kernel's `sum / wsum` cast."""
+    return tl.inline_asm_elementwise(
+        "div.rn.f32 $0, $1, $2;", "=f,f,f", [a, b],
+        dtype=tl.float32, is_pure=True, pack=1,
+    )
+
+
+@triton.jit
 def _round_sat(acc):
     """cvt.rni.sat.u8.f32 as ONE instruction, not four.
 
@@ -187,8 +208,21 @@ def _resize_linear_kernel(
     BLOCK_W: tl.constexpr,
     EXACT_TILE: tl.constexpr = False,
     X_EXACT: tl.constexpr = False,
+    OUT_FLOAT32: tl.constexpr = False,
 ):
     """One program handles a BLOCK_H x BLOCK_W tile of the output.
+
+    OUT_FLOAT32: dst (and src) are float32, not uint8. The bilinear
+    accumulation itself is identical either way -- `tl.load` already reads
+    whatever dtype `src_ptr` actually points at, no separate flag needed for
+    that half. What differs is the LAST step: `saturate_cast<uchar>(float)`
+    (the uint8 contract, see `_round_sat`) rounds-half-to-even and clamps to
+    [0,255]; `saturate_cast<float>(float)` (OpenCV's own default template,
+    `core/saturate.hpp`: `template<typename _Tp> _Tp saturate_cast(float v)
+    { return _Tp(v); }`) is a pure identity with no rounding and no clamp.
+    Storing the accumulator directly, with no `_round_sat` call, is therefore
+    not an approximation of the float32 contract -- it IS the float32
+    contract, matched op-for-op.
 
     EXACT_TILE: the caller has proven dst_w % BLOCK_W == 0 and
     dst_h % BLOCK_H == 0, so every tile lies entirely inside the output and no
@@ -348,10 +382,15 @@ def _resize_linear_kernel(
             acc = _ffma(v21, w21, acc)
             acc = _ffma(v22, w22, acc)
 
-        # One cvt.rni.sat.u8.f32 instead of FRND + 2x FMNMX + F2I; see
-        # _round_sat. This site had the sequence open-coded rather than
-        # calling the helper, so it was carrying the same four-op cost.
-        out_val = _round_sat(acc)
+        if OUT_FLOAT32:
+            # saturate_cast<float>(float) is identity (see this function's
+            # docstring) -- the accumulator IS the output, no conversion.
+            out_val = acc
+        else:
+            # One cvt.rni.sat.u8.f32 instead of FRND + 2x FMNMX + F2I; see
+            # _round_sat. This site had the sequence open-coded rather than
+            # calling the helper, so it was carrying the same four-op cost.
+            out_val = _round_sat(acc)
 
         if EXACT_TILE:
             tl.store(dst_ptr + out_row + c, out_val)
@@ -457,6 +496,106 @@ def _resize_nearest_scalar_kernel(
         tl.store(dst_ptr + out_row + c, val, mask=mask)
 
 
+@triton.jit
+def _bicubic_coeff(t):
+    """bicubicCoeff(x_), a=-0.5 cubic convolution family:
+        |t|<=1:        t^2*(1.5t-2.5) + 1
+        1<|t|<2:       t*(t*(-0.5t+2.5)-4) + 2
+        |t|>=2:        0
+    Module-level (not nested inside _resize_cubic_kernel): Triton's AST
+    frontend does not support defining a Python function inside a
+    @triton.jit function body. _fmul/_ffma pin the instruction sequence
+    the same way the LINEAR kernel's weight products are pinned, so the
+    compiler cannot reassociate this chain either."""
+    at = tl.abs(t)
+    inner = _ffma(at, 1.5, -2.5)          # 1.5*at - 2.5
+    near = _ffma(inner, at, 0.0)          # (1.5*at-2.5)*at
+    near = _ffma(near, at, 1.0)           # ((1.5*at-2.5)*at)*at + 1.0
+    far = _ffma(at, -0.5, 2.5)
+    far = _ffma(far, at, -4.0)
+    far = _ffma(far, at, 2.0)
+    return tl.where(at <= 1.0, near, tl.where(at < 2.0, far, 0.0))
+
+
+@triton.jit
+def _resize_cubic_kernel(
+    src_ptr, dst_ptr,
+    src_h, src_w, dst_h, dst_w,
+    src_stride_h, dst_stride_h,
+    channels: tl.constexpr,
+    fx, fy,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    OUT_FLOAT32: tl.constexpr = False,
+):
+    """One program per BLOCK_H x BLOCK_W output tile. Each output pixel's
+    4x4 window is [floor(src_x)-1 .. floor(src_x)+2] x [floor(src_y)-1 ..
+    floor(src_y)+2] -- always exactly 4 taps per axis because ceil(t-2) and
+    floor(t+2) for non-integer t are floor(t)-1 and floor(t)+2 respectively."""
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask = (offs_h < dst_h)[:, None] & (offs_w < dst_w)[None, :]
+
+    src_x = _fmul(offs_w.to(tl.float32), fx)
+    src_y = _fmul(offs_h.to(tl.float32), fy)
+    fx0 = tl.floor(src_x).to(tl.int32)
+    fy0 = tl.floor(src_y).to(tl.int32)
+
+    # Fractional offset within the central interval, in [0, 1).
+    tx = src_x - fx0.to(tl.float32)
+    ty = src_y - fy0.to(tl.float32)
+
+    # Per-axis weights for the 4 taps at relative offsets -1, 0, +1, +2 from
+    # fx0/fy0, i.e. bicubicCoeff(tx - (-1)), bicubicCoeff(tx - 0), etc.
+    wx_m1 = _bicubic_coeff(tx + 1.0)
+    wx_0 = _bicubic_coeff(tx)
+    wx_p1 = _bicubic_coeff(tx - 1.0)
+    wx_p2 = _bicubic_coeff(tx - 2.0)
+    wy_m1 = _bicubic_coeff(ty + 1.0)
+    wy_0 = _bicubic_coeff(ty)
+    wy_p1 = _bicubic_coeff(ty - 1.0)
+    wy_p2 = _bicubic_coeff(ty - 2.0)
+
+    # Tap row/col indices, clamped (BrdReplicate).
+    y_m1 = tl.minimum(tl.maximum(fy0 - 1, 0), src_h - 1)
+    y_0 = tl.minimum(tl.maximum(fy0, 0), src_h - 1)
+    y_p1 = tl.minimum(tl.maximum(fy0 + 1, 0), src_h - 1)
+    y_p2 = tl.minimum(tl.maximum(fy0 + 2, 0), src_h - 1)
+    x_m1 = tl.minimum(tl.maximum(fx0 - 1, 0), src_w - 1)
+    x_0 = tl.minimum(tl.maximum(fx0, 0), src_w - 1)
+    x_p1 = tl.minimum(tl.maximum(fx0 + 1, 0), src_w - 1)
+    x_p2 = tl.minimum(tl.maximum(fx0 + 2, 0), src_w - 1)
+
+    rows = (y_m1[:, None], y_0[:, None], y_p1[:, None], y_p2[:, None])
+    wys = (wy_m1[:, None], wy_0[:, None], wy_p1[:, None], wy_p2[:, None])
+    cols = (x_m1[None, :], x_0[None, :], x_p1[None, :], x_p2[None, :])
+    wxs = (wx_m1[None, :], wx_0[None, :], wx_p1[None, :], wx_p2[None, :])
+
+    for c in tl.static_range(channels):
+        acc = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+        wsum = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+        for ri in tl.static_range(4):
+            row_base = rows[ri] * src_stride_h
+            for ci in tl.static_range(4):
+                # w, acc and wsum all go through the SAME pinned mul.f32 /
+                # fma.rn.f32 instructions the LINEAR kernel uses, not plain
+                # Triton `*`/`+`; see LINEAR's own docstring for why that
+                # matters (FMA-contraction changes results on a measurable
+                # fraction of pixels).
+                w = _fmul(wys[ri], wxs[ci])
+                v = tl.load(src_ptr + row_base + cols[ci] * channels + c,
+                           mask=mask, other=0).to(tl.float32)
+                acc = _ffma(w, v, acc)
+                wsum = _fadd(wsum, w)
+        res = tl.where(wsum != 0.0, _fdiv(acc, wsum), 0.0)
+        # saturate_cast<float>(float) is identity, same as LINEAR's
+        # OUT_FLOAT32 -- see _resize_linear_kernel's docstring.
+        out_val = res if OUT_FLOAT32 else _round_sat(res)
+        tl.store(dst_ptr + offs_h[:, None] * dst_stride_h + offs_w[None, :] * channels + c,
+                 out_val, mask=mask)
+
 
 # Launch configuration selected by measurement, not by intuition. Evidence:
 # every variant holding 32 registers sits at exactly 6 elements/thread; pushing
@@ -558,17 +697,19 @@ ALGORITHM = ("per-output-pixel gather; loop-invariant address bases hoisted out 
 
 
 def resize(src, dsize, interpolation="INTER_LINEAR", stream=None, config=None, out=None):
-    """Resize a uint8 CUDA tensor. dsize is (width, height), as in OpenCV.
+    """Resize a uint8 or float32 CUDA tensor. dsize is (width, height), as
+    in OpenCV.
 
-    src must be a contiguous uint8 CUDA tensor, HW (C1) or HWC (C3).
-    Returns a new device tensor unless `out` is supplied.
+    src must be a contiguous uint8 or float32 CUDA tensor, HW (C1), HWC (C3)
+    or HWC (C4). Returns a new device tensor unless `out` is supplied.
     """
     import torch
 
     if not src.is_cuda:
         raise ValueError("src must be a CUDA tensor")
-    if src.dtype != torch.uint8:
-        raise ValueError(f"only uint8 is in scope, got {src.dtype}")
+    if src.dtype not in (torch.uint8, torch.float32):
+        raise ValueError(f"only uint8 and float32 are in scope, got {src.dtype}")
+    is_f32 = src.dtype == torch.float32
     if src.ndim not in (2, 3):
         raise ValueError(f"expected HW or HWC, got shape {tuple(src.shape)}")
     if not src.is_contiguous():
@@ -580,8 +721,8 @@ def resize(src, dsize, interpolation="INTER_LINEAR", stream=None, config=None, o
 
     src_h, src_w = int(src.shape[0]), int(src.shape[1])
     channels = 1 if src.ndim == 2 else int(src.shape[2])
-    if channels not in (1, 3):
-        raise ValueError(f"only C1 and C3 are in scope, got {channels}")
+    if channels not in (1, 3, 4):
+        raise ValueError(f"only C1, C3 and C4 are in scope, got {channels}")
 
     # Explicit config always wins; otherwise take the per-mode measured best.
     cfg = dict(MODE_CONFIG.get((interpolation, channels), DEFAULT_CONFIG))
@@ -606,7 +747,7 @@ def resize(src, dsize, interpolation="INTER_LINEAR", stream=None, config=None, o
 
     out_shape = (dst_h, dst_w) if channels == 1 else (dst_h, dst_w, channels)
     if out is None:
-        dst = torch.empty(out_shape, dtype=torch.uint8, device=src.device)
+        dst = torch.empty(out_shape, dtype=src.dtype, device=src.device)
     else:
         # The kernel computes addresses as row_index * stride + col * channels,
         # i.e. it assumes pixels and channels are contiguous within a row and
@@ -616,8 +757,8 @@ def resize(src, dsize, interpolation="INTER_LINEAR", stream=None, config=None, o
         # are rejected rather than silently mis-written.
         if tuple(out.shape) != out_shape:
             raise ValueError(f"out shape {tuple(out.shape)} != expected {out_shape}")
-        if out.dtype != torch.uint8:
-            raise ValueError(f"out must be uint8, got {out.dtype}")
+        if out.dtype != src.dtype:
+            raise ValueError(f"out dtype {out.dtype} != src dtype {src.dtype}")
         if not out.is_cuda:
             raise ValueError("out must be a CUDA tensor")
         if out.device != src.device:
@@ -652,13 +793,18 @@ def resize(src, dsize, interpolation="INTER_LINEAR", stream=None, config=None, o
     fx = float(src_w) / float(dst_w)
     fy = float(src_h) / float(dst_h)
 
-    if interpolation not in ("INTER_LINEAR", "INTER_NEAREST"):
+    if interpolation not in ("INTER_LINEAR", "INTER_NEAREST", "INTER_CUBIC"):
         raise ValueError(f"unsupported interpolation {interpolation}")
 
     # Exact 2x upscale LINEAR: 2.25 taps per output instead of 4, with three
     # of the four output parities dropping the FFMA chain. Dispatch on the
-    # requested shapes only.
-    if (interpolation == "INTER_LINEAR"
+    # requested shapes only -- NOT for float32: _resize_linear_up2_kernel's
+    # numerics derivation is built on the uint8 saturate/round contract and
+    # was never adapted for the float32 identity-cast contract. Falling
+    # through to the general kernel (which IS dtype-aware via OUT_FLOAT32)
+    # is correct and safe; it is this specialization that is not yet
+    # extended, not float32 support in general.
+    if (interpolation == "INTER_LINEAR" and not is_f32
             and dst_h == 2 * src_h and dst_w == 2 * src_w):
         ucfg = dict(UP2_CONFIG)
         if config:
@@ -698,12 +844,32 @@ def resize(src, dsize, interpolation="INTER_LINEAR", stream=None, config=None, o
             dst.copy_(src, non_blocking=True)
         return dst
 
+    if interpolation == "INTER_CUBIC":
+        ccfg = dict(MODE_CONFIG.get((interpolation, channels), DEFAULT_CONFIG))
+        if config:
+            ccfg.update(config)
+        grid_cubic = (triton.cdiv(dst_h, ccfg["BLOCK_H"]), triton.cdiv(dst_w, ccfg["BLOCK_W"]))
+        launch = _resize_cubic_kernel[grid_cubic]
+        args = (src, dst, src_h, src_w, dst_h, dst_w,
+                src.stride(0), dst.stride(0), channels, fx, fy)
+        kwargs = {"BLOCK_H": ccfg["BLOCK_H"], "BLOCK_W": ccfg["BLOCK_W"],
+                  "num_warps": ccfg["num_warps"], "OUT_FLOAT32": is_f32}
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                launch(*args, **kwargs)
+        else:
+            launch(*args, **kwargs)
+        return dst
+
     grid = (triton.cdiv(dst_h, cfg["BLOCK_H"]), triton.cdiv(dst_w, cfg["BLOCK_W"]))
-    if (interpolation == "INTER_NEAREST" and channels == 3
-            and src.data_ptr() % 4 != 0):
-        # The int32 view needs a 4-byte-aligned base; fall back rather than
-        # fault. Fresh torch allocations always satisfy this, but an
-        # externally supplied pointer need not.
+    if interpolation == "INTER_NEAREST" and channels == 3 and (
+            is_f32 or src.data_ptr() % 4 != 0):
+        # The word-wide path reinterprets src_ptr as a uint32 pointer and
+        # extracts 3 BYTES per pixel -- built for the uint8 memory layout (1
+        # byte/channel). For float32 (4 bytes/channel) that same bit-shift
+        # arithmetic reads garbage, so float32 always takes the
+        # channel/dtype-agnostic scalar fallback, the same one already used
+        # for an unaligned pointer.
         kernel = _resize_nearest_scalar_kernel
     else:
         kernel = _resize_linear_kernel if interpolation == "INTER_LINEAR" else _resize_nearest_kernel
@@ -724,6 +890,7 @@ def resize(src, dsize, interpolation="INTER_LINEAR", stream=None, config=None, o
     if kernel is _resize_linear_kernel:
         kwargs["EXACT_TILE"] = exact_tile
         kwargs["X_EXACT"] = x_exact
+        kwargs["OUT_FLOAT32"] = is_f32
     if "num_stages" in cfg:
         kwargs["num_stages"] = cfg["num_stages"]
 
