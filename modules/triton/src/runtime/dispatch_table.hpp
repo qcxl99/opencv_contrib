@@ -1,0 +1,65 @@
+// GENERATED, do not edit: from operators/resize/kernel.py by tools/export_module_kernels.py.
+//   CPU_CONFIG and _CPU_TABLE, as the C++ launch-shape resolver (kf_resize_rt::default_config)
+//   reads them. kernel.py stays the single source of truth; tests/test_module_sync.py fails
+//   if this file is not exactly what kernel.py generates.
+#pragma once
+
+namespace kf_resize_rt {
+
+struct DispatchRow {
+    const char* route;   // route_name(): copy, nearest, linear, cubic, area_fast, area
+    int cn;
+    bool f32;
+    const char* ydir;    // "up" when dst_h > src_h, else "down"
+    bool two_by_two;     // area_fast only: ix == 2 and iy == 2
+    int block_h, block_w, num_warps;
+};
+
+// CPU_CONFIG: what a copy (or an unlisted dispatch class) uses.
+constexpr int DISPATCH_FALLBACK_BLOCK_H = 1;
+constexpr int DISPATCH_FALLBACK_BLOCK_W = 256;
+constexpr int DISPATCH_FALLBACK_NUM_WARPS = 4;
+constexpr int DISPATCH_DEFAULT_NUM_STAGES = 3;
+// _CPU_MIN_PROGRAMS: _cpu_parallel's floor on the program count.
+constexpr int DISPATCH_MIN_PROGRAMS = 512;
+
+inline constexpr DispatchRow DISPATCH_TABLE[] = {
+    {"nearest", 1, false, "down", false, 2, 512, 4},
+    {"nearest", 1, false, "up", false, 8, 512, 2},
+    {"nearest", 1, true, "down", false, 2, 512, 4},
+    {"nearest", 1, true, "up", false, 4, 512, 4},
+    {"nearest", 3, false, "down", false, 2, 256, 2},
+    {"nearest", 3, false, "up", false, 8, 512, 2},
+    {"nearest", 3, true, "down", false, 2, 256, 2},
+    {"nearest", 3, true, "up", false, 2, 256, 2},
+    {"linear", 1, false, "down", false, 2, 128, 1},
+    {"linear", 1, false, "up", false, 8, 128, 1},
+    {"linear", 1, true, "down", false, 2, 256, 2},
+    {"linear", 1, true, "up", false, 4, 256, 2},
+    {"linear", 3, false, "down", false, 2, 256, 2},
+    {"linear", 3, false, "up", false, 16, 128, 1},
+    {"linear", 3, true, "down", false, 2, 256, 2},
+    {"linear", 3, true, "up", false, 8, 256, 2},
+    {"cubic", 1, false, "down", false, 2, 128, 1},
+    {"cubic", 1, false, "up", false, 8, 128, 1},
+    {"cubic", 1, true, "down", false, 2, 128, 1},
+    {"cubic", 1, true, "up", false, 8, 128, 1},
+    {"cubic", 3, false, "down", false, 2, 256, 2},
+    {"cubic", 3, false, "up", false, 16, 256, 2},
+    {"cubic", 3, true, "down", false, 2, 256, 2},
+    {"cubic", 3, true, "up", false, 16, 256, 2},
+    {"area", 1, false, "down", false, 1, 64, 1},
+    {"area", 1, true, "down", false, 1, 256, 4},
+    {"area", 3, false, "down", false, 1, 32, 1},
+    {"area", 3, true, "down", false, 1, 32, 1},
+    {"area_fast", 1, false, "down", false, 1, 32, 1},
+    {"area_fast", 1, true, "down", false, 1, 32, 1},
+    {"area_fast", 3, false, "down", false, 1, 64, 2},
+    {"area_fast", 3, true, "down", false, 1, 64, 2},
+    {"area_fast", 1, false, "down", true, 1, 128, 1},
+    {"area_fast", 1, true, "down", true, 1, 128, 2},
+    {"area_fast", 3, false, "down", true, 1, 64, 1},
+    {"area_fast", 3, true, "down", true, 1, 64, 1},
+};
+
+}  // namespace kf_resize_rt
