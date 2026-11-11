@@ -392,13 +392,23 @@ bool verify_artifact(const std::string& dir, const std::string& expected_key_tex
     return true;
 }
 
-bool compiler_abi_validated(const std::string& compiler) {
+bool compiler_abi_validated(const std::string& compiler, const std::string& format) {
     // Extend only after checking the new compiler's entry parameters (tests/test_compile_protocol.py).
-    return compiler == "triton-3.6.0";
+    //   cubin: the PTX .entry parameters of upstream triton 3.6.0.
+    //   hsaco: the AMDHSA kernel-argument metadata of flagtree's triton on gfx936, read by
+    //          compile_helper.py's hip_abi(). flagtree reports the same version string "3.6.0",
+    //          so the compiler string cannot tell the two distributions apart: the binary
+    //          format keys the entry, and a hip artifact is not validated by the cuda check.
+    if (format == "cubin") return compiler == "triton-3.6.0";
+    if (format == "hsaco") return compiler == "triton-3.6.0";
+    return false;
 }
 
 bool launch_abi_ok(const Manifest& m, std::string& why) {
-    if (!compiler_abi_validated(m.compiler)) { why = "compiler " + m.compiler + ": entry ABI not validated"; return false; }
+    if (!compiler_abi_validated(m.compiler, m.format)) {
+        why = "compiler " + m.compiler + " (" + m.format + "): entry ABI not validated";
+        return false;
+    }
     if (m.global_scratch_bytes != 0 || m.profile_scratch_bytes != 0) { why = "kernel needs scratch memory; null scratch is not valid"; return false; }
     std::size_t nulls = 0;
     for (const ManifestParam& p : m.abi) nulls += p.null_pointer;
@@ -579,10 +589,16 @@ int put(const std::string& s, char* out, int len) {
 }  // namespace
 
 // The request for the key of one resize call (B3 normalize + launch_shape), with an explicit
-// launch config and compiler identity. Returns its length, 0 for the copy route, -1 on error.
+// launch config, compiler identity and target. Returns its length, 0 for the copy route, -1 on error.
+//
+// The target is a parameter, not a default: a key names which backend the binary is for, and a
+// process compiles exactly one -- the one its profile selects. Leaving target_backend null (or
+// arch/warp_size zero) keeps provider.hpp's Target, the cuda default, which on a HIP box names a
+// different compiler distribution than the one that will run the artifact.
 extern "C" int kf_cp_make_request(int src_h, int src_w, int dst_w, int dst_h, double fx, double fy, int cn, int is_f32,
                                   int interp, int block_h, int block_w, int num_warps, const char* compiler,
-                                  const char* source_path, const char* cache_dir, char* out, int out_len) {
+                                  const char* source_path, const char* cache_dir, const char* target_backend,
+                                  int target_arch, int target_warp_size, char* out, int out_len) {
     using namespace kf_resize_rt;
     const std::size_t es = is_f32 ? 4 : 1;
     kf_resize_ref::Size2 z{0, 0, 0, 0};
@@ -600,7 +616,11 @@ extern "C" int kf_cp_make_request(int src_h, int src_w, int dst_w, int dst_h, do
     LaunchConfig cfg; cfg.block_h = block_h; cfg.block_w = block_w; cfg.num_warps = num_warps;
     Toolchain tc; tc.compiler = compiler;
     if (!sha256_file(source_path, tc.source_sha256)) return -1;
-    LaunchShape ls = launch_shape(n, cfg, Target{}, tc);
+    Target target;                                    // provider.hpp's default: cuda/sm_90/32
+    if (target_backend && *target_backend) target.backend = target_backend;
+    if (target_arch > 0) target.arch = target_arch;
+    if (target_warp_size > 0) target.warp_size = target_warp_size;
+    LaunchShape ls = launch_shape(n, cfg, target, tc);
     if (ls.is_copy) return 0;
     return put(make_request(ls.key, source_path, cache_dir), out, out_len);
 }

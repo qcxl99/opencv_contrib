@@ -8,7 +8,7 @@
 //             compiler, source_sha256}, key_text, source_path, cache_dir}
 //   response {protocol, request_sha256, key_digest, status compiled|cached|error, error{kind,
 //             message}, artifact_dir, manifest_sha256}
-//   artifact <cache_dir>/<key_digest>/{manifest.json, kernel.cubin}
+//   artifact <cache_dir>/<key_digest>/{manifest.json, kernel.cubin | kernel.hsaco}
 //
 // key_text is KernelKey::text() (B3) and key_digest = sha256(key_text): the cache entry, the
 // manifest and the B3 key name one another. An entry is valid only if its manifest parses,
@@ -101,8 +101,12 @@ struct Manifest {
 // Compilers whose entry ABI has been validated against the manifest's parameter list: the
 // runtime arguments, then exactly two trailing pointers (global_scratch, profile_scratch)
 // that the launcher may pass as null when the manifest records zero scratch bytes.
+// Keyed by (compiler, binary format): "cubin" (PTX entry parameters) and "hsaco" (AMDHSA
+// kernel-argument metadata) are validated separately, because two Triton distributions can
+// report the same version string. For hsaco the manifest's `ptx` field carries the scalar
+// class derived from that metadata (the field name is the protocol's, kept for stability).
 // launch_abi_ok() is the check the launcher runs before every first launch of a module.
-bool compiler_abi_validated(const std::string& compiler);
+bool compiler_abi_validated(const std::string& compiler, const std::string& format);
 bool launch_abi_ok(const Manifest& m, std::string& why);
 
 // Verifies <dir>/manifest.json and the binary against an expected key_text: protocol, key_text

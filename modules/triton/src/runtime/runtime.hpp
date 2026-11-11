@@ -37,6 +37,8 @@
 #include "opencv2/core.hpp"
 #include "../core.hpp"   // module-internal; src/core.hpp is not on the include path
 #include "provider.hpp"
+#include "cvtcolor.hpp"
+#include "warpaffine.hpp"
 
 namespace cv { namespace triton { namespace runtime {
 
@@ -50,6 +52,15 @@ const char* name();   // "cuda-jit"
 kf_resize_rt::Status resize(const kf_resize_rt::ResizeRequest& req, const kf_resize_rt::ExecContext& ex,
                             std::string* route = nullptr);
 
+/** Run one cvtColor. Same contract as resize(): Submitted, Unsupported (nothing submitted,
+ *  dst untouched) or Error. `opName` receives the conversion's name. */
+kf_resize_rt::Status cvtColor(const kf_cvtcolor::Request& req, const kf_resize_rt::ExecContext& ex,
+                              std::string* opName = nullptr);
+
+/** Run one warpAffine. Same contract as resize(): Submitted, Unsupported (nothing submitted,
+ *  dst untouched) or Error. */
+kf_resize_rt::Status warpAffine(const kf_warpaffine::Request& req, const kf_resize_rt::ExecContext& ex);
+
 }}}  // namespace cv::triton::runtime
 
 namespace cv { namespace triton { namespace detail {
@@ -60,6 +71,10 @@ kf_resize_rt::DeviceView toDeviceView(const ImageView& v, int device, std::uintp
  *  caller's values, passed through unchanged). Raises the mapped OpenCV error. */
 void resizeDevice(const kf_resize_rt::DeviceView& src, const kf_resize_rt::DeviceView& dst, Size dsize,
                   double fx, double fy, int interpolation, int device, std::uintptr_t stream);
+/** cvtColor counterpart: validates, calls runtime::cvtColor, raises the mapped OpenCV error. */
+void cvtColorDevice(const kf_cvtcolor::Request& req, int device, std::uintptr_t stream);
+/** warpAffine counterpart: validates, calls runtime::warpAffine, raises the mapped OpenCV error. */
+void warpAffineDevice(const kf_warpaffine::Request& req, int device, std::uintptr_t stream);
 
 }}}  // namespace cv::triton::detail
 
@@ -79,6 +94,8 @@ struct RuntimeStats
     long long cross_stream_waits = 0;  //!< launches that waited on another stream's table upload
     long long launches = 0, copies = 0;
     long long pending = 0;             //!< launches whose completion has not been observed yet
+    long long capture_launches = 0;    //!< launches recorded into a capturing stream
+    long long capture_pin_holds = 0;   //!< resources currently pinned for captured graphs
     std::string last_route, last_key, last_artifact;
 };
 CV_EXPORTS RuntimeStats runtimeStats();
@@ -87,6 +104,14 @@ CV_EXPORTS void resetRuntimeStats();
 CV_EXPORTS void setCacheLimits(int modules, int tables);
 /** Observe completed launches now (normally done at every call). */
 CV_EXPORTS void reapCompleted();
+/** Release the resources pinned for captured graphs.
+ *
+ * A graph recorded from a capturing stream is launched later, possibly after its module and
+ * tables would have been evicted, so the runtime pins them at capture time. CUDA does not
+ * notify when the caller destroys a graph, so the pin is released here instead: call this once
+ * the graphs you captured are destroyed or no longer used. Returning them early and then
+ * launching a graph that reads them is use-after-free, which no API can detect for you. */
+CV_EXPORTS void releaseCapturePins();
 /** Fill newly allocated table buffers with 0xFF before the upload, so a launch that read a
  *  table before its upload completed produces garbage instead of plausible numbers. */
 CV_EXPORTS void setPoisonNewTables(bool on);

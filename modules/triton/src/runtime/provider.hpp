@@ -1,6 +1,6 @@
 // Private resize provider protocol (BACKLOG B3). Destination: opencv_contrib
 // modules/triton/src/runtime/ (it replaces the one-call backend::launchResize of
-// the earlier one-call backend layer). Not a public API and not a cross-version plugin ABI.
+// src/backend/backend.hpp). Not a public API and not a cross-version plugin ABI.
 //
 // Layering (docs/opencv/jit-integration.md §4, adjusted in §15):
 //   entry adapter (GpuMat today, a HIP view, a future HAL/UMat adapter)
@@ -25,8 +25,14 @@ namespace kf_resize_rt {
 // ------------------------------------------------------------------ identities
 
 enum class Backend : int { CUDA = 1, HIP = 2 };
-enum class ElemType : int { U8 = 0, F32 = 1 };
-inline std::size_t elem_size(ElemType t) { return t == ElemType::U8 ? 1 : 4; }
+// U16 exists because warpAffine serves CV_16U (contract warpaffine/0.4.1). It is a property
+// of this shared runtime, not of resize, which still accepts CV_8U and CV_32F only and says
+// so at its own entry.
+enum class ElemType : int { U8 = 0, F32 = 1, U16 = 2 };
+inline std::size_t elem_size(ElemType t)
+{
+    return t == ElemType::U8 ? 1 : (t == ElemType::U16 ? 2 : 4);
+}
 
 // Which device context a buffer, stream or module belongs to. `native` is the raw
 // CUcontext / hipCtx_t value; `generation` is assigned by the DeviceService and changes

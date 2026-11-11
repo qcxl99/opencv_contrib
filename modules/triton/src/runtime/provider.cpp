@@ -69,7 +69,10 @@ Status check_view(const DeviceView& v, const char* which) {
     return prepared();
 }
 
-const char* tname(ElemType t) { return t == ElemType::U8 ? "u8" : "fp32"; }
+const char* tname(ElemType t)
+{
+    return t == ElemType::U8 ? "u8" : (t == ElemType::U16 ? "u16" : "fp32");
+}
 
 // The runtime-argument lists of the four jit functions in operators/resize/kernel.py,
 // in Triton's type strings. Constexpr parameters are not runtime arguments. Every

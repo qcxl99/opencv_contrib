@@ -35,9 +35,34 @@ inline Mat randomImage(Size sz, int type, uint64 seed)
     Mat m(sz, type);
     if (CV_MAT_DEPTH(type) == CV_8U)
         rng.fill(m, RNG::UNIFORM, 0, 256);
+    else if (CV_MAT_DEPTH(type) == CV_16U)
+        // The full 16-bit range: a fill of 0..2 would pass every test while exercising none
+        // of the range where a saturating store can go wrong.
+        rng.fill(m, RNG::UNIFORM, 0, 65536);
     else
         rng.fill(m, RNG::UNIFORM, -2.0, 2.0);
     return m;
+}
+
+/** cvtColor's reference: this build's own cv::cvtColor -- and that is stated as such.
+ *
+ * For resize the host build is NOT a valid reference (the CPU result depends on the build),
+ * which is why a portable oracle exists there. For cvtColor the host build IS the reference,
+ * but not because the arithmetic is integer: an integer formula computed differently is still
+ * a different formula. It is the reference because each served code is integer, so an output
+ * pixel depends only on its own bytes and constant tables -- no reduction order, no SIMD width,
+ * no position within the row -- and because that equality was measured on the build recorded in
+ * ReferenceBuildIsCharacterised. It is NOT established that some other build computes the same
+ * numbers: cv::cvtColor dispatches through cv_hal_cvtBGRtoBGR / cvtBGRtoYUV / cvtBGRtoHSV, so a
+ * build with IPP or a custom HAL may differ, and the claim is scoped to the configuration the
+ * evidence was gathered on. The codes that are not position independent at all (HSV2BGR, HLS --
+ * float32) are refused by the module and never reach here.
+ */
+inline Mat cpuCvt(const Mat& src, int code)
+{
+    Mat dst;
+    cv::cvtColor(src, dst, code);
+    return dst;
 }
 
 /** The contract's answer: the portable CPU oracle, independent of this build's cv::resize. */

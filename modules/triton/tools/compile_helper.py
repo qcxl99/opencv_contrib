@@ -49,6 +49,7 @@ import time           # noqa: E402
 
 PROTOCOL = "kf-resize-compile/1"
 BINARY = "kernel.cubin"
+HIP_BINARY = "kernel.hsaco"
 T0 = time.time()
 
 
@@ -143,6 +144,89 @@ def compatible(ty: str, ptx: str) -> bool:
     return {"i32": ptx in ("u32", "s32"), "fp32": ptx == "f32"}.get(ty, False)
 
 
+def amdhsa_params(amdgcn: str) -> tuple[str, list[dict]]:
+    """The hip counterpart of ptx_params(): (kernel name, explicit kernel arguments) read from
+    the AMDHSA metadata the compiler embeds in the code object. Only `.args` is read:
+    `.unfolded_args` repeats it further down. Exactly one kernel entry is expected."""
+    i = amdgcn.find("amdhsa.kernels:")
+    if i < 0:
+        raise HelperError("abi_mismatch", "no amdhsa.kernels metadata in the AMDGCN")
+    name, args, kernels, section = None, [], 0, None
+    for line in amdgcn[i:].splitlines()[1:]:
+        if line and not line.startswith(" "):
+            break                                        # the next top-level key (amdhsa.target, ...)
+        if not line.strip():
+            continue
+        m = re.match(r"^  - (\.\w+):\s*(.*)$", line)     # a kernel entry opens with its first key
+        if m:
+            kernels += 1
+        else:
+            m = re.match(r"^    (\.\w+):\s*(.*)$", line)   # a further key of the same kernel
+        if m:
+            section = m.group(1)
+            if section == ".name":
+                name = m.group(2).strip()
+        elif kernels == 1 and section == ".args":         # a line inside the .args list
+            body = line.strip()
+            if body.startswith("- "):
+                args.append({})
+                body = body[2:]
+            kv = re.match(r"^(\.\w+):\s*(.*)$", body)
+            if kv and args:
+                args[-1][kv.group(1)] = kv.group(2).strip()
+    if kernels != 1 or not name:
+        raise HelperError("abi_mismatch", f"expected one amdhsa kernel entry with a name, found {kernels}")
+    return name, args
+
+
+def hip_scalar_class(ty: str, kind: str, size: int):
+    """The scalar class the manifest's `ptx` field carries for a hip argument ('ptx' is the
+    protocol's historical field name), or None if the compiler passes it some other way.
+    The AMDHSA metadata separates pointers from scalars and gives the size, but not
+    signed-vs-float, so i32 and fp32 are told apart by the key's own type string."""
+    if ty.startswith("*"):
+        return "u64" if kind == "global_buffer" and size == 8 else None
+    if kind == "by_value" and size == 4:
+        return {"i32": "s32", "fp32": "f32"}.get(ty)
+    return None
+
+
+def hip_abi(key: dict, sig_names: list[str], ck):
+    """(entry, abi) for a hip kernel. Every kernel argument must be an explicit one
+    (global_buffer / by_value): a hidden_* argument would need the launcher to supply it, and
+    launching without it would be silent corruption, so it is refused here instead."""
+    entry, args = amdhsa_params(ck.asm["amdgcn"])
+    if entry != ck.name:
+        raise HelperError("abi_mismatch", f"metadata names kernel {entry!r}, the compiler produced {ck.name!r}")
+    parsed = []
+    for i, a in enumerate(args):
+        try:
+            kind, size = a[".value_kind"], int(a[".size"])
+        except (KeyError, ValueError):
+            raise HelperError("abi_mismatch", f"kernel argument {i} has no .value_kind/.size: {a}")
+        if kind not in ("global_buffer", "by_value"):
+            raise HelperError("abi_mismatch", f"kernel argument {i} is {kind!r}; the launcher passes explicit arguments only")
+        parsed.append((kind, size))
+    if len(parsed) < len(sig_names):
+        raise HelperError("abi_mismatch", f"AMDHSA entry has {len(parsed)} arguments for {len(sig_names)} runtime arguments")
+    extra_names = ["global_scratch", "profile_scratch"]
+    abi = []
+    for i, (kind, size) in enumerate(parsed):
+        if i < len(sig_names):
+            n, t = key["signature"][i]
+            cls = hip_scalar_class(t, kind, size)
+            if cls is None:
+                raise HelperError("abi_mismatch", f"argument {n}:{t} is passed as {kind}/{size}")
+            abi.append({"name": n, "type": t, "ptx": cls, "null_pointer": False, "abi_source": "amdhsa"})
+        else:
+            if kind != "global_buffer" or size != 8:
+                raise HelperError("abi_mismatch", f"trailing argument {i} is {kind}/{size}, not a pointer")
+            j = i - len(sig_names)
+            abi.append({"name": extra_names[j] if j < len(extra_names) else f"extra_{j}", "type": "*i8", "ptx": "u64",
+                        "null_pointer": True, "abi_source": "amdhsa"})
+    return entry, abi
+
+
 def build(key: dict, src_path: str):
     import triton
     from triton.backends.compiler import GPUTarget
@@ -150,8 +234,9 @@ def build(key: dict, src_path: str):
 
     if f"triton-{triton.__version__}" != key["compiler"]:
         raise HelperError("compiler_mismatch", f"this helper runs triton-{triton.__version__}, the key names {key['compiler']}")
-    if key["target"]["backend"] != "cuda":
-        raise HelperError("invalid_request", f"backend {key['target']['backend']!r}: this helper builds cuda only")
+    backend_name = key["target"]["backend"]
+    if backend_name not in ("cuda", "hip"):
+        raise HelperError("invalid_request", f"backend {backend_name!r}: this helper builds cuda and hip only")
     spec = importlib.util.spec_from_file_location(f"kf_resize_kernels_{key['source_sha256'][:12]}", src_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -168,7 +253,11 @@ def build(key: dict, src_path: str):
     full = {a: "constexpr" for a in fn.arg_names}
     full.update({n: t for n, t in key["signature"]})
     src = ASTSource(fn, full, {n: v for n, v in key["constexprs"]}, {})   # no implicit specialisation
-    target = GPUTarget(key["target"]["backend"], key["target"]["arch"], key["target"]["warp_size"])
+    # cuda: arch is the integer compute capability (90 = sm_90). hip: it is the gfx number
+    # (936 = gfx936); an arch with a letter suffix (gfx90a) has no integer form, so the key
+    # cannot name it and the runtime reports it unsupported rather than guessing.
+    arch = key["target"]["arch"] if backend_name == "cuda" else f"gfx{key['target']['arch']}"
+    target = GPUTarget(backend_name, arch, key["target"]["warp_size"])
     backend = triton.compiler.make_backend(target)
     opts = backend.parse_options({"num_warps": key["num_warps"], "num_stages": key["num_stages"]})
     try:
@@ -178,6 +267,13 @@ def build(key: dict, src_path: str):
     md = ck.metadata
     if getattr(md, "global_scratch_size", 0) or getattr(md, "profile_scratch_size", 0):
         raise HelperError("unsupported_scratch", "the kernel needs global/profile scratch memory; the launcher passes null")
+    launch = {"threads_per_block": md.num_warps * md.warp_size, "num_warps": md.num_warps, "warp_size": md.warp_size,
+              "num_ctas": getattr(md, "num_ctas", 1), "shared_bytes": md.shared,
+              "global_scratch_bytes": int(getattr(md, "global_scratch_size", 0) or 0),
+              "profile_scratch_bytes": int(getattr(md, "profile_scratch_size", 0) or 0)}
+    if backend_name == "hip":
+        entry, abi = hip_abi(key, sig_names, ck)
+        return entry, HIP_BINARY, "hsaco", ck.asm["hsaco"], abi, launch, triton.__version__
     entry, types = ptx_params(ck.asm["ptx"])
     if len(types) < len(sig_names):
         raise HelperError("abi_mismatch", f"PTX entry has {len(types)} parameters for {len(sig_names)} arguments")
@@ -195,11 +291,7 @@ def build(key: dict, src_path: str):
             j = i - len(sig_names)
             abi.append({"name": extra_names[j] if j < len(extra_names) else f"extra_{j}", "type": "*i8", "ptx": ptx,
                         "null_pointer": True})
-    launch = {"threads_per_block": md.num_warps * md.warp_size, "num_warps": md.num_warps, "warp_size": md.warp_size,
-              "num_ctas": md.num_ctas, "shared_bytes": md.shared,
-              "global_scratch_bytes": int(getattr(md, "global_scratch_size", 0)),
-              "profile_scratch_bytes": int(getattr(md, "profile_scratch_size", 0))}
-    return entry, ck.asm["cubin"], abi, launch, triton.__version__
+    return entry, BINARY, "cubin", ck.asm["cubin"], abi, launch, triton.__version__
 
 
 def compile_error_text(exc: BaseException) -> str:
@@ -263,12 +355,12 @@ def serve(raw: bytes) -> dict:
                 return dict(out, status="cached", artifact_dir=final, manifest_sha256=info)
             os.rename(final, os.path.join(cache, f".bad-{digest}-{int(time.time() * 1000)}"))
             out["replaced_invalid_entry"] = info
-        entry, cubin, abi, launch, tver = build(key, src_path)
+        entry, binfile, binfmt, binary, abi, launch, tver = build(key, src_path)
         tmp = tempfile.mkdtemp(prefix=f".tmp-{digest}-{os.getpid()}-", dir=cache)
-        write_synced(os.path.join(tmp, BINARY), cubin)
+        write_synced(os.path.join(tmp, binfile), binary)
         fault("mid_publish")
         manifest = {"protocol": PROTOCOL, "key": key, "key_text": text, "key_digest": digest, "function": entry,
-                    "binary": {"file": BINARY, "format": "cubin", "sha256": sha(cubin), "bytes": len(cubin)},
+                    "binary": {"file": binfile, "format": binfmt, "sha256": sha(binary), "bytes": len(binary)},
                     "abi": abi, "launch": launch,
                     "build": {"triton_version": tver, "line_info": False, "python": sys.version.split()[0],
                               "torch_loaded": False, "created_unix": round(time.time(), 3)}}

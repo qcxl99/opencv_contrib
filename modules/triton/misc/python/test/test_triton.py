@@ -106,5 +106,226 @@ class triton_numeric_test(_TritonBase):
                     self._check(f32, dsize, interp)
 
 
+# cvtColor is a different case from resize: every code it serves is INTEGER arithmetic on
+# CV_8U in OpenCV, so this build's own cv.cvtColor is a legitimate oracle -- no pinned
+# reference configuration, no float32 tolerance. (The float32 conversions -- HSV2BGR and the
+# HLS pair -- are deliberately not served; see the module README for why.)
+_CVT_CODES = [
+    (cv.COLOR_BGR2BGRA, 3, 4), (cv.COLOR_BGRA2BGR, 4, 3),
+    (cv.COLOR_BGR2RGBA, 3, 4), (cv.COLOR_RGBA2BGR, 4, 3),
+    (cv.COLOR_BGR2RGB, 3, 3), (cv.COLOR_BGRA2RGBA, 4, 4),
+    (cv.COLOR_BGR2GRAY, 3, 1), (cv.COLOR_RGB2GRAY, 3, 1),
+    (cv.COLOR_BGRA2GRAY, 4, 1), (cv.COLOR_RGBA2GRAY, 4, 1),
+    (cv.COLOR_BGR2YCrCb, 3, 3), (cv.COLOR_RGB2YCrCb, 3, 3),
+    (cv.COLOR_YCrCb2BGR, 3, 3), (cv.COLOR_YCrCb2RGB, 3, 3),
+    (cv.COLOR_BGR2HSV, 3, 3), (cv.COLOR_RGB2HSV, 3, 3),
+    (cv.COLOR_BGR2HSV_FULL, 3, 3), (cv.COLOR_RGB2HSV_FULL, 3, 3),
+    (cv.COLOR_BGR2YUV, 3, 3), (cv.COLOR_RGB2YUV, 3, 3),
+    (cv.COLOR_YUV2BGR, 3, 3), (cv.COLOR_YUV2RGB, 3, 3),
+]
+
+
+class triton_cvtcolor_test(_TritonBase):
+    """The cvtColor binding, against this build's own integer CPU path."""
+
+    def test_matches_cpu_exactly(self):
+        rng = np.random.RandomState(3)
+        for code, scn, dcn in _CVT_CODES:
+            for h, w in ((1, 1), (7, 13), (61, 97), (480, 640)):
+                img = rng.randint(0, 256, (h, w, scn)).astype(np.uint8)
+                got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
+                ref = cv.cvtColor(img, code)
+                # Integer arithmetic on both sides: exact, not "within a tolerance".
+                self.assertEqual((h, w, dcn) if dcn > 1 else (h, w), got.shape)
+                self.assertEqual(got.dtype, np.uint8)
+                self.assertEqual(int(np.abs(got.astype(np.int16) -
+                                            ref.astype(np.int16)).max()), 0,
+                                 msg="code " + str(code))
+
+    def test_rejected_codes_raise(self):
+        img = np.zeros((32, 32, 3), np.uint8)
+        # The float32 conversions: refused by name rather than served under a tolerance.
+        for code in (cv.COLOR_HSV2BGR, cv.COLOR_BGR2HLS):
+            with self.assertRaises(cv.error):
+                cv.triton.cvtColor(cv.cuda_GpuMat(img), code)
+        # Outside CV_8U.
+        with self.assertRaises(cv.error):
+            cv.triton.cvtColor(cv.cuda_GpuMat(np.zeros((32, 32, 3), np.float32)),
+                               cv.COLOR_BGR2GRAY)
+        # A source whose channel count does not match the code.
+        with self.assertRaises(cv.error):
+            cv.triton.cvtColor(cv.cuda_GpuMat(np.zeros((32, 32), np.uint8)),
+                               cv.COLOR_BGR2GRAY)
+
+
+# warpAffine. Same split as resize and for the same reason: the binding is checked on any build,
+# the numbers only against the selected reference. Unlike cvtColor these numbers are NOT exact --
+# the module reproduces the CPU's vector-path arithmetic, and the contract is a per-element bound
+# (uint8 exact, uint16 <= 1 level, float32 min(5e-5 * max(|ref|, 1.0), 1e-4)). CUBIC is
+# compared against the NATURAL-WIDTH call: that CPU path has no body/tail split (measured 0 of
+# 320 width pairs), so the padding trick the other two need would be meaningless there.
+_WA_F32_REL = 5.0e-5
+_WA_F32_FLOOR = 1.0
+
+_WA_GEOMS = [
+    ("identity",  [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+    ("subpixel",  [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5]]),
+    ("rot_scale", [[0.9, -0.43589, 12.0], [0.43589, 0.9, -7.0]]),
+    ("shear",     [[1.0, 0.35, 0.0], [0.0, 1.0, 0.0]]),
+    ("negative",  [[-1.0, 0.0, 60.0], [0.0, -1.0, 40.0]]),
+]
+
+
+def _wa_within(got, ref):
+    """The contract's per-element bound. Returns (elements outside, max normalised error)."""
+    if ref.dtype in (np.uint8, np.uint16):
+        d = np.abs(got.astype(np.int64) - ref.astype(np.int64))
+        return int((d > (0 if ref.dtype == np.uint8 else 1)).sum()), float(d.max(initial=0))
+    a, b = got.astype(np.float64), ref.astype(np.float64)
+    d = np.abs(a - b)
+    allowed = np.minimum(_WA_F32_REL * np.maximum(np.abs(b), _WA_F32_FLOOR), 1e-4)
+    return int((~(d <= allowed)).sum()), float(np.max(d / allowed, initial=0.0))
+
+
+class triton_warpaffine_binding_test(_TritonBase):
+    """The binding works -- shape, dtype, channels, matrix types, output reuse, refusals."""
+
+    def test_returns_requested_shape_dtype_and_channels(self):
+        rng = np.random.RandomState(0)
+        M = np.array(_WA_GEOMS[1][1], np.float64)
+        for channels in (1, 3, 4):
+            shape = (37, 53) if channels == 1 else (37, 53, channels)
+            for img in (rng.randint(0, 256, shape).astype(np.uint8),
+                        rng.randint(0, 65536, shape).astype(np.uint16),
+                        (rng.rand(*shape) * 4 - 2).astype(np.float32)):
+                for dsize in ((53, 37), (80, 60)):
+                    got = cv.triton.warpAffine(cv.cuda_GpuMat(img), M, dsize).download()
+                    expect = ((dsize[1], dsize[0]) if channels == 1
+                              else (dsize[1], dsize[0], channels))
+                    self.assertEqual(got.shape, expect)
+                    self.assertEqual(got.dtype, img.dtype)
+
+    def test_matrix_accepts_float32_and_float64(self):
+        # cv::warpAffine takes either; the module narrows to double internally, so both must give
+        # the same result. A binding that forwarded the Mat blindly would handle one of them.
+        rng = np.random.RandomState(1)
+        img = rng.randint(0, 256, (37, 53, 3)).astype(np.uint8)
+        g = cv.cuda_GpuMat(img)
+        ref = None
+        for dt in (np.float32, np.float64):
+            M = np.array(_WA_GEOMS[2][1], dt)
+            got = cv.triton.warpAffine(g, M, (53, 37)).download()
+            if ref is None:
+                ref = got
+            else:
+                self.assertEqual(int(np.abs(got.astype(np.int16) -
+                                            ref.astype(np.int16)).max()), 0)
+
+    def test_border_value_is_a_scalar_per_channel(self):
+        # A C3 border of (10, 20, 30) fills three channels; a single 77 fills channel 0 only,
+        # exactly as cv::warpAffine expands Scalar(v) to (v, 0, 0, 0).
+        img = np.zeros((9, 7, 3), np.uint8)
+        M = np.array([[1.0, 0.0, -1000.0], [0.0, 1.0, -1000.0]])    # everything outside
+        for bv, want in (((10, 20, 30), (10, 20, 30)), (77, (77, 0, 0))):
+            got = cv.triton.warpAffine(cv.cuda_GpuMat(img), M, (7, 9),
+                                       borderMode=cv.BORDER_CONSTANT, borderValue=bv).download()
+            self.assertEqual(tuple(int(v) for v in got[0, 0]), want)
+
+    def test_float32_border_keeps_fractional_precision(self):
+        img = np.zeros((9, 7), np.float32)
+        M = np.array([[1.0, 0.0, -1000.0], [0.0, 1.0, -1000.0]])
+        for bv in (0.5, -1.75, 3.25):
+            got = cv.triton.warpAffine(cv.cuda_GpuMat(img), M, (7, 9),
+                                       borderMode=cv.BORDER_CONSTANT,
+                                       borderValue=bv).download()
+            self.assertAlmostEqual(float(got[0, 0]), bv, places=6)
+
+    def test_destination_is_reused_when_supplied(self):
+        rng = np.random.RandomState(2)
+        img = rng.randint(0, 256, (37, 53, 3)).astype(np.uint8)
+        M = np.array(_WA_GEOMS[2][1], np.float64)
+        dst = cv.cuda_GpuMat((37, 53), cv.CV_8UC3)
+        cv.triton.warpAffine(cv.cuda_GpuMat(img), M, (53, 37), dst=dst)
+        first = dst.download()
+        cv.triton.warpAffine(cv.cuda_GpuMat(img), M, (53, 37), dst=dst)
+        self.assertEqual(int(np.abs(first.astype(np.int16) -
+                                    dst.download().astype(np.int16)).max()), 0)
+
+    def test_rejected_inputs_raise(self):
+        u8 = np.zeros((32, 32, 3), np.uint8)
+        M = np.eye(3, dtype=np.float64)[:2]
+        # INTER_CUBIC is served as of 0.4.0; LANCZOS4 and AREA are not.
+        for interp in (cv.INTER_LANCZOS4, cv.INTER_AREA):
+            with self.assertRaises(cv.error):
+                cv.triton.warpAffine(cv.cuda_GpuMat(u8), M, (32, 32), flags=interp)
+        # CV_16U is served; CV_16S is not.
+        got = cv.triton.warpAffine(cv.cuda_GpuMat(np.zeros((32, 32, 3), np.uint16)),
+                                   M, (32, 32)).download()
+        self.assertEqual(got.dtype, np.uint16)
+        with self.assertRaises(cv.error):
+            cv.triton.warpAffine(cv.cuda_GpuMat(np.zeros((32, 32, 3), np.int16)), M, (32, 32))
+        with self.assertRaises(cv.error):
+            cv.triton.warpAffine(cv.cuda_GpuMat(np.zeros((32, 32, 2), np.uint8)), M, (32, 32))
+        with self.assertRaises(cv.error):
+            cv.triton.warpAffine(cv.cuda_GpuMat(u8), np.zeros((3, 3), np.float64), (32, 32))
+
+
+class triton_warpaffine_numeric_test(_TritonBase):
+    """The numbers match the selected CPU reference. Skips on other builds."""
+
+    def setUp(self):
+        super(triton_warpaffine_numeric_test, self).setUp()
+        if not _is_reference_build():
+            self.skipTest("cv.warpAffine of this build is not the reference configuration; "
+                          "the C++ suite compares against the portable oracle instead")
+
+    def _check(self, img, M, dsize, flags, border, bv=0):
+        g = cv.cuda_GpuMat(img)
+        got = cv.triton.warpAffine(g, M, dsize, flags=flags, borderMode=border,
+                                   borderValue=bv).download()
+        ref = cv.warpAffine(img, M, dsize, flags=flags, borderMode=border, borderValue=bv)
+        self.assertEqual(got.shape, ref.shape)
+        nbad, worst = _wa_within(got, ref)
+        # Against a NATURAL-width CPU call the two can differ at critical coordinates: under
+        # NEAREST by an adjacent pixel's value, under LINEAR by one level. This is the
+        # compatibility cost the contract states, so the test asserts the LINEAR bound and only
+        # checks NEAREST on geometries where the CPU accepts the shared region -- using the
+        # vector-path reference, which pads and crops, exactly as the C++ suite does.
+        if (flags & cv.INTER_MAX) in (cv.INTER_NEAREST, cv.INTER_LINEAR):
+            # The invoker-family paths have the body/tail split, so the reference is the
+            # padded vector path. CUBIC does not: it keeps the natural-width ref above.
+            wide = ((dsize[0] + 128 + 127) // 128) * 128
+            ref_v = cv.warpAffine(img, M, (wide, dsize[1]), flags=flags,
+                                  borderMode=border, borderValue=bv)[:, :dsize[0]]
+            nbad, worst = _wa_within(got, ref_v)
+        self.assertEqual(nbad, 0, msg="%d elements outside the contract, worst %.3f"
+                                     % (nbad, worst))
+
+    def test_matches_cpu(self):
+        rng = np.random.RandomState(4)
+        for name, m in _WA_GEOMS:
+            M = np.array(m, np.float64)
+            for channels in (1, 3, 4):
+                shape = (37, 53) if channels == 1 else (37, 53, channels)
+                for img in (rng.randint(0, 256, shape).astype(np.uint8),
+                            rng.randint(0, 65536, shape).astype(np.uint16),
+                            (rng.rand(*shape) * 4 - 2).astype(np.float32)):
+                    for flags, border in ((cv.INTER_LINEAR, cv.BORDER_REPLICATE),
+                                          (cv.INTER_NEAREST, cv.BORDER_CONSTANT),
+                                          (cv.INTER_LINEAR, cv.BORDER_REFLECT_101),
+                                          (cv.INTER_LINEAR | cv.WARP_INVERSE_MAP,
+                                           cv.BORDER_CONSTANT),
+                                          (cv.INTER_CUBIC, cv.BORDER_CONSTANT),
+                                          (cv.INTER_CUBIC, cv.BORDER_REFLECT_101)):
+                        self._check(img, M, (53, 37), flags, border, 7)
+
+    def test_matches_cpu_larger_destination(self):
+        rng = np.random.RandomState(5)
+        img = rng.randint(0, 256, (37, 53, 3)).astype(np.uint8)
+        for name, m in _WA_GEOMS:
+            self._check(img, np.array(m, np.float64), (120, 90),
+                        cv.INTER_LINEAR, cv.BORDER_CONSTANT, 3)
+
+
 if __name__ == '__main__':
     NewOpenCVTests.bootstrap()

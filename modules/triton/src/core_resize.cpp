@@ -10,6 +10,8 @@
 // to cv::cuda: a call that returns has submitted the computation (or the identity copy).
 
 #include "precomp.hpp"
+#include "runtime/cvtcolor.hpp"
+#include "runtime/warpaffine.hpp"
 #include "runtime/runtime.hpp"
 
 namespace cv { namespace triton {
@@ -25,13 +27,34 @@ kf_resize_rt::DeviceView toDeviceView(const ImageView& v, int device, std::uintp
     d.cols = v.cols;
     d.channels = CV_MAT_CN(v.type);
     const int depth = CV_MAT_DEPTH(v.type);
-    if (depth != CV_8U && depth != CV_32F)
-        CV_Error(Error::StsUnsupportedFormat, "cv::triton::resize: only CV_8U and CV_32F are supported");
-    d.type = depth == CV_8U ? kf_resize_rt::ElemType::U8 : kf_resize_rt::ElemType::F32;
+    if (depth != CV_8U && depth != CV_32F && depth != CV_16U)
+        CV_Error(Error::StsUnsupportedFormat,
+                 "cv::triton: only CV_8U, CV_16U and CV_32F are supported");
+    d.type = depth == CV_8U ? kf_resize_rt::ElemType::U8
+             : (depth == CV_16U ? kf_resize_rt::ElemType::U16 : kf_resize_rt::ElemType::F32);
     d.step = v.step;
     d.alloc_base = alloc_base;
     d.alloc_bytes = alloc_bytes;
     return d;
+}
+
+static void raiseCvt(const kf_resize_rt::Status& s)
+{
+    using kf_resize_rt::Reason;
+    const std::string what = cv::format("cv::triton::cvtColor: %s (%s)", s.message.c_str(),
+                                        kf_resize_rt::reason_name(s.reason));
+    if (s.code == kf_resize_rt::Code::Unsupported)
+    {
+        switch (s.reason)
+        {
+        case Reason::DepthOrChannels: case Reason::Interpolation: case Reason::TypeMismatch:
+        case Reason::RouteNotEnabled:
+            CV_Error(Error::StsUnsupportedFormat, what);
+        default:
+            CV_Error(Error::StsBadArg, what);
+        }
+    }
+    CV_Error(Error::StsError, what + (s.submitted ? " -- work had already been submitted; dst is undefined" : ""));
 }
 
 static void raise(const kf_resize_rt::Status& s)
@@ -71,6 +94,47 @@ void resizeDevice(const kf_resize_rt::DeviceView& src, const kf_resize_rt::Devic
     // Asynchronous: everything is on `stream`. No implicit synchronisation.
 }
 
+static void raiseWarp(const kf_resize_rt::Status& s)
+{
+    using kf_resize_rt::Reason;
+    const std::string what = cv::format("cv::triton::warpAffine: %s (%s)", s.message.c_str(),
+                                        kf_resize_rt::reason_name(s.reason));
+    if (s.code == kf_resize_rt::Code::Unsupported)
+    {
+        switch (s.reason)
+        {
+        case Reason::DepthOrChannels: case Reason::Interpolation: case Reason::TypeMismatch:
+        case Reason::RouteNotEnabled:
+            CV_Error(Error::StsUnsupportedFormat, what);
+        default:
+            CV_Error(Error::StsBadArg, what);
+        }
+    }
+    CV_Error(Error::StsError, what + (s.submitted ? " -- work had already been submitted; dst is undefined" : ""));
+}
+
+void warpAffineDevice(const kf_warpaffine::Request& req, int device, std::uintptr_t stream)
+{
+    kf_resize_rt::ExecContext ex;
+    ex.ctx.device = device;
+    ex.stream = stream;
+    const kf_resize_rt::Status s = runtime::warpAffine(req, ex);
+    if (s.code != kf_resize_rt::Code::Submitted)
+        raiseWarp(s);
+    // Asynchronous: same contract as resizeDevice().
+}
+
+void cvtColorDevice(const kf_cvtcolor::Request& req, int device, std::uintptr_t stream)
+{
+    kf_resize_rt::ExecContext ex;
+    ex.ctx.device = device;
+    ex.stream = stream;
+    const kf_resize_rt::Status s = runtime::cvtColor(req, ex);
+    if (s.code != kf_resize_rt::Code::Submitted)
+        raiseCvt(s);
+    // Asynchronous: same contract as resizeDevice().
+}
+
 }  // namespace detail
 
 void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
@@ -79,6 +143,18 @@ void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
 {
     if (dsize.width <= 0 || dsize.height <= 0)
         CV_Error(Error::StsUnsupportedFormat, "cv::triton::resizeCore: dsize must be explicit and non-empty");
+    // resize covers CV_8U and CV_32F only; CV_16U belongs to warpAffine. Checked here because
+    // toDeviceView is shared and now accepts all three depths -- refusing later would let the
+    // request reach the compile helper, which reports -2 instead of the documented
+    // StsUnsupportedFormat.
+    for (const ImageView* v : {&src, &dst})
+    {
+        const int depth = CV_MAT_DEPTH(v->type);
+        if (depth != CV_8U && depth != CV_32F)
+            CV_Error(Error::StsUnsupportedFormat,
+                     cv::format("cv::triton::resize: depth %d is not supported (CV_8U and CV_32F only)",
+                                depth));
+    }
     if (!runtime::deviceAvailable(ctx.device))
         CV_Error(Error::StsNotImplemented, "cv::triton::resizeCore: no usable CUDA device for ctx.device; "
                                            "this module never falls back to CPU or cv::cuda");
@@ -100,5 +176,6 @@ void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
     detail::resizeDevice(detail::toDeviceView(src, ctx.device, 0, 0), detail::toDeviceView(dst, ctx.device, 0, 0),
                          ds, fx, fy, interpolation, ctx.device, ctx.stream);
 }
+
 
 }}  // namespace cv::triton

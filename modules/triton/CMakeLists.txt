@@ -46,6 +46,8 @@ set(_triton_srcs
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cuda_runtime.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/reference_cpu.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/provider.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cvtcolor.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/runtime/warpaffine.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/compile_protocol.cpp")
 # Installed headers: only the public umbrella. src/core.hpp is deliberately NOT here -- it is a
 # raw device-pointer layer the plan code shares with the GpuMat adapter, not an API for callers.
@@ -98,7 +100,10 @@ ocv_target_compile_definitions(${the_module} PRIVATE
   OPENCV_TRITON_PYTHON_DEFAULT="${TRITON_PYTHON_EXECUTABLE}"
   OPENCV_TRITON_PYTHONPATH_DEFAULT="${TRITON_PYTHONPATH}"
   OPENCV_TRITON_COMPILER_DEFAULT="${_triton_compiler}")
-install(FILES "${CMAKE_CURRENT_LIST_DIR}/kernels/resize_cpu.py" DESTINATION "${_triton_res_install}/kernels" COMPONENT libs)
+install(FILES "${CMAKE_CURRENT_LIST_DIR}/kernels/resize_cpu.py"
+              "${CMAKE_CURRENT_LIST_DIR}/kernels/cvtcolor_cpu.py"
+              "${CMAKE_CURRENT_LIST_DIR}/kernels/warpaffine_cpu.py"
+        DESTINATION "${_triton_res_install}/kernels" COMPONENT libs)
 install(FILES "${CMAKE_CURRENT_LIST_DIR}/tools/compile_helper.py" DESTINATION "${_triton_res_install}/tools" COMPONENT libs)
 
 # --- tests / perf / samples -------------------------------------------------------------
@@ -115,13 +120,26 @@ if(TARGET opencv_perf_triton)
   # first pass, before other modules' targets exist, so the target check was false even in a
   # build that had cudawarping enabled. HAVE_opencv_cudawarping is the configure-time answer,
   # and ocv_check_dependencies is the standard way to ask it.
+  #
+  # Two separate baselines, two separate guards: cv::cuda::resize is in cudawarping and
+  # cv::cuda::cvtColor in cudaimgproc, and a build may have either, both or neither. Each
+  # missing one omits its own perf test and nothing else.
   ocv_check_dependencies(opencv_cudawarping)
   if(OCV_DEPENDENCIES_FOUND)
     ocv_target_include_modules(opencv_perf_triton opencv_cudawarping)
     ocv_target_link_libraries(opencv_perf_triton LINK_PRIVATE opencv_cudawarping)
     target_compile_definitions(opencv_perf_triton PRIVATE OPENCV_TRITON_PERF_HAVE_CUDAWARPING=1)
   else()
-    message(STATUS "triton: opencv_cudawarping not built -- the native CUDA timing baseline "
+    message(STATUS "triton: opencv_cudawarping not built -- the native CUDA resize baseline "
+                   "in perf/ is omitted; the module itself is unaffected")
+  endif()
+  ocv_check_dependencies(opencv_cudaimgproc)
+  if(OCV_DEPENDENCIES_FOUND)
+    ocv_target_include_modules(opencv_perf_triton opencv_cudaimgproc)
+    ocv_target_link_libraries(opencv_perf_triton LINK_PRIVATE opencv_cudaimgproc)
+    target_compile_definitions(opencv_perf_triton PRIVATE OPENCV_TRITON_PERF_HAVE_CUDAIMGPROC=1)
+  else()
+    message(STATUS "triton: opencv_cudaimgproc not built -- the native CUDA cvtColor baseline "
                    "in perf/ is omitted; the module itself is unaffected")
   endif()
 endif()

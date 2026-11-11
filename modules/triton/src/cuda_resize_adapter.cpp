@@ -15,6 +15,8 @@
 // CUDA only; a build of this module without it is not offered.
 
 #include "precomp.hpp"
+#include "runtime/cvtcolor.hpp"
+#include "runtime/warpaffine.hpp"
 #include "runtime/runtime.hpp"
 
 namespace cv { namespace triton {
@@ -31,6 +33,14 @@ bool haveBackend()
 String backendName()
 {
     return haveBackend() ? String(runtime::name()) : String();
+}
+
+void releaseGraphResources()
+{
+    // The whole graph lifecycle responsibility of this module: the runtime pins the compiled
+    // module and its tables when a launch is recorded into a capturing stream, and cannot know
+    // when the caller's graph is destroyed. See the declaration for the contract and the cost.
+    detail::releaseCapturePins();
 }
 
 namespace {
@@ -86,6 +96,14 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
     // factor, which is precisely the case this path exists to exercise --
     // so the ORIGINAL fx/fy (when given) must reach the kernel unchanged,
     // and only a dsize-given call computes kernel-space scale from dsize.
+    // resize serves CV_8U and CV_32F only. The shared device-view conversion also accepts
+    // CV_16U (warpAffine needs it), so resize states its own depth rule here, at its own entry,
+    // before anything is allocated or submitted -- refusing later would let a 16-bit request
+    // reach the compile helper, which fails with a different, undocumented error code.
+    if (src.depth() != CV_8U && src.depth() != CV_32F)
+        CV_Error(Error::StsUnsupportedFormat,
+                 cv::format("cv::triton::resize: depth %d is not supported (CV_8U and CV_32F only)",
+                            src.depth()));
     const bool fxfyGiven = dsize.empty();
     if (dsize.empty() && !(fx > 0 && fy > 0))
         CV_Error(Error::StsBadArg,
@@ -147,6 +165,127 @@ void resize(const cuda::GpuMat& src, cuda::GpuMat& dst, Size dsize,
             double fx, double fy, int interpolation, cuda::Stream& stream)
 {
     resize(InputArray(src), OutputArray(dst), dsize, fx, fy, interpolation, stream);
+}
+
+void cvtColor(InputArray _src, OutputArray _dst, int code, cuda::Stream& stream)
+{
+    CV_Assert(_src.kind() == _InputArray::CUDA_GPU_MAT);
+    cuda::GpuMat src = _src.getGpuMat();
+
+    // The destination channel count is a property of the CODE, not of src: BGR2BGRA writes 4
+    // channels from a 3-channel source, BGR2GRAY writes 1. Deriving it here (rather than
+    // letting the caller's dst decide) is what makes `dst` optional from Python while still
+    // producing a correctly shaped buffer.
+    const kf_cvtcolor::CodeSpec* spec = kf_cvtcolor::find(code);
+    if (!spec)
+        CV_Error(Error::StsUnsupportedFormat,
+                 cv::format("cv::triton::cvtColor: code %d is not served by this module; see "
+                            "opencv2/triton.hpp for the supported set (the float32 conversions "
+                            "are excluded on purpose)", code));
+
+    // In-place is refused for the same reason as in resize(), and detected BEFORE create():
+    // create() may reallocate, after which the aliasing is invisible to the overlap check.
+    if (_dst.kind() == _InputArray::CUDA_GPU_MAT)
+    {
+        const cuda::GpuMat preDst = _dst.getGpuMat();
+        if (!preDst.empty() && preDst.cudaPtr() == src.cudaPtr())
+            CV_Error(Error::StsBadArg, "cv::triton::cvtColor: in-place conversion is not supported");
+    }
+
+    // Same type for src and dst here (CV_8U both ways for every supported code); the channel
+    // count comes from the code, the size from src.
+    _dst.create(src.size(), CV_MAKETYPE(src.depth(), spec->dcn));
+    cuda::GpuMat dst = _dst.getGpuMat();
+    CV_Assert(dst.rows == src.rows && dst.cols == src.cols);
+    CV_Assert(dst.channels() == spec->dcn);
+
+    const int device = cuda::getDevice();
+    const std::uintptr_t cuStream = reinterpret_cast<std::uintptr_t>(cuda::StreamAccessor::getStream(stream));
+    auto view = [&](const cuda::GpuMat& m) {
+        return detail::toDeviceView(toImageView(m), device, reinterpret_cast<std::uintptr_t>(m.datastart),
+                                    static_cast<std::size_t>(m.dataend - m.datastart));
+    };
+    kf_cvtcolor::Request req;
+    req.src = view(src);
+    req.dst = view(dst);
+    req.code = code;
+    detail::cvtColorDevice(req, device, cuStream);
+    // Asynchronous, as resize is: everything needed is on `stream`.
+}
+
+void warpAffine(InputArray _src, OutputArray _dst, InputArray _M, Size dsize, int flags,
+                int borderMode, const Scalar& borderValue, cuda::Stream& stream)
+{
+    CV_Assert(_src.kind() == _InputArray::CUDA_GPU_MAT);
+    cuda::GpuMat src = _src.getGpuMat();
+
+    const int interpolation = flags & INTER_MAX;
+    if (interpolation != INTER_NEAREST && interpolation != INTER_LINEAR &&
+        interpolation != INTER_CUBIC)
+        CV_Error(Error::StsUnsupportedFormat,
+                 cv::format("cv::triton::warpAffine: interpolation %d is not served by this "
+                            "module (warpaffine/0.4.1 covers INTER_NEAREST, INTER_LINEAR and "
+                            "INTER_CUBIC); INTER_LANCZOS4 and INTER_AREA are refused, not "
+                            "approximated",
+                            interpolation));
+    {
+        const int depth = src.depth();
+        if (depth != CV_8U && depth != CV_16U && depth != CV_32F)
+            CV_Error(Error::StsUnsupportedFormat,
+                     cv::format("cv::triton::warpAffine: depth %d is not served by this "
+                                "module (warpaffine/0.4.1 covers CV_8U, CV_16U and CV_32F)",
+                                depth));
+    }
+
+    // The matrix is read here, in double, exactly as cv::warpAffine reads it: CV_32F or
+    // CV_64F, 2x3. The runtime converts and inverts; nothing above this line changes it.
+    Mat M = _M.getMat();
+    CV_Assert(M.rows == 2 && M.cols == 3 && (M.type() == CV_32F || M.type() == CV_64F));
+
+    if (_dst.kind() == _InputArray::CUDA_GPU_MAT)
+    {
+        const cuda::GpuMat preDst = _dst.getGpuMat();
+        if (!preDst.empty() && preDst.cudaPtr() == src.cudaPtr())
+            CV_Error(Error::StsBadArg, "cv::triton::warpAffine: in-place operation is not supported");
+    }
+
+    // The destination type is always src's: warpAffine never changes depth or channel count,
+    // unlike cvtColor. dsize empty means "same size as src", as in cv::warpAffine.
+    _dst.create(dsize.empty() ? src.size() : dsize, src.type());
+    cuda::GpuMat dst = _dst.getGpuMat();
+
+    const int device = cuda::getDevice();
+    const std::uintptr_t cuStream = reinterpret_cast<std::uintptr_t>(cuda::StreamAccessor::getStream(stream));
+    auto view = [&](const cuda::GpuMat& m) {
+        return detail::toDeviceView(toImageView(m), device, reinterpret_cast<std::uintptr_t>(m.datastart),
+                                    static_cast<std::size_t>(m.dataend - m.datastart));
+    };
+    kf_warpaffine::Request req;
+    req.src = view(src);
+    req.dst = view(dst);
+    Mat m64;
+    M.convertTo(m64, CV_64F);
+    for (int i = 0; i < 6; ++i) req.M[i] = m64.at<double>(i / 3, i % 3);
+    req.interpolation = interpolation;
+    req.border_mode = borderMode;
+    // The Scalar is carried per channel: cv2.warpAffine(..., borderValue=(10,20,30)) fills
+    // (10,20,30), and a single scalar fills (v,0,0). Reducing it to borderValue[0] is wrong
+    // for every channel but 0. It stays double here; nothing narrows it before the kernel.
+    for (int i = 0; i < 4; ++i) req.border[i] = borderValue[i];
+    req.inverse_map = (flags & WARP_INVERSE_MAP) != 0;
+    detail::warpAffineDevice(req, device, cuStream);
+    // Asynchronous, as resize is.
+}
+
+void cvtColor(const cuda::GpuMat& src, cuda::GpuMat& dst, int code, cuda::Stream& stream)
+{
+    cvtColor(InputArray(src), OutputArray(dst), code, stream);
+}
+
+void warpAffine(const cuda::GpuMat& src, cuda::GpuMat& dst, InputArray M, Size dsize, int flags,
+                int borderMode, const Scalar& borderValue, cuda::Stream& stream)
+{
+    warpAffine(InputArray(src), OutputArray(dst), M, dsize, flags, borderMode, borderValue, stream);
 }
 
 }}  // namespace cv::triton
