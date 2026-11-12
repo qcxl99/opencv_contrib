@@ -25,7 +25,7 @@
 
 namespace opencv_test { namespace {
 
-DEF_PARAM_TEST(Sz_Interp_Dtype, cv::Size, int, int);
+DEF_PARAM_TEST(Sz_Interp_Dtype, cv::Size, int, int, int);
 
 // Three geometries, chosen for different cost structures rather than to be exhaustive:
 // identity-translate (memory-bandwidth bound, the cheapest mapping), a half-pixel translate
@@ -56,7 +56,8 @@ static cv::Mat toMat(const double m[6])
 PERF_TEST_P(Sz_Interp_Dtype, TritonWarpAffine, testing::Combine(
     testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
     testing::Values(0, 1, 2),          // index into kGeoms, so the name is visible in output
-    testing::Values(CV_8U, CV_16U)))
+    testing::Values(CV_8U, CV_16U, CV_32F),
+    testing::Values((int)cv::INTER_NEAREST, (int)cv::INTER_LINEAR, (int)cv::INTER_CUBIC)))
 {
     const cv::Size size = GET_PARAM(0);
     const int geom      = GET_PARAM(1);
@@ -74,15 +75,48 @@ PERF_TEST_P(Sz_Interp_Dtype, TritonWarpAffine, testing::Combine(
     cv::cuda::GpuMat dst(size, type);   // preallocated: reused, excluded from the cycle
 
     for (int i = 0; i < 20; ++i)
-        cv::triton::warpAffine(src, dst, M, size, cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+        cv::triton::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE);
     cv::cuda::Stream::Null().waitForCompletion();
 
     TEST_CYCLE()
     {
-        cv::triton::warpAffine(src, dst, M, size, cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+        cv::triton::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE);
         cv::cuda::Stream::Null().waitForCompletion();
     }
 
+    CUDA_SANITY_CHECK(dst, 1e-10);
+}
+
+// AREA aliases LINEAR. Transparent reads existing dst, so these routes have their
+// own rows rather than implying an equivalent native CUDA comparison. The initial
+// background is defined before warmup; subsequent calls reuse its current contents.
+DEF_PARAM_TEST(Sz_Interp_Border_Type, cv::Size, int, int, int);
+
+PERF_TEST_P(Sz_Interp_Border_Type, TritonWarpAffineAreaTransparent, testing::Combine(
+    testing::Values(cv::Size(1920, 1080), cv::Size(3840, 2160)),
+    testing::Values((int)cv::INTER_NEAREST, (int)cv::INTER_LINEAR, (int)cv::INTER_AREA),
+    testing::Values((int)cv::BORDER_REPLICATE, (int)cv::BORDER_TRANSPARENT),
+    testing::Values(CV_8UC3, CV_16UC1, CV_32FC1)))
+{
+    const cv::Size size = GET_PARAM(0);
+    const int interp = GET_PARAM(1), border = GET_PARAM(2), type = GET_PARAM(3);
+    if (!cv::triton::haveBackend())
+        throw SkipTestException("no Triton backend available");
+
+    cv::Mat host(size, type);
+    declare.in(host, WARMUP_RNG);
+    const cv::Mat M = toMat(kGeoms[2].M);
+    const cv::cuda::GpuMat src(host);
+    cv::cuda::GpuMat dst(host);
+    for (int i = 0; i < 20; ++i)
+        cv::triton::warpAffine(src, dst, M, size, interp, border);
+    cv::cuda::Stream::Null().waitForCompletion();
+
+    TEST_CYCLE()
+    {
+        cv::triton::warpAffine(src, dst, M, size, interp, border);
+        cv::cuda::Stream::Null().waitForCompletion();
+    }
     CUDA_SANITY_CHECK(dst, 1e-10);
 }
 
@@ -96,7 +130,8 @@ PERF_TEST_P(Sz_Interp_Dtype, TritonWarpAffine, testing::Combine(
 PERF_TEST_P(Sz_Interp_Dtype, NativeCudaWarpAffine_Reference, testing::Combine(
     testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
     testing::Values(0, 1, 2),
-    testing::Values(CV_8U, CV_16U)))
+    testing::Values(CV_8U, CV_16U, CV_32F),
+    testing::Values((int)cv::INTER_NEAREST, (int)cv::INTER_LINEAR, (int)cv::INTER_CUBIC)))
 {
     const cv::Size size = GET_PARAM(0);
     const int geom      = GET_PARAM(1);
@@ -111,12 +146,12 @@ PERF_TEST_P(Sz_Interp_Dtype, NativeCudaWarpAffine_Reference, testing::Combine(
     cv::cuda::GpuMat dst(size, type);
 
     for (int i = 0; i < 20; ++i)
-        cv::cuda::warpAffine(src, dst, M, size, cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+        cv::cuda::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE);
     cv::cuda::Stream::Null().waitForCompletion();
 
     TEST_CYCLE()
     {
-        cv::cuda::warpAffine(src, dst, M, size, cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+        cv::cuda::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE);
         cv::cuda::Stream::Null().waitForCompletion();
     }
 

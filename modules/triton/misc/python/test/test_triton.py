@@ -20,7 +20,7 @@ from tests_common import NewOpenCVTests, unittest
 # unnoticed. The C++ suite covers the numbers on any build against a portable
 # oracle (test/test_resize.cpp); Python is here to prove the binding itself.
 
-_F32_ATOL = {cv.INTER_NEAREST: 0.0, cv.INTER_LINEAR: 4.948e-07, cv.INTER_AREA: 8.419e-07}
+_F32_ATOL = {cv.INTER_NEAREST: 0.0, cv.INTER_LINEAR: 4.948e-07, cv.INTER_AREA: 8.419e-07, cv.INTER_CUBIC: 1.401e-06}
 
 
 def _is_reference_build():
@@ -41,6 +41,25 @@ class _TritonBase(NewOpenCVTests):
             self.skipTest("No CUDA-capable device is detected")
         if not cv.triton.haveBackend():
             self.skipTest("No Triton backend available")
+
+
+class triton_hip_binding_test(NewOpenCVTests):
+    """HIP queries work, and CUDA-only Python adapters raise instead of aborting."""
+
+    def setUp(self):
+        super(triton_hip_binding_test, self).setUp()
+        if not hasattr(cv, "triton") or cv.triton.backendName() != "hip-jit":
+            self.skipTest("requires the HIP Triton module")
+
+    def test_gpumat_adapters_raise_safely(self):
+        gpu = cv.cuda_GpuMat()
+        matrix = np.array([[1., 0., 0.], [0., 1., 0.]], np.float64)
+        for fn, args in ((cv.triton.resize, (gpu, (32, 24))),
+                         (cv.triton.warpAffine, (gpu, matrix, (32, 24)))):
+            for kwargs in ({}, {"stream": None}):
+                with self.assertRaises(cv.error) as raised:
+                    fn(*args, **kwargs)
+                self.assertEqual(raised.exception.code, -213)  # StsNotImplemented
 
 
 class triton_binding_test(_TritonBase):
@@ -70,7 +89,7 @@ class triton_binding_test(_TritonBase):
 
     def test_rejected_inputs_raise(self):
         u8 = np.zeros((32, 32, 3), np.uint8)
-        for interp in (cv.INTER_LANCZOS4, cv.INTER_CUBIC):
+        for interp in (cv.INTER_LANCZOS4,):
             with self.assertRaises(cv.error):
                 cv.triton.resize(cv.cuda_GpuMat(u8), (16, 16), interpolation=interp)
 

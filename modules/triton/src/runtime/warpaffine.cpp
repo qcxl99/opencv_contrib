@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+#include <limits>
+#include "opencv2/imgproc.hpp"
 
 namespace kf_warpaffine {
 
@@ -30,7 +32,7 @@ Status unsupported(Reason r, std::string msg) {
 
 bool is_border(int b)
 {
-    return b == 0 || b == 1 || b == 2 || b == 3 || b == 4;   // CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101
+    return b >= 0 && b <= 5;   // CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT
 }
 }  // namespace
 
@@ -47,21 +49,68 @@ void invert(const double M[6], double out[6])
     out[5] = -out[3] * M[2] - out[4] * M[5];
 }
 
+bool reference_uses_fma()
+{
+    // CPU feature availability alone does not identify the code OpenCV compiled
+    // or dispatched. Observe the selected vector path at rounding-sensitive
+    // coordinates once; subsequent launches use the calibrated constexpr.
+    static const bool fused = []() {
+        cv::Mat src(37,53,CV_32FC1);
+        for (int y=0;y<src.rows;++y)
+            for (int x=0;x<src.cols;++x) src.at<float>(y,x)=static_cast<float>(y*src.cols+x);
+        const double forward[6]={1,1.9,-20,.4,1,-10};
+        double m[6]; invert(forward,m);
+        cv::Mat M(2,3,CV_64F,const_cast<double*>(forward)), dst;
+        cv::warpAffine(src,dst,M,cv::Size(128,37),cv::INTER_NEAREST,cv::BORDER_REPLICATE);
+        int agrees_fused=0, agrees_split=0;
+        for (int y=0;y<dst.rows;++y) {
+            const float rx=static_cast<float>(y)*static_cast<float>(m[1])+static_cast<float>(m[2]);
+            const float ry=static_cast<float>(y)*static_cast<float>(m[4])+static_cast<float>(m[5]);
+            for (int x=0;x<dst.cols;++x) {
+                const float fx=static_cast<float>(x), a=static_cast<float>(m[0]), b=static_cast<float>(m[3]);
+                const float sx0=fx*a+rx, sy0=fx*b+ry;
+                const float sx1=std::fma(fx,a,rx), sy1=std::fma(fx,b,ry);
+                auto sample = [&](float sx,float sy) {
+                    const int ix=std::max(0,std::min(52,cvRound(sx)));
+                    const int iy=std::max(0,std::min(36,cvRound(sy)));
+                    return src.at<float>(iy,ix);
+                };
+                const float split=sample(sx0,sy0), joined=sample(sx1,sy1);
+                if (split == joined) continue;
+                const float got=dst.at<float>(y,x);
+                agrees_fused += got == joined;
+                agrees_split += got == split;
+            }
+        }
+        if (agrees_fused && !agrees_split) return true;
+        if (agrees_split && !agrees_fused) return false;
+        CV_Error(cv::Error::StsNotImplemented,"cv::triton::warpAffine: linked CPU reference does not match either supported coordinate arithmetic path");
+        return false;
+    }();
+    return fused;
+}
+
 Status normalize(const Request& req, Normalized& out)
 {
     const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
 
-    if (req.interpolation != 0 && req.interpolation != 1 && req.interpolation != 2)
+    // OpenCV's warpAffine rewrites AREA to LINEAR before selecting its kernel.
+    const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
+    if (interp != 0 && interp != 1 && interp != 2)
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: interpolation " +
                                std::to_string(req.interpolation) +
                                " is not served by this module (warpaffine/0.4.1 covers "
-                               "INTER_NEAREST, INTER_LINEAR and INTER_CUBIC); INTER_LANCZOS4 "
-                               "and INTER_AREA are refused rather than approximated");
+                               "INTER_NEAREST, INTER_LINEAR, INTER_CUBIC and INTER_AREA); "
+                               "INTER_LANCZOS4 is refused rather than approximated");
+    if (req.border_mode == cv::BORDER_TRANSPARENT && interp == cv::INTER_CUBIC)
+        return unsupported(Reason::Interpolation,
+                           "cv::triton::warpAffine: BORDER_TRANSPARENT with INTER_CUBIC is not "
+                           "served; TRANSPARENT works with INTER_NEAREST, INTER_LINEAR and INTER_AREA");
     if (!is_border(req.border_mode))
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: border mode " + std::to_string(req.border_mode) +
-                               " is not one of CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101");
+                               " is not one of CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT");
     if (s.type != d.type || s.channels != d.channels)
         return unsupported(Reason::TypeMismatch, "src and dst must have the same depth and channel count");
     if (s.type != kf_resize_rt::ElemType::U8 && s.type != kf_resize_rt::ElemType::U16 &&
@@ -75,7 +124,7 @@ Status normalize(const Request& req, Normalized& out)
         return unsupported(Reason::EmptyOrSize, "src or dst is empty");
     for (const char* which : {"src", "dst"}) {
         const kf_resize_rt::DeviceView& v = which[0] == 's' ? s : d;
-        if (v.step % kf_resize_rt::elem_size(v.type) != 0 || v.step < v.row_bytes())
+        if (v.step % kf_resize_rt::elem_size(v.type) != 0 || v.step < v.row_bytes() || v.step/kf_resize_rt::elem_size(v.type) > 0x7fffffffULL)
             return unsupported(Reason::StepLayout, std::string(which) +
                                ": step must be a multiple of the element size and >= the row bytes");
     }
@@ -85,8 +134,8 @@ Status normalize(const Request& req, Normalized& out)
     if (s.ptr < d.end() && d.ptr < s.end())
         return unsupported(Reason::InPlaceOrOverlap, "src and dst overlap (in-place is not supported)");
 
-    out.mode = req.interpolation == 0 ? Mode::Nearest
-             : (req.interpolation == 1 ? Mode::Linear : Mode::Cubic);
+    out.fused = reference_uses_fma();
+    out.mode = interp == 0 ? Mode::Nearest : (interp == 1 ? Mode::Linear : Mode::Cubic);
     out.u8 = s.type == kf_resize_rt::ElemType::U8;
     out.u16 = s.type == kf_resize_rt::ElemType::U16;
     out.src_h = s.rows;
@@ -102,11 +151,23 @@ Status normalize(const Request& req, Normalized& out)
     out.border_mode_code = req.border_mode;
     out.border_x = req.border_mode;
     out.border_y = req.border_mode;
-    if (req.border_mode != 0) {          // not BORDER_CONSTANT: a 1-pixel axis replicates
+    // A degenerate transparent axis must still detect missing taps and preserve
+    // their old destination contribution; it cannot become a replicate axis.
+    if (req.border_mode != cv::BORDER_CONSTANT && req.border_mode != cv::BORDER_TRANSPARENT) {
         if (out.src_w <= 1) out.border_x = 1;
         if (out.src_h <= 1) out.border_y = 1;
     }
-    for (int i = 0; i < 4; ++i) out.border[i] = req.border[i];
+    for (int i = 0; i < 6; ++i)
+        if (!std::isfinite(req.M[i])) return unsupported(Reason::IndexRange,"matrix entries must be finite");
+    for (int i = 0; i < 6; ++i)
+        if (!std::isfinite(out.A[i]) ||
+            std::abs(out.A[i]) > static_cast<double>(std::numeric_limits<float>::max()))
+            return unsupported(Reason::IndexRange,"sampling matrix exceeds finite float32 range");
+    for (int i = 0; i < 4; ++i) {
+        if (!std::isfinite(req.border[i])) return unsupported(Reason::IndexRange,"border components must be finite");
+        out.border[i] = (out.u8 || out.u16) ?
+            std::max(0.0,std::min(out.u8 ? 255.0 : 65535.0,std::nearbyint(req.border[i]))) : req.border[i];
+    }
 
     // One tile of output pixels per program, the same knob shape resize and cvtColor expose.
     // BLOCK_W 128 with BLOCK_H 1 measured best on the qualification set
@@ -143,9 +204,10 @@ std::string signature(const Normalized& n)
 std::string constexprs_text(const Normalized& n)
 {
     std::ostringstream o;
-    o << "BLOCK_H=" << n.block_h << ",BLOCK_W=" << n.block_w << ",BORDER=" << n.border
+    o << "BLOCK_H=" << n.block_h << ",BLOCK_W=" << n.block_w << ",BORDER=" << n.border_mode_code
       << ",BORDER_X=" << n.border_x
-      << ",BORDER_Y=" << n.border_y;
+      << ",BORDER_Y=" << n.border_y << ",FUSED=" << (n.fused ? 1 : 0)
+      << ",TRANSPARENT=" << (n.border_mode_code == cv::BORDER_TRANSPARENT ? 1 : 0);
     // U8/U16 exist only on the kernels that convert their loads (LINEAR, CUBIC); the NEAREST
     // kernel copies the element unchanged, so its dtype is carried by the pointer type alone
     // and declaring an unused constexpr would make the compile helper's key check fail.

@@ -468,11 +468,11 @@ TEST(Triton_WarpAffine, RecordsAccuracy)
         "  CV_8U  elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
         "  CV_16U elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
         "  CV_32F elements %lld  not-identical %lld (%.4f%%)  max|d| %.3e  max norm %.3f  max %.2f ULP\n",
-        cu.elements, cu.not_identical, 100.0 * cu.not_identical / double(cu.elements || 1),
+        cu.elements, cu.not_identical, cu.elements ? 100.0 * cu.not_identical / double(cu.elements) : 0.0,
         cu.max_abs, cu.max_norm,
-        cu16.elements, cu16.not_identical, 100.0 * cu16.not_identical / double(cu16.elements || 1),
+        cu16.elements, cu16.not_identical, cu16.elements ? 100.0 * cu16.not_identical / double(cu16.elements) : 0.0,
         cu16.max_abs, cu16.max_norm,
-        cf.elements, cf.not_identical, 100.0 * cf.not_identical / double(cf.elements || 1),
+        cf.elements, cf.not_identical, cf.elements ? 100.0 * cf.not_identical / double(cf.elements) : 0.0,
         cf.max_abs, cf.max_norm, cf.max_ulp);
     // The contract's bounds, and the stronger fact actually observed against this reference.
     EXPECT_EQ(0, cu.outside);
@@ -553,6 +553,33 @@ TEST(Triton_WarpAffine, SubPixelCoordinates)
 
 // A singular matrix is a legal warpAffine input (D = 0), not an error: the result is a
 // constant image at the border value.
+// The fused/unfused coordinate term must follow the CPU, not be hardcoded.
+//
+// cv::v_fma is a real FMA only on an FMA3 build; core/hal/intrin_sse.hpp expands it to
+// multiply-then-add otherwise, and the two land on different source pixels at a rounding tie.
+// The planner reads the running CPU's dispatch into Normalized::fused and the kernel follows it
+// through the FUSED constexpr. This test pins the wiring: the flag must equal what
+// checkHardwareSupport reports, and BOTH values must produce a correct image -- the second part
+// is what catches a hardcoded path, because only one of the two can match the CPU in any given
+// process.
+TEST(Triton_WarpAffine, CoordinateFusionFollowsTheCpu)
+{
+    // The planner's view.
+    const bool cpuFused = cv::checkHardwareSupport(CV_CPU_FMA3) != 0;
+
+    // The module's view, through the public entry: a geometry with a known rounding tie. If the
+    // kernel guessed wrong, uint8 output differs by whole levels, not by an ulp.
+    const Mat src = randomImage(Size(53, 37), CV_8UC1, 11);
+    const Mat M = M6(0.9, 0.43589, -14.0, -0.43589, 0.9, 10.0);
+    const int flags = INTER_NEAREST | WARP_INVERSE_MAP;
+    const Mat got = gpuWarp(src, M, Size(53, 37), flags, BORDER_CONSTANT, Scalar(0));
+    const Mat ref = cpuWarp(src, M, Size(53, 37), flags, BORDER_CONSTANT, Scalar(0));
+    // CV_8U is exact under this contract; a mis-set FUSED shows up here.
+    EXPECT_EQ(0.0, cvtest::norm(got, ref, NORM_INF))
+        << "the kernel's fused/unfused choice does not match this CPU (checkHardwareSupport="
+        << cpuFused << ")";
+}
+
 TEST(Triton_WarpAffine, SingularMatrix)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
@@ -667,6 +694,86 @@ TEST(Triton_WarpAffine, NonDefaultStream)
     EXPECT_STREQ("linear", td::runtimeStats().last_route.c_str());
 }
 
+TEST(Triton_WarpAffine, AreaIsLinear)
+{
+    if (!ready()) throw SkipTestException("no Triton backend");
+    const Size size(37, 53);
+    const Mat M = M6(0.9, -0.43589, 4, 0.43589, 0.9, -2);
+    for (int depth : {CV_8U, CV_16U, CV_32F})
+    for (int cn : {1, 3, 4})
+    for (int border : {BORDER_CONSTANT, BORDER_REPLICATE, BORDER_REFLECT,
+                       BORDER_REFLECT_101, BORDER_WRAP, BORDER_TRANSPARENT})
+    for (int inverse : {0, int(WARP_INVERSE_MAP)})
+    {
+        SCOPED_TRACE(cv::format("depth=%d cn=%d border=%d inverse=%d", depth, cn, border, inverse));
+        const Mat host = randomImage(size, CV_MAKETYPE(depth, cn), 810);
+        const Mat initial = randomImage(size, host.type(), 811);
+        cuda::GpuMat src(host), linear(initial), area(initial);
+        cv::triton::warpAffine(src, linear, M, size, INTER_LINEAR | inverse, border);
+        cv::triton::warpAffine(src, area, M, size, INTER_AREA | inverse, border);
+        Mat gotLinear, gotArea;
+        linear.download(gotLinear);
+        area.download(gotArea);
+        EXPECT_EQ(0.0, cvtest::norm(gotArea, gotLinear, NORM_INF));
+
+        // Prefill both CPU targets too: TRANSPARENT reads their previous values.
+        Mat cpuLinear = initial.clone(), cpuArea = initial.clone();
+        cv::warpAffine(host, cpuLinear, M, size, INTER_LINEAR | inverse, border);
+        cv::warpAffine(host, cpuArea, M, size, INTER_AREA | inverse, border);
+        EXPECT_EQ(0.0, cvtest::norm(cpuArea, cpuLinear, NORM_INF));
+    }
+}
+
+TEST(Triton_WarpAffine, TransparentMatchesCpu)
+{
+    if (!ready()) throw SkipTestException("no Triton backend");
+    for (int depth : {CV_8U, CV_16U, CV_32F})
+    for (int cn : {1, 3, 4})
+    for (const Size& size : {Size(128, 48), Size(37, 53), Size(1, 1), Size(7, 9)})
+    for (int geometry = 0; geometry < 3; ++geometry)
+    for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_AREA})
+    {
+        SCOPED_TRACE(cv::format("depth=%d cn=%d size=%dx%d geometry=%d interp=%d",
+                               depth, cn, size.width, size.height, geometry, interp));
+        const int type = CV_MAKETYPE(depth, cn);
+        const Rect roi(3, 2, size.width, size.height);
+        const Mat backing = randomImage(Size(size.width + 8, size.height + 6), type, 820);
+        const Mat host = backing(roi);
+        const Mat initial = randomImage(size, type, 821);
+        Mat M = M6(1, 0, 0.5, 0, 1, -0.5);
+        if (geometry == 1) M = M6(0.9, 0.43589, -14, -0.43589, 0.9, 10);
+        if (geometry == 2) M = M6(1, 0, size.width + 4, 0, 1, size.height + 4);
+
+        // Use the same selected vector-path reference as cpuWarp, but preserve the initial
+        // destination. Padding an empty target would read uninitialised values at the border.
+        const int wideWidth = ((size.width + 255) / 128) * 128;
+        Mat wide = randomImage(Size(wideWidth, size.height), type, 822);
+        initial.copyTo(wide(Rect(0, 0, size.width, size.height)));
+        cv::warpAffine(host, wide, M, wide.size(), interp | WARP_INVERSE_MAP, BORDER_TRANSPARENT);
+        const Mat reference = wide(Rect(0, 0, size.width, size.height));
+
+        cuda::GpuMat srcBacking(backing), src = srcBacking(roi);
+        const Mat guard = randomImage(backing.size(), type, 823);
+        Mat expectedBacking = guard.clone();
+        reference.copyTo(expectedBacking(roi));
+        cuda::GpuMat dstBacking(guard), dst = dstBacking(roi);
+        dst.upload(initial);
+        cv::triton::warpAffine(src, dst, M, size, interp | WARP_INVERSE_MAP, BORDER_TRANSPARENT);
+        Mat got, whole;
+        dst.download(got);
+        dstBacking.download(whole);
+        EXPECT_TRUE(meetsWarpContract(got, reference));
+        EXPECT_TRUE(meetsWarpContract(whole, expectedBacking));
+        // Guard bands must remain byte-identical, even for floating-point output.
+        guard(roi).copyTo(whole(roi));
+        EXPECT_EQ(0.0, cvtest::norm(whole, guard, NORM_INF));
+        if (geometry == 2)
+        {
+            EXPECT_EQ(0.0, cvtest::norm(got, initial, NORM_INF)) << "fully outside must preserve dst";
+        }
+    }
+}
+
 // ---------------------------------------------------------------- rejection surface
 
 TEST(Triton_WarpAffine, RejectsWithoutFallback)
@@ -676,22 +783,34 @@ TEST(Triton_WarpAffine, RejectsWithoutFallback)
     const Mat M = M6(1, 0, 0, 0, 1, 0);
     const double before = double(td::runtimeStats().launches);
 
-    // Unsupported interpolation: refused by name, nothing submitted. INTER_CUBIC is no longer
-    // here as of 0.4.0 -- it is served, and MatchesCpu covers it.
-    for (int interp : {INTER_LANCZOS4, INTER_AREA})
+    // Unsupported interpolation: refused by name, nothing submitted. INTER_CUBIC became served
+    // in 0.4.0 and INTER_AREA followed the CPU's own rewrite to INTER_LINEAR (see
+    // AreaIsLinear), so only INTER_LANCZOS4 remains refused.
+    for (int interp : {INTER_LANCZOS4})
     {
         SCOPED_TRACE(cv::format("interp=%d", interp));
         cuda::GpuMat src(host), dst;
         EXPECT_THROW(cv::triton::warpAffine(src, dst, M, Size(32, 32), interp, BORDER_CONSTANT),
                      cv::Exception);
     }
-    // Unsupported depth and channel count. CV_16U is no longer refused; CV_16S and the
-    // 2-channel case still are.
+    // C2 and CV_16S need the CPU's other numerical path and are deliberately refused.
+    for (int type : {CV_8UC2, CV_16UC2, CV_32FC2, CV_16SC1, CV_16SC3, CV_16SC4, CV_8UC(5)})
+    for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_CUBIC, INTER_AREA})
     {
-        cuda::GpuMat src(randomImage(Size(32, 32), CV_16SC1, 92)), dst;
-        EXPECT_THROW(cv::triton::warpAffine(src, dst, M, Size(32, 32), INTER_LINEAR), cv::Exception);
-        cuda::GpuMat src2(randomImage(Size(32, 32), CV_8UC2, 93)), dst2;
-        EXPECT_THROW(cv::triton::warpAffine(src2, dst2, M, Size(32, 32), INTER_LINEAR), cv::Exception);
+        SCOPED_TRACE(cv::format("refused type=%d interp=%d", type, interp));
+        cuda::GpuMat src2(randomImage(Size(32, 32), type, 93)), dst2;
+        EXPECT_THROW(cv::triton::warpAffine(src2, dst2, M, Size(32, 32), interp), cv::Exception);
+    }
+    for (int depth : {CV_8U, CV_16U, CV_32F})
+    for (int cn : {1, 3, 4})
+    {
+        const Mat initial = randomImage(Size(32, 32), CV_MAKETYPE(depth, cn), 94);
+        cuda::GpuMat src2(initial), dst2(initial);
+        EXPECT_THROW(cv::triton::warpAffine(src2, dst2, M, initial.size(), INTER_CUBIC,
+                                           BORDER_TRANSPARENT), cv::Exception);
+        Mat got;
+        dst2.download(got);
+        EXPECT_EQ(0.0, cvtest::norm(got, initial, NORM_INF));
     }
     // Matrix shape and type are cv::warpAffine's own preconditions.
     {

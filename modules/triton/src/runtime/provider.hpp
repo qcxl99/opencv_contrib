@@ -174,9 +174,9 @@ struct LaunchShape {
 // The launch shape _cpu_default(src_h, src_w, dst_h, dst_w, channels, mode, is_f32) picks
 // for this request, as a LaunchConfig. num_stages is Triton's default (3) and `ry` applies
 // only to ROUTE_AREA_FAST. tests/test_provider_protocol.py checks it against the JIT.
-LaunchConfig default_config(const Normalized& n);
+LaunchConfig default_config(const Normalized& n, const Target* target = nullptr);
 LaunchShape launch_shape(const Normalized& n, const LaunchConfig& cfg, const Target& t, const Toolchain& tc,
-                         int batch = 1);
+                         int batch = 1, const DeviceView* src = nullptr, const DeviceView* dst = nullptr);
 
 // ------------------------------------------------------- device service (B5)
 

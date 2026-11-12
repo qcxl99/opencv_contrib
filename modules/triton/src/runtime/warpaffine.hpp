@@ -10,8 +10,11 @@
 // coordinates with float weights (warp_kernels.simd.hpp), while the GPU kernel still runs the
 // older fixed-point remap pipeline. cv::cuda::warpAffine is a timing baseline only.
 //
-// Supported: INTER_NEAREST, INTER_LINEAR and INTER_CUBIC; CV_8U, CV_16U and CV_32F; 1/3/4
-// channels; the five border modes; WARP_INVERSE_MAP both ways. DELIBERATELY REFUSED, by name:
+// Supported: INTER_NEAREST, INTER_LINEAR and INTER_CUBIC; INTER_AREA aliases LINEAR;
+// CV_8U, CV_16U and CV_32F; 1/3/4 channels; the five standard border modes plus
+// BORDER_TRANSPARENT for NEAREST/LINEAR/AREA; WARP_INVERSE_MAP both ways. TRANSPARENT
+// reads existing destination contents (range-preserving NEAREST, destination-fill LINEAR).
+// CUBIC+TRANSPARENT is deliberately refused, as is:
 // INTER_LANCZOS4, whose 8x8 table is a separate contract -- approximating it behind an
 // unmeasured tolerance is exactly the failure this project has paid for once already.
 //
@@ -38,7 +41,7 @@ struct Request {
     kf_resize_rt::DeviceView src, dst;
     // The 2x3 matrix as cv::warpAffine takes it (row-major, 6 doubles).
     double M[6] = {1, 0, 0, 0, 1, 0};
-    int interpolation = 1;     // cv::INTER_LINEAR
+    int interpolation = 1;     // cv::INTER_LINEAR; cv::INTER_AREA normalizes to Linear
     int border_mode = 0;       // cv::BORDER_CONSTANT
     // The border value is a Scalar: up to four components, one per channel. A scalar v means
     // Scalar(v, 0, 0, 0), a sequence means its components zero-padded to four. It stays a
@@ -53,15 +56,20 @@ struct Normalized {
     int src_h = 0, src_w = 0, dst_h = 0, dst_w = 0, channels = 0;
     bool u8 = true;
     bool u16 = false;
+    bool fused = false;  // calibrated against the linked CPU reference, part of the compile key
     // The sampling matrix: M itself when WARP_INVERSE_MAP is set, otherwise the closed-form
     // inverse cv::warpAffine computes in double.
     double A[6] = {1, 0, 0, 0, 1, 0};
     // Border codes per axis. A 1-pixel axis is sampled with REPLICATE whatever the requested
-    // mode (cv::warpAffine's border_type_x/y), unless the mode is CONSTANT.
+    // mode (cv::warpAffine's border_type_x/y), unless the mode is CONSTANT or TRANSPARENT.
+    // Code 5 is TRANSPARENT; it selects a separate constexpr and requires initialized dst.
     int border_mode_code = 0, border_x = 0, border_y = 0;
     double border[4] = {0, 0, 0, 0};
     int block_h = 1, block_w = 128, num_warps = 4;
 };
+
+// CPU arithmetic selection for the linked OpenCV build (one directed probe).
+bool reference_uses_fma();
 
 // Pure checks. Fills every field of `out` including the sampling matrix and the block shape.
 kf_resize_rt::Status normalize(const Request& req, Normalized& out);

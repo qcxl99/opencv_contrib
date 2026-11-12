@@ -79,7 +79,8 @@ inline Mat oracle(const Mat& src, Size dsize, double fx, double fy, int interp)
 
 inline double f32Atol(int interp)   // contract cpu_aligned: 2E, derived from CPU's own rounding
 {
-    return interp == INTER_NEAREST ? 0.0 : (interp == INTER_LINEAR ? 4.948e-07 : 8.419e-07);
+    return interp == INTER_NEAREST ? 0.0 : (interp == INTER_LINEAR ? 4.948e-07 :
+           (interp == INTER_CUBIC ? 1.401e-06 : 8.419e-07));
 }
 
 /** Under the contract: CV_8U exact; CV_32F within the derived bound, NaN matched by NaN. */

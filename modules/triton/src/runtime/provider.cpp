@@ -3,6 +3,7 @@
 #include "provider.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -154,7 +155,7 @@ std::string KernelKey::text() const {
     return o.str();
 }
 
-LaunchConfig default_config(const Normalized& n) {
+LaunchConfig default_config(const Normalized& n, const Target* target) {
     LaunchConfig cfg;
     cfg.num_stages = DISPATCH_DEFAULT_NUM_STAGES;
     // The class comes from the route the request actually takes (n.route, already resolved
@@ -187,6 +188,29 @@ LaunchConfig default_config(const Normalized& n) {
         cfg.block_w = DISPATCH_FALLBACK_BLOCK_W;
         cfg.num_warps = DISPATCH_FALLBACK_NUM_WARPS;
     }
+    // HIP defaults mirror the measured Python JIT extension. CUDA keeps the table above.
+    if (target && target->backend == "hip" && static_cast<long long>(n.dst_h) * n.dst_w >= 65536) {
+        const bool f32 = n.type == ElemType::F32;
+        const double sy = 1.0 / n.inv_y, sx = 1.0 / n.inv_x;
+        const bool point = !f32 && look.kind == ref::ROUTE_LINEAR && !look.area_mode &&
+            std::max(n.src_h,n.src_w) < (1 << 23) && sy >= 1 && sx >= 1 &&
+            sy == std::floor(sy) && sx == std::floor(sx) && std::fmod(sy,2.0) == 1 && std::fmod(sx,2.0) == 1;
+        if (f32 && n.dst_h <= n.src_h && n.dst_w <= n.src_w) {
+            if (look.kind == ref::ROUTE_NEAREST && n.channels == 1 && n.src_w % 128 == 0 && n.dst_w % 128 == 0)
+                { cfg.block_h=2; cfg.block_w=512; cfg.num_warps=2; }
+            else if (look.kind == ref::ROUTE_LINEAR && n.channels == 3)
+                { cfg.block_h=4; cfg.block_w=256; cfg.num_warps=1; }
+        }
+        if (!f32) {
+            if (point) { cfg.block_h=1; cfg.block_w=512; cfg.num_warps=4; }
+            else if (two && n.channels == 1) { cfg.block_h=1; cfg.block_w=1024; cfg.num_warps=4; }
+            else if (two && n.channels == 4) { cfg.block_h=1; cfg.block_w=512; cfg.num_warps=8; }
+            else if (look.kind == ref::ROUTE_LINEAR && n.channels == 1 && n.dst_h <= n.src_h)
+                { cfg.block_h=4; cfg.block_w=256; cfg.num_warps=2; }
+            else if (look.kind == ref::ROUTE_LINEAR && n.channels == 3 && n.dst_h > n.src_h)
+                { cfg.block_h=8; cfg.block_w=256; cfg.num_warps=2; }
+        }
+    }
     // _cpu_parallel: shrink BLOCK_H, then BLOCK_W, until the launch has at least
     // DISPATCH_MIN_PROGRAMS programs (or neither can shrink). It counts programs on
     // dst_w for axis 1 whatever the route; that only errs on the small side for C3/C4
@@ -205,7 +229,7 @@ LaunchConfig default_config(const Normalized& n) {
 }
 
 LaunchShape launch_shape(const Normalized& n, const LaunchConfig& requested, const Target& t, const Toolchain& tc,
-                         int batch) {
+                         int batch, const DeviceView* src, const DeviceView* dst) {
     LaunchShape ls;
     const ref::Route r = n.route.kind;
     if (r == ref::ROUTE_COPY) { ls.is_copy = true; return ls; }
@@ -213,7 +237,7 @@ LaunchShape launch_shape(const Normalized& n, const LaunchConfig& requested, con
     // value is never replaced, so the compile protocol's (block_h, block_w, num_warps) pass
     // through unchanged.
     LaunchConfig cfg = requested;
-    const LaunchConfig d = default_config(n);
+    const LaunchConfig d = default_config(n, &t);
     if (cfg.block_h <= 0) cfg.block_h = d.block_h;
     if (cfg.block_w <= 0) cfg.block_w = d.block_w;
     if (cfg.num_warps <= 0) cfg.num_warps = d.num_warps;
@@ -244,6 +268,33 @@ LaunchShape launch_shape(const Normalized& n, const LaunchConfig& requested, con
             c.push_back({"U8", u8});
             break;
         case ref::ROUTE_COPY: break;
+    }
+    if (t.backend == "hip" && n.type == ElemType::U8) {
+        const double sy=1.0/n.inv_y, sx=1.0/n.inv_x;
+        const bool point = r == ref::ROUTE_LINEAR && !n.route.area_mode && std::max(n.src_h,n.src_w) < (1<<23) &&
+            sy >= 1 && sx >= 1 && sy == std::floor(sy) && sx == std::floor(sx) &&
+            std::fmod(sy,2.0) == 1 && std::fmod(sx,2.0) == 1;
+        const bool full2 = r == ref::ROUTE_AREA_FAST && n.route.ix == 2 && n.route.iy == 2 &&
+            n.src_h >= 2LL*n.dst_h && n.src_w >= 2LL*n.dst_w;
+        if (point) {
+            k.kernel="_resize_cpu_nearest_kernel";
+            k.signature=signature(ref::ROUTE_NEAREST,n.type);
+            c={{"BLOCK_H",cfg.block_h},{"BLOCK_W",cfg.block_w},{"cn",n.channels}};
+        } else if (full2 && n.channels == 3 && n.dst_h*static_cast<long long>(n.dst_w) >= 65536 &&
+                   requested.block_h == 0 && requested.block_w == 0 && requested.num_warps == 0) {
+            k.kernel="_hip_area2_channels";
+            k.signature="src:*u8, dst:*u8, dst_h:i32, W:i32, src_rs:i32, dst_rs:i32, src_bs:i32, dst_bs:i32";
+            k.cfg.block_h=1; k.cfg.block_w=512; k.cfg.num_warps=4;
+            c={{"BLOCK_E",512}};
+            ls.grid[0]=n.dst_h; ls.grid[1]=(static_cast<long long>(n.dst_w)*3+511)/512; ls.grid[2]=batch;
+            return ls;
+        } else if (full2 && (n.channels == 1 || n.channels == 4) && (n.channels == 4 || n.dst_w%4 == 0) &&
+                   cfg.block_w%4 == 0 && src && dst && src->ptr%4 == 0 && dst->ptr%4 == 0 &&
+                   src->step%4 == 0 && dst->step%4 == 0) {
+            k.kernel="_hip_area2_packed";
+            k.signature="src:*u8, dst:*u8, dst_h:i32, dst_w:i32, src_rs:i32, dst_rs:i32, src_bs:i32, dst_bs:i32";
+            c={{"BLOCK_H",cfg.block_h},{"BLOCK_W",cfg.block_w},{"C1",n.channels == 1 ? 1 : 0}};
+        }
     }
     std::sort(c.begin(), c.end());
     // Grid axis 1 counts the tile's second dimension, which the kernels agree on with

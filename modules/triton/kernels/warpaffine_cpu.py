@@ -2,33 +2,19 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# warpAffine kernels (contract warpaffine/0.4.1) for the runtime JIT of modules/triton.
-# Exported from kernelforge-lab operators/warpaffine/kernel.py; the jit functions and their
-# helpers are copied verbatim. Regenerating is the only supported edit.
-#
-# CPU cv2.warpAffine semantics, per family:
-#   * NEAREST / LINEAR -- warpAffine{Nearest,Linear}Invoker_*: float coordinates (the row
-#     term rounds twice, the pixel term once through fma), cvRound for NEAREST, floor+fma
-#     chain for LINEAR, saturate_cast<uchar|ushort> for uint8/uint16, Scalar(v,0,0,0) border
-#     values, and a 1-pixel axis sampled with REPLICATE.
-#   * CUBIC -- genericWarp -> bicubicVec: M_x + M_xx*x with NO fma (which is why it has no
-#     width dependence), a float coordinate clamp to [-max(dim,16), 2*max(dim,16)], 4x4 taps,
-#     A = -0.75, and an fma accumulation chain.
+# CPU-aligned resize kernels (contract resize/0.15.0) for the runtime JIT of modules/triton.
+# GENERATED, do not edit: exported from kernelforge-lab by tools/export_module_kernels.py.
+#   lab file:    operators/warpaffine/kernel.py
+#   lab sha256:  09f274acc76943052e0976a3147f156d5f0a994d17ed7ec27c8fcf709845bc4b
+#   functions:   _pmod, _bm, _fma, _mapped_coord, _warp_nearest, _warp_linear, _bicubic_weights_t, _warp_cubic
+# The runtime compiles these through tools/compile_helper.py; the compile key carries this
+# file's own sha256, so editing it here only changes which binaries are built, never which
+# binaries are trusted.
 
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-DEFAULT_CONFIG = {"BLOCK_H": 1, "BLOCK_W": 128, "num_warps": 4}
-
-# cv::BorderTypes
-BORDER_CONSTANT = 0
-BORDER_REPLICATE = 1
-BORDER_REFLECT = 2
-BORDER_WRAP = 3
-BORDER_REFLECT_101 = 4
-
-MODES = ("NEAREST", "LINEAR", "CUBIC")
 
 @triton.jit
 def _pmod(p, n):
@@ -60,10 +46,44 @@ def _bm(p, n, BORDER: tl.constexpr):
 
 
 @triton.jit
+def _fma(a, b, c, FUSED: tl.constexpr):
+    """cv::v_fma: fused on an FMA3 build, multiply-then-add otherwise.
+
+    core/hal/intrin_sse.hpp expands v_fma to _mm_add_ps(_mm_mul_ps(a,b), c) when CV_FMA3 is 0.
+    OpenCV's warp kernels use v_fma for the coordinate term AND for the interpolation
+    accumulation, so both must follow the same switch; reproducing only the coordinate one
+    leaves the interpolation off by an ulp, which reaches the integer store.
+    """
+    if FUSED:
+        return libdevice.fma(a, b, c)
+    return libdevice.add_rn(libdevice.mul_rn(a, b), c)
+
+
+@triton.jit
+def _mapped_coord(xf, M00, M10, row_x, row_y, FUSED: tl.constexpr):
+    """The column term of CV_WARPAFFINE_VECTOR_COMPUTE_MAPPED_COORD2.
+
+    `v_fma(M0, dst_x, M_x)` on the CPU is only a fused operation when the build has FMA3:
+    core/hal/intrin_sse.hpp implements v_fma as _mm_add_ps(_mm_mul_ps(a,b), c) when CV_FMA3 is
+    0. An FMA3 build therefore rounds once and a baseline-only build rounds twice, and at a
+    0.5 tie in the interpolation the two land on different source pixels.
+
+    Which one the reference used is decided by the C++ planner (it asks the driver for the
+    build's CPU dispatch) and arrives as the FUSED constexpr. Guessing it wrong is not an ulp
+    of noise: it is a whole output level on the pixels where the two disagree.
+    """
+    if FUSED:
+        return (libdevice.fma(xf, M00.to(tl.float32), row_x),
+                libdevice.fma(xf, M10.to(tl.float32), row_y))
+    return (libdevice.add_rn(libdevice.mul_rn(xf, M00.to(tl.float32)), row_x),
+            libdevice.add_rn(libdevice.mul_rn(xf, M10.to(tl.float32)), row_y))
+
+
+@triton.jit
 def _warp_nearest(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
                   src_rs, dst_rs, bv0, bv1, bv2, bv3,
                   cn: tl.constexpr, BORDER: tl.constexpr, BORDER_X: tl.constexpr,
-                  BORDER_Y: tl.constexpr,
+                  BORDER_Y: tl.constexpr, FUSED: tl.constexpr, TRANSPARENT: tl.constexpr,
                   BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
     pid_h = tl.program_id(0)
     pid_w = tl.program_id(1)
@@ -83,15 +103,12 @@ def _warp_nearest(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, d
     row_x = libdevice.add_rn(libdevice.mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
     row_y = libdevice.add_rn(libdevice.mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
     xf = xs.to(tl.float32)
-    # fma(M0, x, row) -- one rounding, as CV_WARPAFFINE_VECTOR_COMPUTE_MAPPED_COORD2
-    # writes it. A separate multiply and add rounds twice.
-    sx = libdevice.fma(xf, M00.to(tl.float32), row_x)
-    sy = libdevice.fma(xf, M10.to(tl.float32), row_y)
+    sx, sy = _mapped_coord(xf, M00, M10, row_x, row_y, FUSED)
 
     ix = libdevice.rint(sx).to(tl.int32)             # cvRound: half to even
     iy = libdevice.rint(sy).to(tl.int32)
 
-    if BORDER == 0:                                  # BORDER_CONSTANT
+    if BORDER == 0 or TRANSPARENT:                   # BORDER_CONSTANT, or TRANSPARENT's range test
         inside = (ix >= 0) & (ix < src_w) & (iy >= 0) & (iy < src_h)
         cx = tl.minimum(tl.maximum(ix, 0), src_w - 1)
         cy = tl.minimum(tl.maximum(iy, 0), src_h - 1)
@@ -105,6 +122,11 @@ def _warp_nearest(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, d
     # Row pitch in ELEMENTS, not src_w*cn: a GpuMat's step is padded for alignment, so
     # recomputing the pitch from the width reads the wrong row on every row but the first.
     base = cy.to(tl.int64) * src_rs + cx.to(tl.int64) * cn
+    # BORDER_TRANSPARENT (NEAREST): write only where the rounded source point is inside, using
+    # the CPU's own unsigned range test -- `(unsigned)cvRound(sx) < W && (unsigned)cvRound(sy) < H`.
+    # The destination is never read, so "skip" and "write the old value" are the same thing for
+    # the pixels that are skipped; the store mask is the whole rule.
+    store_mask = m & inside if TRANSPARENT else m
     for c in tl.static_range(cn):
         v = tl.load(src + base + c, mask=m & inside, other=0)
         if BORDER == 0:
@@ -122,15 +144,15 @@ def _warp_nearest(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, d
             # bv is an fp32 runtime argument already rounded and clamped on the host into
             # the destination dtype (saturate_cast), so a uint8/uint16 store just narrows it.
             v = tl.where(m & ~inside, tl.full(v.shape, bv.to(v.dtype), v.dtype), v)
-        tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, v, mask=m)
+        tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, v, mask=store_mask)
 
 
 @triton.jit
 def _warp_linear(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
                  src_rs, dst_rs, bv0, bv1, bv2, bv3,
                  cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
-                 BORDER: tl.constexpr,
-                 BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr,
+                 BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                 BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr, FUSED: tl.constexpr,
                  BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
     pid_h = tl.program_id(0)
     pid_w = tl.program_id(1)
@@ -149,8 +171,7 @@ def _warp_linear(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, ds
     row_x = libdevice.add_rn(libdevice.mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
     row_y = libdevice.add_rn(libdevice.mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
     xf = xs.to(tl.float32)
-    sx = libdevice.fma(xf, M00.to(tl.float32), row_x)
-    sy = libdevice.fma(xf, M10.to(tl.float32), row_y)
+    sx, sy = _mapped_coord(xf, M00, M10, row_x, row_y, FUSED)
 
     fx = tl.floor(sx)
     fy = tl.floor(sy)
@@ -161,9 +182,11 @@ def _warp_linear(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, ds
     ix1 = ix + 1
     iy1 = iy + 1
 
-    if BORDER == 0:
+    if BORDER == 0 or TRANSPARENT:
         # whole neighbourhood outside -> border value; otherwise each tap that is
-        # outside alone takes the border value (CV_WARP_SCALAR_FETCH_PIXEL)
+        # outside alone takes the border value (CV_WARP_SCALAR_FETCH_PIXEL). TRANSPARENT uses the
+        # same in-range flags, but substitutes the OLD DESTINATION PIXEL for an out-of-range tap
+        # and leaves the weights unchanged (see the lstore comment below).
         outside = (ix >= src_w) | (ix1 < 0) | (iy >= src_h) | (iy1 < 0)
         in0 = (ix >= 0) & (ix < src_w)
         in1 = (ix1 >= 0) & (ix1 < src_w)
@@ -178,7 +201,7 @@ def _warp_linear(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, ds
 
     hw = src_rs
     for c in tl.static_range(cn):
-        if BORDER == 0:
+        if BORDER == 0 or TRANSPARENT:
             if c == 0:
                 bv = bv0
             elif c == 1:
@@ -189,6 +212,10 @@ def _warp_linear(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, ds
                 bv = bv3
             # `other` must have the pointer's element type; the border component is fp32.
             bvs = bv.to(src.dtype.element_ty)
+            if TRANSPARENT:
+                # Out-of-range taps take the destination pixel's CURRENT value, not a constant.
+                bvs = tl.load(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c,
+                              mask=m, other=0)
             p00 = tl.load(src + iy.to(tl.int64) * hw + ix.to(tl.int64) * cn + c,
                           mask=m & in0 & jy0, other=bvs)
             p01 = tl.load(src + iy.to(tl.int64) * hw + ix1.to(tl.int64) * cn + c,
@@ -211,9 +238,9 @@ def _warp_linear(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, ds
             f = tl.float32
             p00 = p00.to(f); p01 = p01.to(f); p10 = p10.to(f); p11 = p11.to(f)
         # v0 = fma(ax, p01 - p00, p00); v1 = fma(ax, p11 - p10, p10); out = fma(ay, v1 - v0, v0)
-        v0 = libdevice.fma(ax, p01 - p00, p00)
-        v1 = libdevice.fma(ax, p11 - p10, p10)
-        v = libdevice.fma(ay, v1 - v0, v0)
+        v0 = _fma(ax, p01 - p00, p00, FUSED)
+        v1 = _fma(ax, p11 - p10, p10, FUSED)
+        v = _fma(ay, v1 - v0, v0, FUSED)
         if U8:
             v = tl.minimum(tl.maximum(libdevice.rint(v), 0.0), 255.0).to(tl.uint8)
         elif U16:
@@ -229,11 +256,18 @@ def _warp_linear(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, ds
             else:
                 bv = bv3
             v = tl.where(outside & m, tl.full(v.shape, bv.to(v.dtype), v.dtype), v)
-        tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, v, mask=m)
+        # BORDER_TRANSPARENT (LINEAR): each out-of-range tap is replaced by the OLD DESTINATION
+        # pixel with its weight unchanged -- out = sum(w_k*S_k) + (1 - sum(w_k))*dst_old, so the
+        # blend degenerates smoothly to "keep the old value" as the point leaves the image. No
+        # renormalisation and no border value; the pixel is still written unless the whole 2x2
+        # window is outside (ix < -1 || ix >= W || iy < -1 || iy >= H). Measured rule:
+        # WA_TRANSPARENT.md. The destination must already hold its intended contents.
+        lstore = m & ~outside if TRANSPARENT else m
+        tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, v, mask=lstore)
 
 
 @triton.jit
-def _bicubic_weights_t(a):
+def _bicubic_weights_t(a, FUSED: tl.constexpr):
     """bicubicWeights for one fractional coordinate, float32, in the C++ order.
 
     w0 = A*(a*b2) and w3 = A*(a2*b): the grouping is A*(a*b^2), not (A*a)*b^2 -- the
@@ -245,7 +279,7 @@ def _bicubic_weights_t(a):
     b2 = libdevice.mul_rn(b, b)
     w0 = libdevice.mul_rn(-0.75, libdevice.mul_rn(a, b2))
     w3 = libdevice.mul_rn(-0.75, libdevice.mul_rn(a2, b))
-    w1 = libdevice.fma(a2, libdevice.fma(1.25, a, -2.25), 1.0)   # A+2 = 1.25, A+3 = 2.25
+    w1 = _fma(a2, _fma(1.25, a, -2.25, FUSED), 1.0, FUSED)   # A+2 = 1.25, A+3 = 2.25
     w2 = libdevice.sub_rn(libdevice.sub_rn(libdevice.sub_rn(1.0, w0), w1), w3)
     return w0, w1, w2, w3
 
@@ -254,8 +288,9 @@ def _bicubic_weights_t(a):
 def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
                 src_rs, dst_rs, bv0, bv1, bv2, bv3,
                 cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
-                BORDER: tl.constexpr, BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr,
-                BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+                BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr,
+                FUSED: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
     """INTER_CUBIC: genericWarp -> bicubicVec/bicubicRef (OpenCV 5.0.0).
 
     Different family from _warp_linear/_warp_nearest: the column coordinate is
@@ -295,12 +330,17 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
     ay = libdevice.sub_rn(sy, fy)
     ix0 = fx.to(tl.int32) - 1
     iy0 = fy.to(tl.int32) - 1
-    wx0, wx1, wx2, wx3 = _bicubic_weights_t(ax)
-    wy0, wy1, wy2, wy3 = _bicubic_weights_t(ay)
+    wx0, wx1, wx2, wx3 = _bicubic_weights_t(ax, FUSED)
+    wy0, wy1, wy2, wy3 = _bicubic_weights_t(ay, FUSED)
 
-    # all_outliers: (unsigned)(ix0+4) >= (unsigned)(width+4) on either axis
-    all_out = ((ix0 + 4 >= src_w + 4) | (ix0 + 4 < 0) |
-               (iy0 + 4 >= src_h + 4) | (iy0 + 4 < 0))
+    # all_outliers: the whole 4-tap window is outside, i.e. floor(sx)-1+3 < 0 or >= width, which
+    # with ix0 = floor(sx)-1 is ix0+3 < 0 or ix0 >= width. The upper half is `ix0 + 4 >= width + 4`
+    # (same thing); the lower half must be `ix0 + 3 < 0`, NOT `ix0 + 4 < 0` -- the latter is one
+    # pixel too strict and leaves a column/row of pixels written that the CPU leaves untouched
+    # (warp_kernels.simd.hpp bicubicCoeffs: `(unsigned)(ix0+4) >= (unsigned)(width+4)` compared
+    # against the window origin, and the TRANSPARENT skip is `code == -1`).
+    all_out = ((ix0 + 4 >= src_w + 4) | (ix0 + 3 < 0) |
+               (iy0 + 4 >= src_h + 4) | (iy0 + 3 < 0))
 
     wx = (wx0, wx1, wx2, wx3)
     wy = (wy0, wy1, wy2, wy3)
@@ -313,7 +353,7 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
             rowsum = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
             for k in tl.static_range(4):
                 xx = ix0 + k
-                if BORDER == 0:
+                if BORDER == 0 or TRANSPARENT:
                     ok = (xx >= 0) & (xx < src_w) & (ry >= 0) & (ry < src_h)
                     cx = tl.minimum(tl.maximum(xx, 0), src_w - 1)
                     cy = tl.minimum(tl.maximum(ry, 0), src_h - 1)
@@ -322,7 +362,7 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
                     cy = _bm(ry, src_h, BORDER_Y)
                     ok = m
                 idx = (cy.to(tl.int64) * src_rs + cx.to(tl.int64) * cn + c)
-                if BORDER == 0:
+                if BORDER == 0 or TRANSPARENT:
                     if c == 0:
                         bv = bv0
                     elif c == 1:
@@ -332,14 +372,20 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
                     else:
                         bv = bv3
                     bvs = bv.to(src.dtype.element_ty)
+                    if TRANSPARENT:
+                        # BORDER_TRANSPARENT (CUBIC): an out-of-range tap is the OLD DESTINATION
+                        # pixel, weights unchanged -- the same destination-fill blend LINEAR uses
+                        # (WA_TRANSPARENT.md). Written unless the whole 4x4 window is outside.
+                        bvs = tl.load(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c,
+                                      mask=m, other=0)
                     v = tl.load(src + idx, mask=m & ok, other=bvs)
                 else:
                     v = tl.load(src + idx, mask=m, other=0)
                 if U8 or U16:
                     v = v.to(tl.float32)
                 # BICUBIC_UPDATE_ACC_VEC: rowsum = fma(v, wx, rowsum)
-                rowsum = libdevice.fma(v, wx[k], rowsum)
-            acc = libdevice.fma(rowsum, wy_r, acc)
+                rowsum = _fma(v, wx[k], rowsum, FUSED)
+            acc = _fma(rowsum, wy_r, acc, FUSED)
         if BORDER == 0:
             if c == 0:
                 bv = bv0
@@ -356,4 +402,5 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
             out = tl.minimum(tl.maximum(libdevice.rint(acc), 0.0), 65535.0).to(tl.uint16)
         else:
             out = acc
-        tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, out, mask=m)
+        cstore = m & ~all_out if TRANSPARENT else m
+        tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, out, mask=cstore)

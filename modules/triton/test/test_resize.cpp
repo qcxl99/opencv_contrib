@@ -23,6 +23,8 @@ struct RouteCase
 };
 
 const RouteCase kCases[] = {
+    {Size(97,61),Size(131,53),0,0,INTER_CUBIC,"cubic"},
+    {Size(100,80),Size(37,29),0,0,INTER_AREA,"area"},
     // copy: identity, whatever the mode
     {Size(97, 53), Size(97, 53), 0, 0, INTER_NEAREST, "copy"},
     {Size(97, 53), Size(97, 53), 0, 0, INTER_LINEAR, "copy"},
@@ -166,14 +168,7 @@ TEST(Triton_Resize, RejectsWithoutFallback)
         catch (const cv::Exception& e) { return e.code; }
         return 0;
     };
-    // Routes P1 does not serve yet: nothing is submitted, there is no silent substitute.
-    const td::RuntimeStats a = td::runtimeStats();
-    EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::resize(u8, dst, Size(50, 50), 0, 0, INTER_CUBIC); }));
-    cuda::GpuMat fractional;
-    EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::resize(u8, fractional, Size(20, 21), 0, 0, INTER_AREA); }));
-    const td::RuntimeStats b = td::runtimeStats();
-    EXPECT_EQ(a.launches, b.launches);
-    EXPECT_EQ(a.copies, b.copies);
+    // Every contracted route is served; unsupported interpolation remains a refusal.
     // Outside the contract.
     cuda::GpuMat out;
     EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::resize(u8, out, Size(16, 16), 0, 0, INTER_LANCZOS4); }));
