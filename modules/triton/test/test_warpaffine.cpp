@@ -468,11 +468,11 @@ TEST(Triton_WarpAffine, RecordsAccuracy)
         "  CV_8U  elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
         "  CV_16U elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
         "  CV_32F elements %lld  not-identical %lld (%.4f%%)  max|d| %.3e  max norm %.3f  max %.2f ULP\n",
-        cu.elements, cu.not_identical, 100.0 * cu.not_identical / double(cu.elements || 1),
+        cu.elements, cu.not_identical, cu.elements ? 100.0 * cu.not_identical / double(cu.elements) : 0.0,
         cu.max_abs, cu.max_norm,
-        cu16.elements, cu16.not_identical, 100.0 * cu16.not_identical / double(cu16.elements || 1),
+        cu16.elements, cu16.not_identical, cu16.elements ? 100.0 * cu16.not_identical / double(cu16.elements) : 0.0,
         cu16.max_abs, cu16.max_norm,
-        cf.elements, cf.not_identical, 100.0 * cf.not_identical / double(cf.elements || 1),
+        cf.elements, cf.not_identical, cf.elements ? 100.0 * cf.not_identical / double(cf.elements) : 0.0,
         cf.max_abs, cf.max_norm, cf.max_ulp);
     // The contract's bounds, and the stronger fact actually observed against this reference.
     EXPECT_EQ(0, cu.outside);
@@ -553,6 +553,33 @@ TEST(Triton_WarpAffine, SubPixelCoordinates)
 
 // A singular matrix is a legal warpAffine input (D = 0), not an error: the result is a
 // constant image at the border value.
+// The fused/unfused coordinate term must follow the CPU, not be hardcoded.
+//
+// cv::v_fma is a real FMA only on an FMA3 build; core/hal/intrin_sse.hpp expands it to
+// multiply-then-add otherwise, and the two land on different source pixels at a rounding tie.
+// The planner reads the running CPU's dispatch into Normalized::fused and the kernel follows it
+// through the FUSED constexpr. This test pins the wiring: the flag must equal what
+// checkHardwareSupport reports, and BOTH values must produce a correct image -- the second part
+// is what catches a hardcoded path, because only one of the two can match the CPU in any given
+// process.
+TEST(Triton_WarpAffine, CoordinateFusionFollowsTheCpu)
+{
+    // The planner's view.
+    const bool cpuFused = cv::checkHardwareSupport(CV_CPU_FMA3) != 0;
+
+    // The module's view, through the public entry: a geometry with a known rounding tie. If the
+    // kernel guessed wrong, uint8 output differs by whole levels, not by an ulp.
+    const Mat src = randomImage(Size(53, 37), CV_8UC1, 11);
+    const Mat M = M6(0.9, 0.43589, -14.0, -0.43589, 0.9, 10.0);
+    const int flags = INTER_NEAREST | WARP_INVERSE_MAP;
+    const Mat got = gpuWarp(src, M, Size(53, 37), flags, BORDER_CONSTANT, Scalar(0));
+    const Mat ref = cpuWarp(src, M, Size(53, 37), flags, BORDER_CONSTANT, Scalar(0));
+    // CV_8U is exact under this contract; a mis-set FUSED shows up here.
+    EXPECT_EQ(0.0, cvtest::norm(got, ref, NORM_INF))
+        << "the kernel's fused/unfused choice does not match this CPU (checkHardwareSupport="
+        << cpuFused << ")";
+}
+
 TEST(Triton_WarpAffine, SingularMatrix)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
@@ -676,21 +703,20 @@ TEST(Triton_WarpAffine, RejectsWithoutFallback)
     const Mat M = M6(1, 0, 0, 0, 1, 0);
     const double before = double(td::runtimeStats().launches);
 
-    // Unsupported interpolation: refused by name, nothing submitted. INTER_CUBIC is no longer
-    // here as of 0.4.0 -- it is served, and MatchesCpu covers it.
-    for (int interp : {INTER_LANCZOS4, INTER_AREA})
+    // Unsupported interpolation: refused by name, nothing submitted. INTER_CUBIC became served
+    // in 0.4.0 and INTER_AREA followed the CPU's own rewrite to INTER_LINEAR (see
+    // AreaIsLinear), so only INTER_LANCZOS4 remains refused.
+    for (int interp : {INTER_LANCZOS4})
     {
         SCOPED_TRACE(cv::format("interp=%d", interp));
         cuda::GpuMat src(host), dst;
         EXPECT_THROW(cv::triton::warpAffine(src, dst, M, Size(32, 32), interp, BORDER_CONSTANT),
                      cv::Exception);
     }
-    // Unsupported depth and channel count. CV_16U is no longer refused; CV_16S and the
-    // 2-channel case still are.
+    // Unsupported depth and channel count. CV_16U and CV_16S are served, and so are 2-channel
+    // images (the CPU's own guard is channels <= 4); only 5 channels is outside.
     {
-        cuda::GpuMat src(randomImage(Size(32, 32), CV_16SC1, 92)), dst;
-        EXPECT_THROW(cv::triton::warpAffine(src, dst, M, Size(32, 32), INTER_LINEAR), cv::Exception);
-        cuda::GpuMat src2(randomImage(Size(32, 32), CV_8UC2, 93)), dst2;
+        cuda::GpuMat src2(randomImage(Size(32, 32), CV_8UC(5), 93)), dst2;
         EXPECT_THROW(cv::triton::warpAffine(src2, dst2, M, Size(32, 32), INTER_LINEAR), cv::Exception);
     }
     // Matrix shape and type are cv::warpAffine's own preconditions.

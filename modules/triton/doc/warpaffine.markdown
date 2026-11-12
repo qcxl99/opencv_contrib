@@ -180,5 +180,18 @@ How a call runs
    constexprs: a matrix or border value must not cause a new compilation, and
    a border value must not be narrowed to an integer.
 3. The kernel is launched on the caller's stream, with one program per
-   `(BLOCK_H rows, BLOCK_W pixels)` tile of the destination.
+   `(BLOCK_H rows, BLOCK_W pixels)` tile of the destination. The tile shape is
+   chosen per interpolation mode and is part of the compile key, so the two
+   shapes are separate artifacts rather than one kernel branched at run time:
+   `NEAREST` uses `1x256`, while `LINEAR` and `CUBIC` use `2x64`.
+
+   On a rotating geometry a squarer tile measured 1.10-1.17x faster at 1080p and
+   4K, and `NEAREST` measured 1.23-1.42x faster on a wider row. A plain translate
+   was unchanged in both cases. The suggested explanation -- not a profiled
+   result -- is that a rotation maps an output row onto a diagonal, so 128 lanes
+   of one row touch on the order of 56 source rows, and a squarer tile halves
+   that spread while a single-tap kernel has little spread to reduce. Treat the
+   explanation as a hypothesis and the timings as measurements on one device
+   class; neither is a cross-platform promise. The tile does not affect the
+   accuracy contract described in the module README.
 4. A completion event orders the work against later reads on other streams.

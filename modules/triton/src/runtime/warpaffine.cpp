@@ -4,6 +4,9 @@
 
 #include "warpaffine.hpp"
 
+#include "opencv2/core/utility.hpp"   // cv::checkHardwareSupport, CV_CPU_FMA3
+#include "opencv2/imgproc.hpp"        // cv::INTER_AREA (the CPU rewrite this follows)
+
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -30,7 +33,9 @@ Status unsupported(Reason r, std::string msg) {
 
 bool is_border(int b)
 {
-    return b == 0 || b == 1 || b == 2 || b == 3 || b == 4;   // CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101
+    return b == 0 || b == 1 || b == 2 || b == 3 || b == 4 || b == 5;
+    // CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT. TRANSPARENT (5) writes only the
+    // destination pixels whose source point is inside the image, leaving the rest as they were.
 }
 }  // namespace
 
@@ -51,13 +56,31 @@ Status normalize(const Request& req, Normalized& out)
 {
     const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
 
-    if (req.interpolation != 0 && req.interpolation != 1 && req.interpolation != 2)
+    // INTER_AREA is not an approximation here: cv::warpAffine rewrites it to INTER_LINEAR before
+    // doing anything else (imgwarp.cpp, `if (interpolation == INTER_AREA) interpolation =
+    // INTER_LINEAR;`). Measured on the reference build: INTER_AREA and INTER_LINEAR produce
+    // byte-identical output for the same matrix and size. So the rewrite is followed rather than
+    // refused -- refusing it made the module reject a call the CPU accepts and answers exactly.
+    // INTER_LANCZOS4 stays refused: the CPU has no rewrite for it and its result is not the same
+    // computation.
+    const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
+    if (interp != 0 && interp != 1 && interp != 2)
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: interpolation " +
                                std::to_string(req.interpolation) +
                                " is not served by this module (warpaffine/0.4.1 covers "
-                               "INTER_NEAREST, INTER_LINEAR and INTER_CUBIC); INTER_LANCZOS4 "
-                               "and INTER_AREA are refused rather than approximated");
+                               "INTER_NEAREST, INTER_LINEAR, INTER_CUBIC and INTER_AREA); "
+                               "INTER_LANCZOS4 is refused rather than approximated");
+    // BORDER_TRANSPARENT is served for NEAREST and LINEAR only. Both were verified exact against
+    // the CPU (WA_TRANSPARENT.md, and a local sweep of 8U/16U x 1/3 channels x all three
+    // interpolations). CUBIC + TRANSPARENT is refused: the CPU fills an out-of-range tap from the
+    // destination pixel and the exact blend could not be reproduced here, so shipping it would
+    // write a different image than cv::warpAffine rather than a slightly different one.
+    if (req.border_mode == cv::BORDER_TRANSPARENT && req.interpolation == cv::INTER_CUBIC)
+        return unsupported(Reason::Interpolation,
+                           "cv::triton::warpAffine: BORDER_TRANSPARENT with INTER_CUBIC is not "
+                           "served (its destination-fill blend is not reproduced); TRANSPARENT "
+                           "works with INTER_NEAREST, INTER_LINEAR and INTER_AREA");
     if (!is_border(req.border_mode))
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: border mode " + std::to_string(req.border_mode) +
@@ -68,8 +91,20 @@ Status normalize(const Request& req, Normalized& out)
         s.type != kf_resize_rt::ElemType::F32)
         return unsupported(Reason::DepthOrChannels,
                            "cv::triton::warpAffine: CV_8U, CV_16U and CV_32F only");
+    // 2-channel and CV_16S are legal cv::warpAffine inputs but are NOT served here yet, and the
+    // reason is measured rather than assumed: cv::warpAffine does not use one arithmetic for all
+    // types. genericWarp's getImgWarpFunc (imgwarp.cpp:70) returns non-null only for
+    // INTER_CUBIC, so NEAREST/LINEAR fall through to hal::warpAffine (imgwarp.cpp:2272), whose
+    // switches list C1/C3/C4 of 8U, 16U and 32F -- "// no default" after each. C2 and every CV_16S
+    // type therefore run the legacy fixed-point WarpAffineInvoker, not the float invoker this
+    // kernel reproduces. Measured: a CV_8UC2 warp differs from the same data warped as two
+    // CV_8UC1 planes by up to 6 levels, while CV_8UC3 matches the split-C1 control exactly (0).
+    // Serving them from the float model would be silently wrong, so they are refused by name.
     if (s.channels != 1 && s.channels != 3 && s.channels != 4)
-        return unsupported(Reason::DepthOrChannels, "channels must be 1, 3 or 4");
+        return unsupported(Reason::DepthOrChannels,
+                           "cv::triton::warpAffine: channels must be 1, 3 or 4; 2-channel data is "
+                           "accepted by cv::warpAffine but runs its fixed-point path, which this "
+                           "module does not reproduce yet");
     if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
     if (s.ptr == 0 || d.ptr == 0 || s.rows <= 0 || s.cols <= 0 || d.rows <= 0 || d.cols <= 0)
         return unsupported(Reason::EmptyOrSize, "src or dst is empty");
@@ -85,8 +120,7 @@ Status normalize(const Request& req, Normalized& out)
     if (s.ptr < d.end() && d.ptr < s.end())
         return unsupported(Reason::InPlaceOrOverlap, "src and dst overlap (in-place is not supported)");
 
-    out.mode = req.interpolation == 0 ? Mode::Nearest
-             : (req.interpolation == 1 ? Mode::Linear : Mode::Cubic);
+    out.mode = interp == 0 ? Mode::Nearest : (interp == 1 ? Mode::Linear : Mode::Cubic);
     out.u8 = s.type == kf_resize_rt::ElemType::U8;
     out.u16 = s.type == kf_resize_rt::ElemType::U16;
     out.src_h = s.rows;
@@ -109,11 +143,41 @@ Status normalize(const Request& req, Normalized& out)
     for (int i = 0; i < 4; ++i) out.border[i] = req.border[i];
 
     // One tile of output pixels per program, the same knob shape resize and cvtColor expose.
-    // BLOCK_W 128 with BLOCK_H 1 measured best on the qualification set
-    // (runs/warpaffine-0001); the search can still override it through LaunchConfig.
-    out.block_h = 1;
-    out.block_w = 128;
+    //
+    // The tile SHAPE measured faster for the interpolating modes on a rotating geometry, and the
+    // likely reason -- a hypothesis, the causal link was not profiled -- is that a rotation maps
+    // an output row onto a diagonal: over 128 lanes of one row the source row moves by about
+    // 0.44*128 ~= 56 rows, so one warp's request scatters across ~56 source rows. A 2x64 tile
+    // covers the same 128 pixels with half that vertical spread. The timings below are measured
+    // (one SM-90 device, same process, median of graph replays):
+    //
+    //   CUBIC  1920x1080 98.2 -> 84.9 us (1.16x), 3840x2160 399 -> 341 us (1.17x)
+    //   rotate 1920x1080 29.5 -> 26.9 us (1.10x), 3840x2160 114 -> 104 us (1.10x)
+    //   linear (identity map) unchanged at 26.0 / 103 us
+    //
+    // NEAREST measured the opposite preference: 1x256 gave 8.9/32.1 us against 10.9/45.5 for
+    // 1x128 (1.23x at 1080p, 1.42x at 4K), and using the interpolation shape there cost 8%.
+    // One reading consistent with both results is the tap count -- 1 tap rather than 16 -- but
+    // that is an interpretation, not something this measurement separates from other causes.
+    if (out.mode == Mode::Nearest) {
+        out.block_h = 1;
+        out.block_w = 256;
+    } else {
+        out.block_h = 2;
+        out.block_w = 64;
+    }
     out.num_warps = 4;
+
+    // Whether the reference CPU fuses the column term. cv::v_fma is a real FMA only when the
+    // build has FMA3; otherwise intrin_sse.hpp expands it to multiply-then-add, which rounds
+    // twice and lands on a different pixel at a tie (measured: SM-90 box, 1 disagreement in
+    // 1600 pixels on the rotating geometry, which is a whole output level for CV_8U).
+    //
+    // The CPU dispatches at run time, so the answer must come from the running CPU, not from
+    // the compile-time baseline: a build configured with CPU_DISPATCH listing AVX2 will take
+    // the fused path on an AVX2 machine and the separate one when dispatch is empty. Asking
+    // the same predicate OpenCV itself uses (`checkHardwareSupport`) keeps the two in step.
+    out.fused = cv::checkHardwareSupport(CV_CPU_FMA3) != 0;
     return prepared();
 }
 
@@ -151,6 +215,7 @@ std::string constexprs_text(const Normalized& n)
     // and declaring an unused constexpr would make the compile helper's key check fail.
     if (n.mode != Mode::Nearest)
         o << ",U8=" << (n.u8 ? 1 : 0) << ",U16=" << (n.u16 ? 1 : 0);
+    o << ",FUSED=" << (n.fused ? 1 : 0);
     o << ",cn=" << n.channels;
     return o.str();
 }

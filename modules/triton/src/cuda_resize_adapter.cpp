@@ -219,13 +219,15 @@ void warpAffine(InputArray _src, OutputArray _dst, InputArray _M, Size dsize, in
     CV_Assert(_src.kind() == _InputArray::CUDA_GPU_MAT);
     cuda::GpuMat src = _src.getGpuMat();
 
+    // INTER_AREA is accepted because cv::warpAffine rewrites it to INTER_LINEAR before doing
+    // anything else, and the runtime follows that rewrite (see warpaffine.cpp normalize()).
     const int interpolation = flags & INTER_MAX;
     if (interpolation != INTER_NEAREST && interpolation != INTER_LINEAR &&
-        interpolation != INTER_CUBIC)
+        interpolation != INTER_CUBIC && interpolation != INTER_AREA)
         CV_Error(Error::StsUnsupportedFormat,
                  cv::format("cv::triton::warpAffine: interpolation %d is not served by this "
-                            "module (warpaffine/0.4.1 covers INTER_NEAREST, INTER_LINEAR and "
-                            "INTER_CUBIC); INTER_LANCZOS4 and INTER_AREA are refused, not "
+                            "module (warpaffine/0.4.1 covers INTER_NEAREST, INTER_LINEAR, "
+                            "INTER_CUBIC and INTER_AREA); INTER_LANCZOS4 is refused, not "
                             "approximated",
                             interpolation));
     {

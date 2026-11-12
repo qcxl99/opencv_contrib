@@ -61,6 +61,11 @@ struct Normalized {
     int border_mode_code = 0, border_x = 0, border_y = 0;
     double border[4] = {0, 0, 0, 0};
     int block_h = 1, block_w = 128, num_warps = 4;
+    // Whether the reference CPU computes the column term with a real FMA. cv::v_fma is only
+    // fused when the build has FMA3 (core/hal/intrin_sse.hpp uses _mm_add_ps(_mm_mul_ps(..))
+    // otherwise), and the two land on different pixels at a 0.5 tie. Filled by normalize() from
+    // the running CPU's dispatch, so the kernel reproduces whichever the reference used.
+    bool fused = true;
 };
 
 // Pure checks. Fills every field of `out` including the sampling matrix and the block shape.

@@ -984,7 +984,14 @@ Status warpAffine(const kf_warpaffine::Request& req, const ExecContext& ex)
                       {"BORDER", n.border_mode_code},
                       {"BORDER_X", n.border_x},
                       {"BORDER_Y", n.border_y},
+                      // TRANSPARENT is a separate constexpr rather than folded into BORDER so the
+                      // kernels keep their existing border switch and only add the store mask.
+                      {"TRANSPARENT", n.border_mode_code == 5 ? 1 : 0},
                       {"cn", n.channels}};
+    // All three kernels take FUSED. CUBIC's *coordinate* has no fma (that is what makes it
+    // width-invariant), but its bicubic weights and its accumulation are v_fma on the CPU, so
+    // it follows the same switch as the other two.
+    key.constexprs.push_back({"FUSED", n.fused ? 1 : 0});
     if (n.mode != kf_warpaffine::Mode::Nearest) {
         key.constexprs.push_back({"U8", n.u8 ? 1 : 0});
         key.constexprs.push_back({"U16", n.u16 ? 1 : 0});
