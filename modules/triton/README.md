@@ -73,25 +73,38 @@ general: `cv::cvtColor` dispatches through `cv_hal_cvtBGRtoBGR`, `cvtBGRtoYUV`
 and `cvtBGRtoHSV`, so an IPP or custom-HAL build — or a later OpenCV with
 different coefficients — is a different reference and needs its own
 verification. The accuracy suite records `Intel IPP`, `Custom HAL` and the
-run-time IPP state by value; when a build differs from the one the evidence came
-from it reports that as a skipped diagnostic rather than a failure, because such
-a build is a legitimate configuration. The numeric tests compare against the
-portable C++ oracle compiled into the test binary, which no HAL can reroute, so a
-build that computes different numbers still fails them.
+run-time IPP state by value, and fails on a build that differs from the one the
+evidence came from.
+
+**The numeric tests compare against this build's own `cv::cvtColor`, not a
+portable oracle** (`test/test_helpers.hpp::cpuCvt`). Only resize has a portable
+oracle compiled into the test binary; cvtColor does not, because every code it
+serves is integer arithmetic and the reference was verified exhaustively against
+one recorded build (`runs/cvtcolor-module-0001`). An earlier version of this
+paragraph claimed a portable oracle for cvtColor and was wrong.
 
 ### `cv::triton::warpAffine`
 
 `CV_8U`, `CV_16U` and `CV_32F`; 1/3/4 channels; `INTER_NEAREST`, `INTER_LINEAR`
-and `INTER_CUBIC`; the five border modes; and `WARP_INVERSE_MAP` both ways.
+and `INTER_CUBIC`; `INTER_AREA` aliases `INTER_LINEAR`. The five standard border
+modes and `BORDER_TRANSPARENT` for NEAREST/LINEAR/AREA are supported, with
+`WARP_INVERSE_MAP` both ways.
 
 | dimension | supported |
 |---|---|
 | depth | `CV_8U`, `CV_16U`, `CV_32F` |
 | channels | 1, 3, 4 |
-| interpolation | `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC` |
-| border modes | `CONSTANT`, `REPLICATE`, `REFLECT`, `REFLECT_101`, `WRAP` |
+| interpolation | `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC`; `INTER_AREA` aliases `INTER_LINEAR` |
+| border modes | `CONSTANT`, `REPLICATE`, `REFLECT`, `REFLECT_101`, `WRAP`; `TRANSPARENT` for NEAREST/LINEAR/AREA |
 | `borderValue` | a `Scalar` of up to four components, one per channel, kept in full precision |
 | matrix | 2x3 `CV_32F` or `CV_64F`, forward map inverted internally unless `WARP_INVERSE_MAP` |
+
+`BORDER_TRANSPARENT` reads the previous destination: NEAREST preserves it when
+its rounded source point is outside; LINEAR/AREA substitute that destination
+pixel for each outside tap with the original weight. Initialize a destination
+of the requested size/type when these contents matter. `INTER_CUBIC` with
+`BORDER_TRANSPARENT` is explicitly refused. C2 and `CV_16S` are also deliberately
+refused: they need the CPU's other numerical path, rather than an input-check change.
 
 `INTER_LANCZOS4` is **refused on purpose**: its 8x8 weight table and clamped
 taps are a separate contract, and approximating them behind an unmeasured

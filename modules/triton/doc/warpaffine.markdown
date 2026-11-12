@@ -60,12 +60,12 @@ multiple of 128 (past any SIMD width, so every compared column is in the body),
 then cropped. That is a pure function of `(src, M, dsize, flags)`, and it is
 stable: padding by 128 and by 256 give identical crops.
 
-Why 128 suffices is an argument about the code, not only a measurement: the body
-evaluates `v_fma(M0, x, Mx)` per lane with `x` the lane's own column, so a given
-column gets the same float on SSE, AVX2 and AVX-512. Only the tail's *length* is
-ISA-dependent, and it is at most 32 lanes with an unroll factor up to 64 on any
-`CV_SIMD` build. Padding past that puts every compared column in the body, which
-is what makes the reference ISA-independent.
+Padding past the vector body's unroll factor puts every compared column in the
+body on the characterised build; padding by 128 and by 256 produced identical
+crops there. This removes the observed dependence on which columns reach the
+scalar tail. It does not prove ISA independence: fused versus separate arithmetic,
+compiler choices and dispatch can change results. The reference remains bound to
+the characterised CPU build; cross-ISA equality is unverified.
 
 Against a **natural-width** call the difference is confined to columns whose
 sampled coordinate is critical, and its size depends on the interpolation: for
@@ -148,12 +148,19 @@ Supported subset (this milestone)
 |---|---|
 | depth | `CV_8U`, `CV_16U`, `CV_32F` |
 | channels | 1, 3, 4 |
-| interpolation | `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC` |
-| border modes | `BORDER_CONSTANT`, `BORDER_REPLICATE`, `BORDER_REFLECT`, `BORDER_REFLECT_101`, `BORDER_WRAP` |
+| interpolation | `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC`; `INTER_AREA` aliases `INTER_LINEAR` |
+| border modes | `BORDER_CONSTANT`, `BORDER_REPLICATE`, `BORDER_REFLECT`, `BORDER_REFLECT_101`, `BORDER_WRAP`; `BORDER_TRANSPARENT` for NEAREST/LINEAR/AREA |
 | map direction | forward, and `WARP_INVERSE_MAP` |
 | `borderValue` | a `Scalar` of up to four components, one per channel; kept as `double` to the kernel, so a `CV_32F` border of 0.5 is 0.5 |
 | layout | ROI source/destination, padded row stride, 1-pixel axes (sampled with `BORDER_REPLICATE` as on the CPU), output reuse |
 | platform | Linux, CUDA (driver API), `sm_90` tested |
+
+`BORDER_TRANSPARENT` reads the previous destination: NEAREST preserves it when
+its rounded source point is outside; LINEAR/AREA substitute that destination
+pixel for each outside tap with the original weight. Initialize a destination
+of the requested size/type when these contents matter. `INTER_CUBIC` with
+`BORDER_TRANSPARENT` is explicitly refused. C2 and `CV_16S` are also deliberately
+refused: they need the CPU's other numerical path, rather than an input-check change.
 
 `INTER_LANCZOS4` raises `cv::Error::StsUnsupportedFormat`, and so do other depths
 and channel counts, and overlapping input/output. LANCZOS4's 8x8 weight table and

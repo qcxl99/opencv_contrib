@@ -88,7 +88,10 @@ CV_EXPORTS_W void releaseGraphResources();
  * CPU or to cv::cuda: a call that returns has submitted the computation or a same-size copy.
  *
  * @param src   Source GpuMat, CV_8U or CV_32F, 1/3/4 channels.
- * @param dst   Destination GpuMat. Created if needed; never aliased with src.
+ * @param dst   Destination GpuMat. Created if needed; never aliased with src. For
+ *              BORDER_TRANSPARENT, initialize it at the requested size/type when previous
+ *              values matter: outside taps use its existing pixel with their original weight
+ *              under LINEAR/AREA, and outside rounded points remain unchanged under NEAREST.
  * @param dsize Explicit output size, or an empty Size() to derive it from
  *              fx/fy instead.
  * @param fx    Horizontal scale factor, used only when dsize is empty.
@@ -179,7 +182,9 @@ CV_EXPORTS_W void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, in
  * two differ in the last bits of any sub-pixel map. It is a timing baseline only.
  *
  * Supported: CV_8U, CV_16U and CV_32F; 1/3/4 channels; INTER_NEAREST, INTER_LINEAR and
- * INTER_CUBIC; the five border modes; and WARP_INVERSE_MAP both ways. Anything else raises
+ * INTER_CUBIC; INTER_AREA aliases INTER_LINEAR. The five standard border modes plus
+ * BORDER_TRANSPARENT for NEAREST/LINEAR/AREA and WARP_INVERSE_MAP both ways are served.
+ * CUBIC with TRANSPARENT, C2 and CV_16S are refused. Anything else raises
  * `cv::Error::StsUnsupportedFormat`; there is no fallback to the CPU or to cv::cuda.
  *
  * **Refused on purpose:** INTER_LANCZOS4. Its 8x8 weight table is a separate contract, and
@@ -215,14 +220,17 @@ CV_EXPORTS_W void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, in
  * applying the rule would hide that. `Triton_WarpAffine.CpuCubicIsWidthInvariant` pins it.
  *
  * @param src   Source GpuMat, CV_8U, CV_16U or CV_32F, 1/3/4 channels. ROI accepted.
- * @param dst   Destination GpuMat. Created if needed; never aliased with src.
+ * @param dst   Destination GpuMat. Created if needed; never aliased with src. For
+ *              BORDER_TRANSPARENT, initialize it at the requested size/type when previous
+ *              values matter: outside taps use its existing pixel with their original weight
+ *              under LINEAR/AREA, and outside rounded points remain unchanged under NEAREST.
  * @param M     2x3 CV_32F or CV_64F matrix, interpreted as cv::warpAffine interprets it: the
  *              forward map, inverted internally, unless WARP_INVERSE_MAP is set in `flags`.
  * @param dsize Destination size; empty means the source size.
- * @param flags INTER_NEAREST, INTER_LINEAR or INTER_CUBIC, optionally OR-ed with
+ * @param flags INTER_NEAREST, INTER_LINEAR, INTER_CUBIC or INTER_AREA (LINEAR alias), optionally OR-ed with
  *              WARP_INVERSE_MAP.
  * @param borderMode BORDER_CONSTANT, BORDER_REPLICATE, BORDER_REFLECT, BORDER_REFLECT_101 or
- *              BORDER_WRAP.
+ *              BORDER_WRAP; BORDER_TRANSPARENT is supported for NEAREST/LINEAR/AREA.
  * @param borderValue Used by BORDER_CONSTANT. A Scalar of up to four components, one per
  *              channel, exactly as cv::warpAffine reads it: Scalar(v) means (v, 0, 0, 0), not v
  *              on every channel, and the value keeps full double precision, so a CV_32F border

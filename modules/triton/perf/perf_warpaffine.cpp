@@ -93,6 +93,35 @@ PERF_TEST_P(Sz_Geom_Interp_Dtype, TritonWarpAffine, testing::Combine(
     CUDA_SANITY_CHECK(dst, 1e-10);
 }
 
+// New public routes, measured independently from the native CUDA baseline: that API does not
+// provide the same transparent destination-fill semantics. dst is initialized before warmup
+// and reused in the timed loop, since reading the existing destination is part of this route.
+PERF_TEST_P(Sz_Geom_Interp_Dtype, TritonWarpAffineAreaTransparent, testing::Combine(
+    testing::Values(cv::Size(1920, 1080), cv::Size(3840, 2160)),
+    testing::Values(cv::INTER_NEAREST, cv::INTER_LINEAR, cv::INTER_AREA),
+    testing::Values(cv::BORDER_REPLICATE, cv::BORDER_TRANSPARENT),
+    testing::Values(CV_8UC3, CV_16UC1, CV_32FC1)))
+{
+    const cv::Size size = GET_PARAM(0);
+    const int interp = GET_PARAM(1), border = GET_PARAM(2), type = GET_PARAM(3);
+    if (!cv::triton::haveBackend())
+        throw SkipTestException("no Triton backend available");
+    cv::Mat host(size, type);
+    declare.in(host, WARMUP_RNG);
+    const cv::Mat M = toMat(kGeoms[2].M);
+    const cv::cuda::GpuMat src(host);
+    cv::cuda::GpuMat dst(host);
+    for (int i = 0; i < 20; ++i)
+        cv::triton::warpAffine(src, dst, M, size, interp, border);
+    cv::cuda::Stream::Null().waitForCompletion();
+    TEST_CYCLE()
+    {
+        cv::triton::warpAffine(src, dst, M, size, interp, border);
+        cv::cuda::Stream::Null().waitForCompletion();
+    }
+    CUDA_SANITY_CHECK(dst, 1e-10);
+}
+
 #ifdef OPENCV_TRITON_PERF_HAVE_CUDAWARPING
 // The native implementation on the same card and harness. cudawarping is an OPTIONAL dependency
 // of perf/ only -- the module never uses it -- so a build without it omits this baseline.
