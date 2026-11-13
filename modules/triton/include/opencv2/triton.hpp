@@ -32,9 +32,8 @@
  *   - CV_8U or CV_32F, 1, 3 or 4 channels, ROI source/destination, row-contiguous pixels
  *   - explicit dsize, or fx/fy (> 0) when dsize is empty -- dsize wins if both are given, and
  *     given fx/fy are used unchanged as the inverse scales, as in cv::resize
- *   - routes: same size (a device copy), INTER_NEAREST, INTER_LINEAR, INTER_AREA at integer
- *     ratios or with an upscaled axis. INTER_CUBIC and fractional INTER_AREA raise
- *     StsUnsupportedFormat ("route_not_enabled") until the next milestone.
+ *   - routes: same size (a device copy), INTER_NEAREST, INTER_LINEAR, INTER_CUBIC, INTER_AREA
+ *     at integer or fractional ratios, including AREA's upscaled-axis route.
  *   - Linux, CUDA.
  *
  * @see @ref tutorial_triton_resize "Triton resize usage guide" for build instructions and examples.
@@ -88,10 +87,8 @@ CV_EXPORTS_W void releaseGraphResources();
  * CPU or to cv::cuda: a call that returns has submitted the computation or a same-size copy.
  *
  * @param src   Source GpuMat, CV_8U or CV_32F, 1/3/4 channels.
- * @param dst   Destination GpuMat. Created if needed; never aliased with src. For
- *              BORDER_TRANSPARENT, initialize it at the requested size/type when previous
- *              values matter: outside taps use its existing pixel with their original weight
- *              under LINEAR/AREA, and outside rounded points remain unchanged under NEAREST.
+ * @param dst   Destination GpuMat. Created if needed; correctly sized/type ROI storage is
+ *              reused. Source and destination must not alias or overlap.
  * @param dsize Explicit output size, or an empty Size() to derive it from
  *              fx/fy instead.
  * @param fx    Horizontal scale factor, used only when dsize is empty.
@@ -123,43 +120,37 @@ CV_EXPORTS_W void resize(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, Size
 
 /** @brief Convert an image between colour spaces using a Triton-generated kernel.
  *
- * Computes what OpenCV's CPU `cv::cvtColor` computes — bit-exactly, for the codes listed
- * below. Anything else raises `cv::Error::StsUnsupportedFormat`; there is no implicit
- * fallback to the CPU or to `cv::cuda`.
+ * The native module serves 84 distinct numeric codes (aliases share a code):
+ * channel permutations (six), colour to gray (four), gray to colour (two),
+ * YCrCb (four), YUV (four), forward HSV/HSV_FULL (four), BGR565/BGR555
+ * packing/unpacking (twenty), Bayer bilinear (six), XYZ (four), Lab (eight),
+ * Luv (six), UYVY/YUY2/YVYU decode (six), YUV gray extraction (two), and
+ * NV12/NV21 decode (eight). See the module README for code names and families.
  *
- * Supported for CV_8U (see the module description for why the CV_8U integer conversions are
- * the exact set):
- *   - channel permutes: BGR2BGRA, BGRA2BGR, BGR2RGBA, RGBA2BGR, BGR2RGB, BGRA2RGBA
- *   - to gray: BGR2GRAY, RGB2GRAY, BGRA2GRAY, RGBA2GRAY
- *   - YCrCb: BGR2YCrCb, RGB2YCrCb, YCrCb2BGR, YCrCb2RGB
- *   - HSV: BGR2HSV, RGB2HSV, BGR2HSV_FULL, RGB2HSV_FULL
- *   - YUV: BGR2YUV, RGB2YUV, YUV2BGR, YUV2RGB
+ * CV_8U covers every served code. CV_16U covers the 20 numeric codes in
+ * colour/gray, YCrCb/YUV and Bayer bilinear. CV_32F covers 20 numeric codes:
+ * all channel permutations, gray to colour, colour to gray, and YCrCb/YUV.
+ * The two YUV gray extraction codes are CV_8U-only, as in CPU cv::cvtColor. Copies and integer conversions are exact
+ * against the characterised build's CPU cv::cvtColor. For finite 32F arithmetic:
+ * `|got-ref| <= 8*2^-24*max(1, |ref|, max(abs(input channels at this pixel)))`.
+ * This is a per-pixel scale bound, not whole-image scale or bit-exact arithmetic.
+ * IPP/custom-HAL and changed CPU builds require their own validation.
  *
- * **Refused on purpose:** HSV2BGR and every HLS code. OpenCV computes those in float32, and in
- * the characterised build the SIMD body and the scalar tail round differently, so the result
- * for a pixel depends on which of the two processes it — position in the row, and build. The
- * result is well-defined per build and per pixel; what is missing is a value stable across
- * positions and builds for a kernel to match, so these are refused rather than given a
- * tolerance. Also refused: CV_32F, CV_16U, 2-channel images, size-changing codes, and anything
- * not in the list above.
+ * Packed BGR565/555 uses CV_8UC2 (two bytes per pixel), not CV_16UC1.
+ * 4:2:2 conversions require even width; the two YUV gray extractions allow
+ * odd widths. NV12/NV21 use a packed CV_8UC1 source of (3H/2) rows and even W,
+ * with source rows divisible by three; output is H by W. Other codes preserve
+ * size. Reverse HSV, HLS, forward linear Luv, Bayer VNG/edge-aware, YUV encoding,
+ * unlisted codes and unsupported depths are refused without fallback.
  *
- * @param src   Source GpuMat, CV_8U, 3 or 4 channels as the code requires. ROI accepted.
- * @param dst   Destination GpuMat. Created if needed. Its channel count must be the one the
- *              code produces; the size always equals src's.
- * @param code  A `cv::COLOR_*` value from the supported list.
- * @param stream Work is submitted to this stream and the call returns asynchronously.
- *
- * @note The reference is this build's own `cv::cvtColor`. Each served code is integer
- * arithmetic, so an output pixel is a function of its own input bytes and constant tables --
- * no reduction order, no SIMD width. That is why resize needs a pinned reference configuration
- * and cvtColor does not. Equality to that reference was measured: exhaustively over all 256^3
- * colour triples for the 3-channel codes, by sampled alpha for the 4-channel ones, and by a
- * directed position-independence probe -- not inferred from the word "integer".
- *
- * This is a statement about the build that was verified, not about "the CPU" in general:
- * `cv::cvtColor` dispatches through `cv_hal_cvtBGRtoBGR` / `cvtBGRtoYUV` / `cvtBGRtoHSV`, so an
- * IPP or custom-HAL build, or a later OpenCV with different coefficients, is a different
- * reference and must be re-verified.
+ * @param src Source GpuMat, with the depth and channels required by the code.
+ *            ROI and row pitch are accepted for interleaved pixels.
+ * @param dst Destination GpuMat. Reused when size/type match, otherwise created
+ *            at the source depth, code-specific channels and output size.
+ *            Source/output overlap is not supported.
+ * @param code A supported cv::COLOR_* value. No dstCn override is provided.
+ * @param stream Work is submitted asynchronously to this stream. Callers order
+ *               producers/consumers and retain image buffers until completion.
  */
 CV_EXPORTS void cvtColor(InputArray src, OutputArray dst, int code,
                          cuda::Stream& stream = cuda::Stream::Null());
@@ -190,7 +181,7 @@ CV_EXPORTS_W void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, in
  * **Refused on purpose:** INTER_LANCZOS4. Its 8x8 weight table is a separate contract, and
  * claiming it behind an unmeasured tolerance is precisely the failure this module avoids.
  *
- * Accuracy (contract warpaffine/0.4.1; measured against the selected reference on the core
+ * Accuracy (contract warpaffine/0.4.3; measured against the selected reference on the core
  * suite, a deterministic combination sweep over this surface and a random sweep):
  *   - CV_8U: bit-exact (got == ref), no one-level allowance.
  *   - CV_16U: |got - ref| <= 1 on every element; its one-level allowance is unchanged.
@@ -200,7 +191,12 @@ CV_EXPORTS_W void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, in
  *     |diff|, max normalised error and max ULP rather than a bare pass. CUBIC float32 measured
  *     1.8e-7 relative, five orders of magnitude inside the same bound.
  *
- * "CPU cv::warpAffine" here means its VECTOR path for INTER_NEAREST and INTER_LINEAR:
+ * The fused/separate multiply-add choice is calibrated from fixed probes of the actual linked
+ * CPU implementation, per depth/channel count and cv::useOptimized() state. Hardware FMA
+ * capability and the module's compiler flags do not identify that reference path. This bounded
+ * first-use reference identification does not compute the user's output on the CPU.
+ *
+ * "CPU cv::warpAffine" here means its VECTOR path for INTER_NEAREST/INTER_LINEAR/INTER_AREA:
  * selected CPU vector-path semantics. That build computes a column's source coordinate as
  * v_fma(M0, x, (float)(y*M1 + M2)) in the SIMD body but as x*M0 + y*M1 + M2 in the scalar tail,
  * and the tail's length depends on the destination width, so the shared region of two different

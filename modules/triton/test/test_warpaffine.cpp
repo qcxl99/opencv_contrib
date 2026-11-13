@@ -5,17 +5,14 @@
 // cv::triton::warpAffine through its real public entry (GpuMat + C++ planner + binaries from
 // the runtime JIT) against this build's own cv::warpAffine.
 //
-// Why the host build IS a valid reference here, unlike resize: warpAffine on this OpenCV
-// evaluates float coordinates and float weights per output pixel (warp_kernels.simd.hpp), so
-// an output pixel depends only on its own coordinates and four source pixels -- no reduction
-// across a row, no accumulation order that a different SIMD width would change. The residual
-// difference against the CPU is the last bits of the interpolation, which is why the contract
-// states a tolerance instead of bit-exactness and why the float32 bound below is per VALUE
-// rather than a whole-image maximum.
-//
-// The reference is the CPU's VECTOR path (cpuWarp below), not a natural-width call: this
-// OpenCV's warpAffine disagrees with itself at 0.5 ties depending on the destination width.
-// See the comment on cpuWarp.
+// Contract warpaffine/0.4.3 selects this linked CPU build's padded VECTOR path
+// for NEAREST/LINEAR/AREA and its natural-width call for CUBIC. These are named
+// reference routes, not a portable oracle or a promise about arbitrary CPU
+// builds/natural destination widths. Fused versus separate arithmetic is
+// calibrated from actual CPU outputs per dtype/channel/useOptimized state;
+// hardware FMA support alone does not identify the compiled dispatch path.
+// uint8 must be exact, uint16 allows one level, and the float32 bound is per
+// element. See cpuWarp below for the width-dependent body/tail distinction.
 //
 // Coverage: all three depths and every channel count, both of the invoker-family
 // interpolations and CUBIC, against the CPU (MatchesCpu); CUBIC's width invariance and its
@@ -65,13 +62,14 @@ static Mat gpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int bord
         cv::triton::warpAffine(gsrc, gdst, M, dsize, flags, border, bv, *stream);
     else
         cv::triton::warpAffine(gsrc, gdst, M, dsize, flags, border, bv);
-    cuda::Stream::Null().waitForCompletion();
+    if (stream) stream->waitForCompletion();
+    else cuda::Stream::Null().waitForCompletion();
     Mat out;
     gdst.download(out);
     return out;
 }
 
-/** The reference: cv::warpAffine's VECTOR path, cropped to `dsize`.
+/** Mode-specific reference: padded VECTOR for NN/LINEAR/AREA, natural width for CUBIC.
  *
  * The CPU is not one function of (src, M, dsize). Its SIMD body computes the column term as
  * v_fma(M0, x, float(y*M1 + M2)) while its scalar tail -- the remainder past the vector width --
@@ -80,7 +78,7 @@ static Mat gpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int bord
  * destination width 40 -> 193, widths 48/64/128 -> 65.
  *
  * Reproducing that would mean reproducing which columns fall in the tail, i.e. depending on the
- * destination width in a way no implementation should. The contract (warpaffine/0.4.1,
+ * destination width in a way no implementation should. The contract (warpaffine/0.4.3,
  * semantics.reference_path) therefore defines the reference as the vector path: evaluate at a
  * destination width rounded up to a multiple of 128, then crop. Verified stable -- padding by
  * 128 and by 256 give identical crops -- so it is a pure function of the inputs. The module
@@ -172,7 +170,7 @@ static double spacing_at(float v)
     return sp > 0 ? sp : double(std::numeric_limits<float>::denorm_min());
 }
 
-/** Compare under contract warpaffine/0.4.1: CV_8U exact, CV_16U at most 1 LSB, CV_32F
+/** Compare under contract warpaffine/0.4.3: CV_8U exact, CV_16U at most 1 LSB, CV_32F
  *  min(5e-5*max(|ref|,1), 1e-4). */
 static ::testing::AssertionResult meetsWarpContract(const Mat& got, const Mat& ref_,
                                                     WarpStats* stats = nullptr)
@@ -463,7 +461,7 @@ TEST(Triton_WarpAffine, RecordsAccuracy)
                     (depth == CV_8U ? cu : (depth == CV_16U ? cu16 : cf)).merge(st);
                 }
     std::cout << cv::format(
-        "contract warpaffine/0.4.1, kernel vs the selected reference "
+        "contract warpaffine/0.4.3, kernel vs the selected reference "
         "(vector path for NEAREST/LINEAR, natural width for CUBIC):\n"
         "  CV_8U  elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
         "  CV_16U elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
@@ -553,31 +551,33 @@ TEST(Triton_WarpAffine, SubPixelCoordinates)
 
 // A singular matrix is a legal warpAffine input (D = 0), not an error: the result is a
 // constant image at the border value.
-// The fused/unfused coordinate term must follow the CPU, not be hardcoded.
-//
-// cv::v_fma is a real FMA only on an FMA3 build; core/hal/intrin_sse.hpp expands it to
-// multiply-then-add otherwise, and the two land on different source pixels at a rounding tie.
-// The planner reads the running CPU's dispatch into Normalized::fused and the kernel follows it
-// through the FUSED constexpr. This test pins the wiring: the flag must equal what
-// checkHardwareSupport reports, and BOTH values must produce a correct image -- the second part
-// is what catches a hardcoded path, because only one of the two can match the CPU in any given
-// process.
+// Hardware FMA capability must not be confused with this linked CPU build's
+// selected arithmetic. Exercise both useOptimized states without changing the
+// frozen vector reference, over every dtype/channel dispatch at known ties.
 TEST(Triton_WarpAffine, CoordinateFusionFollowsTheCpu)
 {
-    // The planner's view.
-    const bool cpuFused = cv::checkHardwareSupport(CV_CPU_FMA3) != 0;
-
-    // The module's view, through the public entry: a geometry with a known rounding tie. If the
-    // kernel guessed wrong, uint8 output differs by whole levels, not by an ulp.
-    const Mat src = randomImage(Size(53, 37), CV_8UC1, 11);
-    const Mat M = M6(0.9, 0.43589, -14.0, -0.43589, 0.9, 10.0);
-    const int flags = INTER_NEAREST | WARP_INVERSE_MAP;
-    const Mat got = gpuWarp(src, M, Size(53, 37), flags, BORDER_CONSTANT, Scalar(0));
-    const Mat ref = cpuWarp(src, M, Size(53, 37), flags, BORDER_CONSTANT, Scalar(0));
-    // CV_8U is exact under this contract; a mis-set FUSED shows up here.
-    EXPECT_EQ(0.0, cvtest::norm(got, ref, NORM_INF))
-        << "the kernel's fused/unfused choice does not match this CPU (checkHardwareSupport="
-        << cpuFused << ")";
+    if (!ready()) throw SkipTestException("no Triton backend");
+    struct RestoreOptimized {
+        bool previous = cv::useOptimized();
+        ~RestoreOptimized() { cv::setUseOptimized(previous); }
+    } restore;
+    const Mat M = M6(1, 1.9, -20, .4, 1, -10);
+    for (bool optimized : {true, false, true})
+    {
+        cv::setUseOptimized(optimized);
+        for (int depth : {CV_8U, CV_16U, CV_32F})
+        for (int cn : {1, 3, 4})
+        for (int mode : {INTER_NEAREST, INTER_LINEAR, INTER_CUBIC})
+        {
+            SCOPED_TRACE(cv::format("optimized=%d depth=%d cn=%d mode=%d hardwareFMA=%d",
+                                   optimized, depth, cn, mode,
+                                   cv::checkHardwareSupport(CV_CPU_FMA3)));
+            const Mat src = randomImage(Size(53, 37), CV_MAKETYPE(depth, cn), 11);
+            const Mat got = gpuWarp(src, M, Size(53, 37), mode, BORDER_CONSTANT);
+            const Mat ref = cpuWarp(src, M, Size(53, 37), mode, BORDER_CONSTANT);
+            EXPECT_TRUE(meetsWarpContract(got, ref));
+        }
+    }
 }
 
 TEST(Triton_WarpAffine, SingularMatrix)

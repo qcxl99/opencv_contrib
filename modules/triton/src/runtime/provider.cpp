@@ -58,20 +58,34 @@ constexpr long long I32_MAX = std::numeric_limits<int>::max();
 bool fits_i32(long long v) { return v >= 0 && v <= I32_MAX; }
 
 Status check_view(const DeviceView& v, const char* which) {
-    if (v.ptr == 0 || v.rows <= 0 || v.cols <= 0) return unsupported(Reason::EmptyOrSize, std::string(which) + " is empty");
-    const std::size_t es = elem_size(v.type);
-    if (v.step % es != 0 || v.step < v.row_bytes())
-        return unsupported(Reason::StepLayout, std::string(which) + ": step must be a multiple of the element size and >= the row bytes");
-    if (!fits_i32(static_cast<long long>(v.step / es)) || !fits_i32(static_cast<long long>(v.cols) * v.channels))
-        return unsupported(Reason::IndexRange, std::string(which) + ": row stride or row width exceeds int32 elements");
-    if (v.alloc_base != 0 && (v.ptr < v.alloc_base || v.end() > v.alloc_base + v.alloc_bytes))
-        return unsupported(Reason::StepLayout, std::string(which) + " extends beyond its allocation");
+    const std::string label(which);
+    if (v.ptr == 0 || v.rows <= 0 || v.cols <= 0 || v.channels <= 0)
+        return unsupported(Reason::EmptyOrSize, label + " is empty");
+    const long long width = static_cast<long long>(v.cols) * v.channels;
+    if (!fits_i32(width)) return unsupported(Reason::IndexRange, label + ": row width exceeds int32 elements");
+    const std::size_t es = elem_size(v.type), row = static_cast<std::size_t>(width) * es;
+    if (v.ptr % es != 0 || v.step % es != 0 || v.step < row)
+        return unsupported(Reason::StepLayout, label + ": pointer/step must be element-aligned and step >= the packed row");
+    if (v.step / es > static_cast<std::size_t>(I32_MAX))
+        return unsupported(Reason::IndexRange, label + ": row stride exceeds int32 elements");
+    // Every address expression in the current kernels is int32 element indexing.
+    const std::size_t rows = static_cast<std::size_t>(v.rows - 1), stride = v.step / es;
+    if (rows && stride > (static_cast<std::size_t>(I32_MAX) - static_cast<std::size_t>(width)) / rows)
+        return unsupported(Reason::IndexRange, label + ": view span exceeds int32 element indexing");
+    const std::size_t span = rows * v.step + row;
+    const auto maxptr = std::numeric_limits<std::uintptr_t>::max();
+    if (v.ptr > maxptr - span)
+        return unsupported(Reason::IndexRange, label + ": address range overflows");
+    if (v.alloc_base != 0 && (v.alloc_base > maxptr - v.alloc_bytes || v.ptr < v.alloc_base ||
+                              v.ptr + span > v.alloc_base + v.alloc_bytes))
+        return unsupported(Reason::StepLayout, label + " extends beyond its allocation");
     return prepared();
 }
 
 const char* tname(ElemType t)
 {
-    return t == ElemType::U8 ? "u8" : (t == ElemType::U16 ? "u16" : "fp32");
+    return t == ElemType::U8 ? "u8"
+         : (t == ElemType::U16 ? "u16" : (t == ElemType::S16 ? "i16" : "fp32"));
 }
 
 // The runtime-argument lists of the four jit functions in operators/resize/kernel.py,
@@ -104,8 +118,12 @@ std::string signature(ref::Route r, ElemType t) {
 
 }  // namespace
 
+Status validate_view(const DeviceView& view, const char* name) { return check_view(view, name); }
+
 Status normalize(const ResizeRequest& req, Normalized& out) {
     const DeviceView &s = req.src, &d = req.dst;
+    if (s.type != ElemType::U8 && s.type != ElemType::F32)
+        return unsupported(Reason::DepthOrChannels, "resize serves U8 and F32 only");
     if (req.interpolation < ref::INTER_NEAREST || req.interpolation > ref::INTER_AREA)
         return unsupported(Reason::Interpolation, "interpolation must be NEAREST, LINEAR, CUBIC or AREA");
     for (const DeviceView* v : {&s, &d})

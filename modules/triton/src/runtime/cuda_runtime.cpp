@@ -212,7 +212,7 @@ struct TableRes
     CUevent uploaded = nullptr;
     CUstream upload_stream = nullptr;
     std::map<std::string, std::size_t> offset;
-    int xmax = 0;
+    int xmax = 0, kx = 0, ky = 0;
     ~TableRes()
     {
         if (contextAlive(ctx, gen))
@@ -343,10 +343,14 @@ bool capturing(CUstream stream)
 // destroys a graph, so the module cannot know; a caller that keeps graphs indefinitely keeps
 // the pin, which is bounded by the number of distinct (code, size-class) keys it captured and is
 // a few kilobytes each.
+// `tab2` is a SECOND table set for the same launch: cvtColor's Xyz/Lab/Luv codes read the small
+// sdiv/hdiv set and their own 2.3 MB family set in the same kernel, and both must be kept alive
+// exactly as long as `tab`. Null for every other caller.
 Status finishLaunch(State& s, CUcontext ctx, std::uint64_t gen, CUstream stream,
                     const std::shared_ptr<ModuleRes>& mod, const std::shared_ptr<TableRes>& tab,
                     const std::string& route, const std::string& key,
-                    const std::string& artifact)
+                    const std::string& artifact,
+                    const std::shared_ptr<TableRes>& tab2 = nullptr)
 {
     std::lock_guard<std::mutex> lk(s.mu);
     ++s.st.launches;
@@ -372,6 +376,7 @@ Status finishLaunch(State& s, CUcontext ctx, std::uint64_t gen, CUstream stream,
         };
         add(std::static_pointer_cast<void>(mod));
         add(std::static_pointer_cast<void>(tab));
+        add(std::static_pointer_cast<void>(tab2));
         s.st.capture_pin_holds = static_cast<long long>(pin->keep.size());
         s.st.capture_launches++;
         Status ok;
@@ -389,6 +394,7 @@ Status finishLaunch(State& s, CUcontext ctx, std::uint64_t gen, CUstream stream,
         static std::vector<std::shared_ptr<void>> leaked;
         leaked.push_back(mod);
         if (tab) leaked.push_back(tab);
+        if (tab2) leaked.push_back(tab2);
         Status e = error(Reason::LaunchFailed, "completion event: " + cuErr(r));
         e.submitted = true;
         return e;
@@ -399,6 +405,7 @@ Status finishLaunch(State& s, CUcontext ctx, std::uint64_t gen, CUstream stream,
     p.done = done;
     p.keep.push_back(mod);
     if (tab) p.keep.push_back(tab);
+    if (tab2) p.keep.push_back(tab2);
     s.pending.push_back(std::move(p));
     s.st.pending = static_cast<long long>(s.pending.size());
     Status ok;
@@ -566,6 +573,18 @@ void buildTables(const Normalized& n, TableRes& t)
             pack(t.host, t.offset, "byf", byf.data(), byf.size() * 4);
         }
     }
+    else if (k == ref::ROUTE_AREA)
+    {
+        const ref::AreaTab tx = ref::area_tab(n.src_w, n.dst_w, 1.0 / n.inv_x);
+        const ref::AreaTab ty = ref::area_tab(n.src_h, n.dst_h, 1.0 / n.inv_y);
+        t.kx = tx.taps; t.ky = ty.taps;
+        pack(t.host, t.offset, "xs", tx.src_index.data(), tx.src_index.size() * sizeof(int));
+        pack(t.host, t.offset, "xa", tx.alpha.data(), tx.alpha.size() * sizeof(float));
+        pack(t.host, t.offset, "xc", tx.count.data(), tx.count.size() * sizeof(int));
+        pack(t.host, t.offset, "ys", ty.src_index.data(), ty.src_index.size() * sizeof(int));
+        pack(t.host, t.offset, "ya", ty.alpha.data(), ty.alpha.size() * sizeof(float));
+        pack(t.host, t.offset, "yc", ty.count.data(), ty.count.size() * sizeof(int));
+    }
     if (t.host.empty()) t.host.resize(16);
 }
 
@@ -683,6 +702,14 @@ std::shared_ptr<TableRes> cvtTablesFor(const kf_cvtcolor::HsvTables& hv, int cod
     t->gen = gen;
     pack(t->host, t->offset, "sdiv", hv.sdiv.data(), hv.sdiv.size() * sizeof(int));
     pack(t->host, t->offset, "hdiv", hv.hdiv.data(), hv.hdiv.size() * sizeof(int));
+    // The Xyz/Lab/Luv kernels take three more table pointers whether or not their op reads them,
+    // so every row needs SOME live address for each: a dead branch that Triton folds away would
+    // never dereference it, but passing 0 would also be wrong the first time a fold did not
+    // happen. Eight bytes of a shared static buffer covers all three.
+    static int dummy = 0;
+    pack(t->host, t->offset, "t32", &dummy, sizeof(int));
+    pack(t->host, t->offset, "t16", &dummy, sizeof(int));
+    pack(t->host, t->offset, "t64", &dummy, sizeof(int));
     t->bytes = t->host.size();
     CUdevice dev;
     int pools = 0;
@@ -706,7 +733,102 @@ std::shared_ptr<TableRes> cvtTablesFor(const kf_cvtcolor::HsvTables& hv, int cod
 
 bool p1Route(ref::Route r)
 {
-    return r == ref::ROUTE_COPY || r == ref::ROUTE_NEAREST || r == ref::ROUTE_LINEAR || r == ref::ROUTE_AREA_FAST;
+    return r == ref::ROUTE_COPY || r == ref::ROUTE_NEAREST || r == ref::ROUTE_LINEAR || r == ref::ROUTE_CUBIC ||
+           r == ref::ROUTE_AREA_FAST || r == ref::ROUTE_AREA;
+}
+
+// The Xyz/Lab/Luv tables. They are ~2.3 MB in total (the 33^3 Luv grid alone is 1.7 MB), so they
+// get their own upload keyed on the FAMILY rather than the code: BGR2Lab and RGB2Lab read the
+// same bytes, and so do BGR2XYZ/RGB2XYZ and the four reverse codes. Keying by code would upload
+// the same 1.7 MB twice for BGR2Luv and RGB2Luv.
+//
+// The packing order is the contract with the kernel (kernels/cvtcolor_cpu.py: T_GAMMA, T_CBRT,
+// ...) and with kf_cvtcolor::LabLuvLayout. Both sides are checked by the numeric tests; a
+// mismatch shows up as every pixel being wrong, not as a subtle drift.
+std::shared_ptr<TableRes> labluvTablesFor(int code, CUcontext ctx, std::uint64_t gen,
+                                          CUstream stream, Status& st)
+{
+    // family: 0 = XYZ (no tables), 1 = Lab/Luv reverse + Lab forward (the small tables),
+    // 2 = Luv forward (the big grid). 2 implies 1, so Luv forward gets both.
+    const kf_cvtcolor::CodeSpec* spec = kf_cvtcolor::find(code);
+    // Only Op::Lab and Op::Luv read these tables. Every other op -- and XYZ, whose coefficients
+    // are constexprs -- gets NO table set at all, which matters: this cache is shared with the
+    // per-code sdiv/hdiv sets and is small (256), so uploading a 2.3 MB set for a code that never
+    // reads it would evict live entries and turn a table hit into a load on every call.
+    if (!spec || (spec->op != kf_cvtcolor::Op::Lab && spec->op != kf_cvtcolor::Op::Luv))
+        return nullptr;
+    const bool isLuvFwd = spec->op == kf_cvtcolor::Op::Luv && !spec->inverse;
+    const std::string key = std::to_string(gen) + "|labluv|" + (isLuvFwd ? "2" : "1");
+
+    State& s = S();
+    bool poison;
+    {
+        std::lock_guard<std::mutex> lk(s.mu);
+        if (auto t = s.tables.get(key))
+        {
+            ++s.st.table_hits;
+            if (t->upload_stream != stream)
+            {
+                const CUresult r = cuStreamWaitEvent(stream, t->uploaded, 0);
+                if (r != CUDA_SUCCESS) { st = error(Reason::LaunchFailed, "cuStreamWaitEvent: " + cuErr(r)); return nullptr; }
+                ++s.st.cross_stream_waits;
+            }
+            return t;
+        }
+        poison = s.poison;
+    }
+
+    const kf_cvtcolor::LabLuvTables& tab = kf_cvtcolor::labluv_tables();
+    auto t = std::make_shared<TableRes>();
+    t->ctx = ctx;
+    t->gen = gen;
+    // t32: fixed-layout concat, in the order the kernel's offsets name. `pack` aligns each blob
+    // to 256 bytes, which happens to match these offsets (they are all multiples of 256 entries
+    // x 4 bytes) -- if an offset is ever added that is not, this needs a manual layout instead.
+    {
+        std::vector<int> t32(static_cast<std::size_t>(kf_cvtcolor::LabLuvLayout::t32_entries), 0);
+        using L = kf_cvtcolor::LabLuvLayout;
+        std::copy(tab.gamma.begin(), tab.gamma.end(), t32.begin() + L::gamma);
+        std::copy(tab.cbrt.begin(), tab.cbrt.end(), t32.begin() + L::cbrt);
+        std::copy(tab.yf.begin(), tab.yf.end(), t32.begin() + L::yf);
+        std::copy(tab.abxz.begin(), tab.abxz.end(), t32.begin() + L::abxz);
+        std::copy(tab.invgamma.begin(), tab.invgamma.end(), t32.begin() + L::invgamma);
+        std::copy(tab.lu.begin(), tab.lu.end(), t32.begin() + L::lu);
+        std::copy(tab.lv.begin(), tab.lv.end(), t32.begin() + L::lv);
+        pack(t->host, t->offset, "t32", t32.data(), t32.size() * sizeof(int));
+    }
+    pack(t->host, t->offset, "t64", tab.lvpl.data(), tab.lvpl.size() * sizeof(long long));
+    if (isLuvFwd)
+    {
+        pack(t->host, t->offset, "t16", tab.luvLut.data(), tab.luvLut.size() * sizeof(short));
+    }
+    else
+    {
+        // Luv's LUT is not read by any other code; keep the pointer live with one element so the
+        // argument is never null.
+        static const short one = 0;
+        pack(t->host, t->offset, "t16", &one, sizeof(short));
+    }
+    t->bytes = t->host.size();
+
+    CUdevice dev;
+    int pools = 0;
+    if (cuCtxGetDevice(&dev) == CUDA_SUCCESS)
+        cuDeviceGetAttribute(&pools, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, dev);
+    t->stream_ordered = pools != 0;
+    CUresult r = t->stream_ordered ? cuMemAllocAsync(&t->base, t->bytes, stream) : cuMemAlloc(&t->base, t->bytes);
+    if (r == CUDA_SUCCESS && poison) r = cuMemsetD8Async(t->base, 0xFF, t->bytes, stream);
+    if (r == CUDA_SUCCESS) r = cuMemcpyHtoDAsync(t->base, t->host.data(), t->bytes, stream);
+    if (r == CUDA_SUCCESS) r = cuEventCreate(&t->uploaded, CU_EVENT_DISABLE_TIMING);
+    if (r == CUDA_SUCCESS) r = cuEventRecord(t->uploaded, stream);
+    if (r != CUDA_SUCCESS) { st = error(Reason::DeviceAlloc, "cvtColor Lab/Luv table upload: " + cuErr(r)); return nullptr; }
+    t->upload_stream = stream;
+    std::vector<std::shared_ptr<TableRes>> ev;
+    std::lock_guard<std::mutex> lk(s.mu);
+    ++s.st.table_uploads;
+    s.tables.put(key, t, ev);
+    countEvicted(ev, s.st.table_evictions, s.st.deferred);
+    return t;
 }
 
 }  // namespace
@@ -806,10 +928,16 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
     {
         ptr("xofs", tab->at("xofs")); ptr("yofs", tab->at("yofs"));
     }
-    else if (n.route.kind == ref::ROUTE_LINEAR)
+    else if (n.route.kind == ref::ROUTE_LINEAR || n.route.kind == ref::ROUTE_CUBIC)
     {
         ptr("xofs", tab->at("xofs")); ptr("ax", tab->at("ax")); ptr("yofs", tab->at("yofs"));
         ptr("by", tab->at("by")); ptr("byf", tab->at("byf")); i32("xmax", tab->xmax);
+    }
+    else if (n.route.kind == ref::ROUTE_AREA)
+    {
+        ptr("xs", tab->at("xs")); ptr("xa", tab->at("xa")); ptr("xc", tab->at("xc"));
+        ptr("ys", tab->at("ys")); ptr("ya", tab->at("ya")); ptr("yc", tab->at("yc"));
+        i32("KX", tab->kx); i32("KY", tab->ky);
     }
     else  // area_fast
     {
@@ -879,6 +1007,16 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
     key.constexprs = {{"BLOCK", key.cfg.block_w},
                       {"BLUE", spec.blue},
                       {"DCN", spec.dcn},
+                      {"GB", spec.gb},
+                      {"ORD", spec.ord},
+                      // Bayer row phase (Start_with_green); 0 for every other op, which ignores it.
+                      {"SWG", spec.swg},
+                      // The one depth constexpr. Only Op::Bayer can be non-zero -- normalize
+                      // refuses every other op at 16U -- but it is passed for all of them so the
+                      // key always names the same set, which is what the compile helper checks
+                      // (tools/compile_helper.py: `constexprs != the kernel's`).
+                      {"U16", n.u16 ? 1 : 0},
+                      {"F32", n.f32 ? 1 : 0},
                       {"I0", spec.perm[0]},
                       {"I1", spec.perm[1]},
                       {"I2", spec.perm[2]},
@@ -886,7 +1024,15 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
                       {"I3", spec.perm[3]},
                       {"INV", spec.inverse ? 1 : 0},
                       {"OP", static_cast<int>(spec.op)},
-                      {"SCN", spec.scn}};
+                      {"SCN", spec.scn},
+                      // The Xyz/Lab/Luv coefficient matrix and the sRGB flag. Passed for EVERY
+                      // code, zeros included, so the compile key always names the same constexpr
+                      // set -- which is exactly what the helper enforces. They come from the
+                      // CODE (coeffs_for), so they are constexprs and not launch arguments.
+                      {"SRGB", spec.srgb ? 1 : 0},
+                      {"E0", spec.k[0]}, {"E1", spec.k[1]}, {"E2", spec.k[2]},
+                      {"E3", spec.k[3]}, {"E4", spec.k[4]}, {"E5", spec.k[5]},
+                      {"E6", spec.k[6]}, {"E7", spec.k[7]}, {"E8", spec.k[8]}};
     std::sort(key.constexprs.begin(), key.constexprs.end());
 
     std::shared_ptr<ModuleRes> mod = moduleFor(key, ctx, gen, st, c.cvt_kernels);
@@ -900,6 +1046,12 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
     std::shared_ptr<TableRes> tab = cvtTablesFor(hv, spec.code, ctx, gen, stream, st);
     if (!tab) return st;
 
+    // The Xyz/Lab/Luv table set, for the codes that read one. XYZ has none (its coefficients are
+    // constexprs); the others get the family's tables, and the pointers that family does not use
+    // still resolve to something valid inside the same allocation.
+    std::shared_ptr<TableRes> ltab = labluvTablesFor(spec.code, ctx, gen, stream, st);
+    if (st.code == kf_resize_rt::Code::Error) return st;
+
     std::map<std::string, Arg> a;
     auto ptr = [&](const char* k, CUdeviceptr v) { Arg x; x.kind = 'p'; x.p = v; a[k] = x; };
     auto i32 = [&](const char* k, long long v) { Arg x; x.kind = 'i'; x.i = static_cast<int>(v); a[k] = x; };
@@ -907,12 +1059,28 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
     ptr("dst", req.dst.ptr);
     ptr("sdiv", tab->at("sdiv"));
     ptr("hdiv", tab->at("hdiv"));
-    // DeviceView::step is the row pitch in BYTES, which is the unit the kernel also indexes
-    // in: cvtColor here is CV_8U only, so a pixel is SCN bytes and there is no element-size
-    // division to do (unlike resize, which serves several depths).
+    // The three typed table pointers. For a family that reads none of them (every op but
+    // Xyz/Lab/Luv, plus Xyz which has no table at all) these resolve to the four-byte dummy the
+    // small table set carries; the per-code constexprs mean the dead branches never load from it.
+    const CUdeviceptr t32 = ltab ? ltab->at("t32") : tab->at("t32");
+    const CUdeviceptr t16 = ltab ? ltab->at("t16") : tab->at("t16");
+    const CUdeviceptr t64 = ltab ? ltab->at("t64") : tab->at("t64");
+    ptr("t32", t32);
+    ptr("t16", t16);
+    ptr("t64", t64);
+    // DeviceView::step is the row pitch in BYTES. The kernel indexes a TYPED pointer, so the
+    // strides it receives are in ELEMENTS; for CV_8U the two are the same number, which is why
+    // this division only appeared when Bayer made 16U reachable. normalize() has already
+    // checked that step is a multiple of the element size, so the division is exact.
     i32("cols", n.cols);
-    i32("src_rs", static_cast<long long>(req.src.step));
-    i32("dst_rs", static_cast<long long>(req.dst.step));
+    i32("src_rs", static_cast<long long>(req.src.step / kf_resize_rt::elem_size(req.src.type)));
+    i32("dst_rs", static_cast<long long>(req.dst.step / kf_resize_rt::elem_size(req.dst.type)));
+    // Where the chroma plane starts, in elements from `src`: the Y plane is `n.rows` tall. For a
+    // code with no chroma plane the value is unused. It uses the DESTINATION height, which for a
+    // 4:2:0 decode is the source height * 2/3 -- using src.rows would read 1.5x too far into the
+    // buffer, and that is a silent wrong image rather than a crash.
+    i32("uv_rs", static_cast<long long>(n.rows) *
+                 static_cast<long long>(req.src.step / kf_resize_rt::elem_size(req.src.type)));
 
     unsigned grid[3];
     kf_cvtcolor::grid(n, key.cfg.block_w, grid);
@@ -921,7 +1089,7 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
 
     // Under capture the module and tables are pinned to the graph's lifetime instead of being
     // left to the caches: see finishLaunch.
-    return finishLaunch(s, ctx, gen, stream, mod, tab, spec.name, key.text(), mod->dir);
+    return finishLaunch(s, ctx, gen, stream, mod, tab, spec.name, key.text(), mod->dir, ltab);
 }
 
 // ----------------------------------------------------------------- warpAffine

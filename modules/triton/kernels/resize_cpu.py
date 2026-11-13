@@ -5,7 +5,7 @@
 # CPU-aligned resize kernels (contract resize/0.15.0) for the runtime JIT of modules/triton.
 # GENERATED, do not edit: exported from kernelforge-lab by tools/export_module_kernels.py.
 #   lab file:    operators/resize/kernel.py
-#   lab sha256:  d3019ce3bcfd3bb576771a9f1335d3ee103d0471851b1e962ba19d27d6cd4eec
+#   lab sha256:  6ec7f1a7fbe31d54dcf6c1f1abeacf70e1761d00bd01aa9a95721fe877a9a308
 #   functions:   _cpu_tile, _resize_cpu_nearest_kernel, _cpu_hlin, _cpu_hcub, _cpu_row, _cpu_tap, _resize_cpu_sep_kernel, _cpu_f32_tap, _cpu_f32_tapv, _cpu_f32_window_v, _cpu_step, _cpu_f32_window, _resize_cpu_area_fast_kernel, _resize_cpu_area_kernel
 # The runtime compiles these through tools/compile_helper.py; the compile key carries this
 # file's own sha256, so editing it here only changes which binaries are built, never which

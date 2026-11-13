@@ -28,10 +28,15 @@ enum class Backend : int { CUDA = 1, HIP = 2 };
 // U16 exists because warpAffine serves CV_16U (contract warpaffine/0.4.1). It is a property
 // of this shared runtime, not of resize, which still accepts CV_8U and CV_32F only and says
 // so at its own entry.
-enum class ElemType : int { U8 = 0, F32 = 1, U16 = 2 };
+// S16 exists as an identity because CV_16S is a legal cv::warpAffine input and the type system
+// has to be able to name it, but NO operator admits it yet: cv::warpAffine sends every CV_16S
+// type down its legacy fixed-point path (imgwarp.cpp:2272, "// no default"), which is a
+// different algorithm from the float kernels these operators reproduce. See warpaffine.cpp
+// normalize() for the measurement.
+enum class ElemType : int { U8 = 0, F32 = 1, U16 = 2, S16 = 3 };
 inline std::size_t elem_size(ElemType t)
 {
-    return t == ElemType::U8 ? 1 : (t == ElemType::U16 ? 2 : 4);
+    return t == ElemType::U8 ? 1 : ((t == ElemType::U16 || t == ElemType::S16) ? 2 : 4);
 }
 
 // Which device context a buffer, stream or module belongs to. `native` is the raw
@@ -128,6 +133,9 @@ struct Normalized {
 //    elements, tap counts): beyond that the request is Unsupported, never truncated;
 //  * no in-place and no overlap of the byte ranges [ptr, end()) (conservative).
 Status normalize(const ResizeRequest& req, Normalized& out);
+
+// Shared layout/range validator; geometry and supported depth stay operator-owned.
+Status validate_view(const DeviceView& view, const char* name);
 
 // ------------------------------------------------------------ compile key (B2)
 

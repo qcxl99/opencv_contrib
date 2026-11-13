@@ -5,13 +5,14 @@
 // Pure part of the warpAffine provider: validation and the explicit compile key. No device
 // access, so it is testable without a GPU.
 //
-// Semantics are CPU cv::warpAffine (kernelforge-lab contract warpaffine/0.4.1), NOT
+// Semantics are CPU cv::warpAffine (kernelforge-lab contract warpaffine/0.4.3), NOT
 // cv::cuda::warpAffine. The two differ: this OpenCV's CPU warpAffine evaluates float
 // coordinates with float weights (warp_kernels.simd.hpp), while the GPU kernel still runs the
 // older fixed-point remap pipeline. cv::cuda::warpAffine is a timing baseline only.
 //
-// Supported: INTER_NEAREST, INTER_LINEAR and INTER_CUBIC; CV_8U, CV_16U and CV_32F; 1/3/4
-// channels; the five border modes; WARP_INVERSE_MAP both ways. DELIBERATELY REFUSED, by name:
+// Supported: INTER_NEAREST, INTER_LINEAR and INTER_CUBIC; INTER_AREA aliases LINEAR;
+// CV_8U/CV_16U/CV_32F, 1/3/4 channels; five standard borders plus TRANSPARENT for
+// NEAREST/LINEAR/AREA; WARP_INVERSE_MAP both ways. CUBIC+TRANSPARENT is refused, as is
 // INTER_LANCZOS4, whose 8x8 table is a separate contract -- approximating it behind an
 // unmeasured tolerance is exactly the failure this project has paid for once already.
 //
@@ -63,8 +64,8 @@ struct Normalized {
     int block_h = 1, block_w = 128, num_warps = 4;
     // Whether the reference CPU computes the column term with a real FMA. cv::v_fma is only
     // fused when the build has FMA3 (core/hal/intrin_sse.hpp uses _mm_add_ps(_mm_mul_ps(..))
-    // otherwise), and the two land on different pixels at a 0.5 tie. Filled by normalize() from
-    // the running CPU's dispatch, so the kernel reproduces whichever the reference used.
+    // otherwise), and the two land on different pixels at a 0.5 tie. normalize() calibrates
+    // the actual linked CPU path per dtype/channels/useOptimized, not hardware capability.
     bool fused = true;
 };
 

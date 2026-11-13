@@ -32,15 +32,14 @@ Supported subset (this milestone)
 | depth | `CV_8U`, `CV_32F` |
 | channels | 1, 3, 4 |
 | sizing | explicit `dsize`, or `fx`/`fy` when `dsize` is empty (the caller's values are used, as in `cv::resize`) |
-| routes | same size (a device copy, not a kernel launch); `INTER_NEAREST`; `INTER_LINEAR` (exact 2x down takes the AREA fast path, as on the CPU); `INTER_AREA` at integer ratios, and with an upscaled axis |
+| routes | same size (a device copy, not a kernel launch); `INTER_NEAREST`; `INTER_LINEAR` (exact 2x down takes the AREA fast path, as on the CPU); `INTER_CUBIC`; `INTER_AREA` at integer and fractional ratios, and with an upscaled axis |
 | layout | ROI source/destination, row-contiguous pixels and channels; the output is reused when it already has the right size and type |
 | platform | Linux, CUDA (driver API), `sm_90` tested |
 
-`INTER_CUBIC` and `INTER_AREA` at fractional ratios raise
-`cv::Error::StsUnsupportedFormat` (route not enabled) until the next milestone;
-so do other depths, channel counts and interpolations. There is **no implicit
-fallback** to CPU or to `cv::cuda`: a call that returns has submitted the
-computation. Windows and the HIP/BW1000 backend are not built in this milestone.
+Unsupported depths, channels and interpolation modes raise
+`cv::Error::StsUnsupportedFormat`. All four declared interpolations execute the
+CPU-aligned kernels; there is no implicit fallback to CPU or to `cv::cuda`.
+Windows and the HIP/BW1000 backend are not built in this milestone.
 
 How a call runs
 ---------------

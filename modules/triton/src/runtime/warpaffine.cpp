@@ -4,12 +4,15 @@
 
 #include "warpaffine.hpp"
 
-#include "opencv2/core/utility.hpp"   // cv::checkHardwareSupport, CV_CPU_FMA3
+#include "opencv2/core/utility.hpp"   // cv::useOptimized
 #include "opencv2/imgproc.hpp"        // cv::INTER_AREA (the CPU rewrite this follows)
 
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+#include <map>
+#include <mutex>
+#include <tuple>
 
 namespace kf_warpaffine {
 
@@ -31,11 +34,81 @@ Status unsupported(Reason r, std::string msg) {
     return s;
 }
 
+// Hardware FMA support does not identify the arithmetic compiled into imgproc.
+// Calibrate the linked CPU vector path at rounding ties, with no CPU feature
+// toggles and no device work. Padding keeps every sampled column out of the tail.
+// Type/channel dispatch and useOptimized are part of the calibration identity.
+bool reference_fused(int depth, int channels)
+{
+    static std::mutex mutex;
+    static std::map<std::tuple<int, int, bool>, bool> cache;
+    const auto key = std::make_tuple(depth, channels, cv::useOptimized());
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+
+    cv::Mat ids(37, 53, CV_MAKETYPE(CV_16U, channels));
+    for (int y = 0; y < ids.rows; ++y)
+        for (int x = 0; x < ids.cols; ++x)
+            for (int c = 0; c < channels; ++c)
+                ids.ptr<unsigned short>(y)[x * channels + c] =
+                    static_cast<unsigned short>(1 + (y * ids.cols + x) * 17 + c * 73);
+    cv::Mat source;
+    ids.convertTo(source, CV_MAKETYPE(depth, channels));
+    if (depth == CV_8U)
+        for (int y = 0; y < source.rows; ++y)
+            for (int x = 0; x < source.cols * channels; ++x)
+                source.ptr<unsigned char>(y)[x] = static_cast<unsigned char>(ids.ptr<unsigned short>(y)[x] % 251 + 1);
+
+    // Fixed probes are independent of the user's matrix, seed or expected image.
+    const double probes[][6] = {{1, 1.9, -20, .4, 1, -10},
+                                {.9, .43589, -14, -.43589, .9, 10}};
+    bool matches[2] = {true, true};
+    for (const auto& matrix : probes)
+    {
+        double sampling[6];
+        invert(matrix, sampling);
+        float a[6];
+        for (int i = 0; i < 6; ++i) a[i] = static_cast<float>(sampling[i]);
+        cv::Mat reference;
+        cv::warpAffine(source, reference, cv::Mat(2, 3, CV_64F, const_cast<double*>(matrix)),
+                       cv::Size(256, 37), cv::INTER_NEAREST, cv::BORDER_CONSTANT);
+        cv::Mat src64, ref64;
+        source.convertTo(src64, CV_MAKETYPE(CV_64F, channels));
+        reference.convertTo(ref64, CV_MAKETYPE(CV_64F, channels));
+        for (int fused = 0; fused < 2; ++fused)
+            for (int y = 0; y < 37 && matches[fused]; ++y)
+                for (int x = 0; x < 53 && matches[fused]; ++x)
+                {
+                    // Volatile intermediates prohibit compiler FMA contraction
+                    // in the unfused alternative, regardless of module flags.
+                    volatile float rowx = y * a[1], rowy = y * a[4];
+                    const float rx = rowx + a[2], ry = rowy + a[5];
+                    volatile float colx = x * a[0], coly = x * a[3];
+                    const float sx = fused ? std::fma(float(x), a[0], rx) : colx + rx;
+                    const float sy = fused ? std::fma(float(x), a[3], ry) : coly + ry;
+                    const int ix = cvRound(sx), iy = cvRound(sy);
+                    for (int c = 0; c < channels; ++c)
+                    {
+                        const double predicted = ix >= 0 && ix < 53 && iy >= 0 && iy < 37
+                            ? src64.ptr<double>(iy)[ix * channels + c] : 0;
+                        if (predicted != ref64.ptr<double>(y)[x * channels + c])
+                            matches[fused] = false;
+                    }
+                }
+    }
+    if (matches[0] == matches[1])
+        CV_Error(cv::Error::StsUnsupportedFormat,
+                 "cv::triton::warpAffine: linked CPU vector arithmetic could not be identified");
+    cache.emplace(key, matches[1]);
+    return matches[1];
+}
+
 bool is_border(int b)
 {
     return b == 0 || b == 1 || b == 2 || b == 3 || b == 4 || b == 5;
-    // CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT. TRANSPARENT (5) writes only the
-    // destination pixels whose source point is inside the image, leaving the rest as they were.
+    // CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT. TRANSPARENT preserves outside
+    // nearest samples; LINEAR/AREA use the old destination for each outside tap.
 }
 }  // namespace
 
@@ -68,14 +141,13 @@ Status normalize(const Request& req, Normalized& out)
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: interpolation " +
                                std::to_string(req.interpolation) +
-                               " is not served by this module (warpaffine/0.4.1 covers "
+                               " is not served by this module (warpaffine/0.4.3 covers "
                                "INTER_NEAREST, INTER_LINEAR, INTER_CUBIC and INTER_AREA); "
                                "INTER_LANCZOS4 is refused rather than approximated");
-    // BORDER_TRANSPARENT is served for NEAREST and LINEAR only. Both were verified exact against
-    // the CPU (WA_TRANSPARENT.md, and a local sweep of 8U/16U x 1/3 channels x all three
-    // interpolations). CUBIC + TRANSPARENT is refused: the CPU fills an out-of-range tap from the
-    // destination pixel and the exact blend could not be reproduced here, so shipping it would
-    // write a different image than cv::warpAffine rather than a slightly different one.
+    // BORDER_TRANSPARENT is served for NEAREST and LINEAR (including the AREA alias).
+    // TransparentMatchesCpu checks the selected reference with initialized destinations,
+    // every supported dtype/channel, ROI guards and inside/partial/outside geometries.
+    // CUBIC + TRANSPARENT remains outside the implemented subset.
     if (req.border_mode == cv::BORDER_TRANSPARENT && req.interpolation == cv::INTER_CUBIC)
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: BORDER_TRANSPARENT with INTER_CUBIC is not "
@@ -106,17 +178,10 @@ Status normalize(const Request& req, Normalized& out)
                            "accepted by cv::warpAffine but runs its fixed-point path, which this "
                            "module does not reproduce yet");
     if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
-    if (s.ptr == 0 || d.ptr == 0 || s.rows <= 0 || s.cols <= 0 || d.rows <= 0 || d.cols <= 0)
-        return unsupported(Reason::EmptyOrSize, "src or dst is empty");
-    for (const char* which : {"src", "dst"}) {
-        const kf_resize_rt::DeviceView& v = which[0] == 's' ? s : d;
-        if (v.step % kf_resize_rt::elem_size(v.type) != 0 || v.step < v.row_bytes())
-            return unsupported(Reason::StepLayout, std::string(which) +
-                               ": step must be a multiple of the element size and >= the row bytes");
-    }
-    const long long n = static_cast<long long>(d.rows) * d.cols * d.channels;
-    if (n > 0x7fffffffLL)
-        return unsupported(Reason::IndexRange, "output element count exceeds int32 indexing");
+    Status valid = kf_resize_rt::validate_view(s, "src");
+    if (!valid.ok()) return valid;
+    valid = kf_resize_rt::validate_view(d, "dst");
+    if (!valid.ok()) return valid;
     if (s.ptr < d.end() && d.ptr < s.end())
         return unsupported(Reason::InPlaceOrOverlap, "src and dst overlap (in-place is not supported)");
 
@@ -168,16 +233,8 @@ Status normalize(const Request& req, Normalized& out)
     }
     out.num_warps = 4;
 
-    // Whether the reference CPU fuses the column term. cv::v_fma is a real FMA only when the
-    // build has FMA3; otherwise intrin_sse.hpp expands it to multiply-then-add, which rounds
-    // twice and lands on a different pixel at a tie (measured: SM-90 box, 1 disagreement in
-    // 1600 pixels on the rotating geometry, which is a whole output level for CV_8U).
-    //
-    // The CPU dispatches at run time, so the answer must come from the running CPU, not from
-    // the compile-time baseline: a build configured with CPU_DISPATCH listing AVX2 will take
-    // the fused path on an AVX2 machine and the separate one when dispatch is empty. Asking
-    // the same predicate OpenCV itself uses (`checkHardwareSupport`) keeps the two in step.
-    out.fused = cv::checkHardwareSupport(CV_CPU_FMA3) != 0;
+    const int depth = out.u8 ? CV_8U : (out.u16 ? CV_16U : CV_32F);
+    out.fused = reference_fused(depth, s.channels);
     return prepared();
 }
 
@@ -207,7 +264,7 @@ std::string signature(const Normalized& n)
 std::string constexprs_text(const Normalized& n)
 {
     std::ostringstream o;
-    o << "BLOCK_H=" << n.block_h << ",BLOCK_W=" << n.block_w << ",BORDER=" << n.border
+    o << "BLOCK_H=" << n.block_h << ",BLOCK_W=" << n.block_w << ",BORDER=" << n.border_mode_code
       << ",BORDER_X=" << n.border_x
       << ",BORDER_Y=" << n.border_y;
     // U8/U16 exist only on the kernels that convert their loads (LINEAR, CUBIC); the NEAREST

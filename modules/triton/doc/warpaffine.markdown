@@ -10,7 +10,8 @@ module's `README.md`; this page is the full usage guide.
 What it computes
 ----------------
 
-Selected CPU vector-path semantics for `INTER_NEAREST` and `INTER_LINEAR`:
+Contract `warpaffine/0.4.3` uses selected CPU vector-path semantics for
+`INTER_NEAREST` and `INTER_LINEAR` (including the `INTER_AREA` alias):
 OpenCV's CPU `cv::warpAffine` as produced by its SIMD body (OpenCV 5.0.0: float32
 coordinates and float32 weights, one `saturate_cast<uchar|ushort>` for `CV_8U` /
 `CV_16U`), and the **natural-width** call for `INTER_CUBIC`, which is a different
@@ -66,6 +67,14 @@ crops there. This removes the observed dependence on which columns reach the
 scalar tail. It does not prove ISA independence: fused versus separate arithmetic,
 compiler choices and dispatch can change results. The reference remains bound to
 the characterised CPU build; cross-ISA equality is unverified.
+
+The module calibrates fused versus separate multiply/add from fixed probes of
+this linked CPU implementation, separately for depth, channel count and
+`cv::useOptimized()` state. It does not infer the reference arithmetic from
+hardware FMA support or from the module's own compiler flags. This is bounded
+CPU reference-path identification on first use of each configuration; the
+user's image operation still executes on the GPU. An unidentifiable CPU path
+is rejected explicitly instead of being guessed.
 
 Against a **natural-width** call the difference is confined to columns whose
 sampled coordinate is critical, and its size depends on the interpolation: for

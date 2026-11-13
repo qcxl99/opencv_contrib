@@ -9,6 +9,8 @@
 // not cv::cuda::resize, which computes something else.
 
 #include "test_helpers.hpp"
+#include <climits>
+#include <thread>
 
 namespace opencv_test { namespace {
 
@@ -28,6 +30,14 @@ const RouteCase kCases[] = {
     {Size(97, 53), Size(97, 53), 0, 0, INTER_LINEAR, "copy"},
     {Size(97, 53), Size(97, 53), 0, 0, INTER_AREA, "copy"},
     {Size(97, 53), Size(97, 53), 0, 0, INTER_CUBIC, "copy"},
+    // Four-mode CPU semantics: cubic and fractional AREA use the existing generic kernels.
+    {Size(131, 97), Size(61, 53), 0, 0, INTER_CUBIC, "cubic"},
+    {Size(64, 48), Size(200, 150), 0, 0, INTER_CUBIC, "cubic"},
+    {Size(1, 40), Size(5, 20), 0, 0, INTER_CUBIC, "cubic"},
+    {Size(40, 1), Size(), 1.7, 3.0, INTER_CUBIC, "cubic"},
+    {Size(131, 97), Size(61, 53), 0, 0, INTER_AREA, "area"},
+    {Size(64, 48), Size(20, 21), 0, 0, INTER_AREA, "area"},
+    {Size(64, 48), Size(), 0.7, 0.6, INTER_AREA, "area"},
     // nearest: down, up, exact ratios, one-pixel edges, fx/fy
     {Size(131, 97), Size(61, 53), 0, 0, INTER_NEAREST, "nearest"},
     {Size(64, 48), Size(200, 150), 0, 0, INTER_NEAREST, "nearest"},
@@ -166,11 +176,9 @@ TEST(Triton_Resize, RejectsWithoutFallback)
         catch (const cv::Exception& e) { return e.code; }
         return 0;
     };
-    // Routes P1 does not serve yet: nothing is submitted, there is no silent substitute.
+    // Every declared interpolation is served; rejected requests still submit nothing.
     const td::RuntimeStats a = td::runtimeStats();
-    EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::resize(u8, dst, Size(50, 50), 0, 0, INTER_CUBIC); }));
-    cuda::GpuMat fractional;
-    EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::resize(u8, fractional, Size(20, 21), 0, 0, INTER_AREA); }));
+    EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::resize(u8, dst, Size(50, 50), 0, 0, INTER_LANCZOS4); }));
     const td::RuntimeStats b = td::runtimeStats();
     EXPECT_EQ(a.launches, b.launches);
     EXPECT_EQ(a.copies, b.copies);
@@ -188,6 +196,118 @@ TEST(Triton_Resize, RejectsWithoutFallback)
     parent.setTo(Scalar::all(0));
     cuda::GpuMat s0 = parent(Rect(0, 0, 32, 32)), d0 = parent(Rect(16, 16, 16, 16));
     EXPECT_EQ(Error::StsBadArg, code([&] { cv::triton::resize(s0, d0, Size(16, 16)); }));
+}
+
+
+
+TEST(Triton_Boundary, RejectsInvalidAllocationAndStrideBeforeLaunch)
+{
+    if (!ready()) throw SkipTestException("no Triton backend");
+    cuda::GpuMat allocation(8, 8, CV_8UC1);
+    cuda::GpuMat tooLarge(128, 128, CV_8UC1, allocation.cudaPtr(), 128);
+    cuda::GpuMat hugeStride(2, 8, CV_8UC1, allocation.cudaPtr(), static_cast<size_t>(INT_MAX));
+    cuda::GpuMat out;
+    const Mat M = (Mat_<double>(2,3) << 1,0,0,0,1,0);
+    cuda::GpuMat unaligned(2,4,CV_32FC1,static_cast<unsigned char*>(allocation.cudaPtr())+1,32);
+    for (const cuda::GpuMat* bad : {&tooLarge, &hugeStride, &unaligned})
+    {
+        const auto before = td::runtimeStats();
+        EXPECT_THROW(cv::triton::resize(*bad, out, Size(4,4)), cv::Exception);
+        EXPECT_THROW(cv::triton::cvtColor(*bad, out, COLOR_GRAY2BGR), cv::Exception);
+        EXPECT_THROW(cv::triton::warpAffine(*bad, out, M, Size(4,4)), cv::Exception);
+        EXPECT_EQ(before.launches, td::runtimeStats().launches);
+        EXPECT_EQ(before.copies, td::runtimeStats().copies);
+    }
+}
+
+TEST(Triton_Boundary, RejectsForeignBuffersAndStreamsBeforeAllocation)
+{
+    if (!ready()) throw SkipTestException("no Triton backend");
+    if (cuda::getCudaEnabledDeviceCount() < 2) throw SkipTestException("two devices required for actual context rejection");
+    const Mat M = (Mat_<double>(2,3) << 1,0,0,0,1,0);
+    cuda::setDevice(0);
+    cuda::GpuMat local(16, 16, CV_8UC3), result;
+    cuda::Stream localStream;
+    cuda::setDevice(1);
+    cuda::GpuMat foreign(16, 16, CV_8UC3);
+    {
+        cuda::Stream foreignStream;
+        cuda::setDevice(0);
+        const auto before = td::runtimeStats();
+        EXPECT_THROW(cv::triton::resize(foreign, result, Size(8,8)), cv::Exception);
+        EXPECT_THROW(cv::triton::cvtColor(foreign, result, COLOR_BGR2GRAY), cv::Exception);
+        EXPECT_THROW(cv::triton::warpAffine(foreign, result, M, Size(8,8)), cv::Exception);
+        const void* foreignPtr = foreign.cudaPtr();
+        EXPECT_THROW(cv::triton::resize(local, foreign, Size(8,8)), cv::Exception);
+        EXPECT_THROW(cv::triton::cvtColor(local, foreign, COLOR_BGR2GRAY), cv::Exception);
+        EXPECT_THROW(cv::triton::warpAffine(local, foreign, M, Size(8,8)), cv::Exception);
+        EXPECT_EQ(foreignPtr, foreign.cudaPtr());
+        EXPECT_THROW(cv::triton::resize(local, result, Size(8,8), 0,0,INTER_LINEAR,foreignStream), cv::Exception);
+        EXPECT_THROW(cv::triton::cvtColor(local, result, COLOR_BGR2GRAY,foreignStream), cv::Exception);
+        EXPECT_THROW(cv::triton::warpAffine(local,result,M,Size(8,8),INTER_LINEAR,BORDER_CONSTANT,Scalar(),foreignStream), cv::Exception);
+        EXPECT_EQ(before.launches, td::runtimeStats().launches);
+        EXPECT_EQ(before.copies, td::runtimeStats().copies);
+        cuda::setDevice(1);
+    }
+    foreign.release();
+    cuda::setDevice(0);
+}
+
+TEST(Triton_Boundary, ExplicitProducerConsumerAndSustainedReuse)
+{
+    if (!ready()) throw SkipTestException("no Triton backend");
+    const Mat M = (Mat_<double>(2,3) << 1,0,0,0,1,0);
+    cuda::Stream producer, target, consumer;
+    cuda::Event uploaded, completed;
+    cuda::GpuMat src, resized, gray, warped;
+    Mat a,b,c;
+    for (int round = 0; round < 24; ++round)
+    {
+        const Mat host = randomImage(Size(48,32),CV_8UC3,500000+round);
+        src.upload(host, producer);
+        uploaded.record(producer);
+        target.waitEvent(uploaded);
+        cv::triton::resize(src,resized,Size(24,16),0,0,INTER_CUBIC,target);
+        cv::triton::cvtColor(src,gray,COLOR_BGR2GRAY,target);
+        cv::triton::warpAffine(src,warped,M,host.size(),INTER_NEAREST,BORDER_CONSTANT,Scalar(),target);
+        completed.record(target);
+        consumer.waitEvent(completed);
+        resized.download(a,consumer); gray.download(b,consumer); warped.download(c,consumer);
+        consumer.waitForCompletion();
+        EXPECT_TRUE(meetsContract(a,oracle(host,Size(24,16),0,0,INTER_CUBIC),INTER_CUBIC));
+        Mat grayRef; cv::cvtColor(host,grayRef,COLOR_BGR2GRAY);
+        EXPECT_EQ(0.0,cvtest::norm(b,grayRef,NORM_INF));
+        EXPECT_EQ(0.0,cvtest::norm(c,host,NORM_INF));
+    }
+    td::reapCompleted();
+    EXPECT_EQ(0,td::runtimeStats().pending);
+}
+
+
+TEST(Triton_Boundary, BorrowedBufferOnFreshHostThread)
+{
+    if (!ready()) throw SkipTestException("no Triton backend");
+    cuda::setDevice(0);
+    const Mat host(32,48,CV_8UC3,Scalar(37,37,37));
+    cuda::GpuMat src(host);
+    bool passed = false;
+    std::string failure;
+    std::thread worker([&] {
+        try {
+            cuda::GpuMat small,gray,warped;
+            cv::triton::resize(src,small,Size(24,16));
+            cv::triton::cvtColor(src,gray,COLOR_BGR2GRAY);
+            Mat M=(Mat_<double>(2,3)<<1,0,0,0,1,0);
+            cv::triton::warpAffine(src,warped,M,src.size(),INTER_NEAREST);
+            cuda::Stream::Null().waitForCompletion();
+            Mat a,b,c;small.download(a);gray.download(b);warped.download(c);
+            passed=cvtest::norm(a,Mat(a.size(),a.type(),Scalar::all(37)),NORM_INF)==0 &&
+                   cvtest::norm(b,Mat(b.size(),b.type(),Scalar::all(37)),NORM_INF)==0 &&
+                   cvtest::norm(c,host,NORM_INF)==0;
+        } catch(const cv::Exception& e) { failure=e.what(); }
+    });
+    worker.join();
+    EXPECT_TRUE(passed) << failure;
 }
 
 }}  // namespace

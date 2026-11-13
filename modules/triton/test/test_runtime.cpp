@@ -14,6 +14,8 @@
 #include "../src/runtime/compile_protocol.hpp"
 
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <fstream>
 #include <thread>
@@ -34,6 +36,62 @@ static void blockStream(cuda::Stream& s, int* ms)
 {
     ASSERT_EQ(CUDA_SUCCESS, cuLaunchHostFunc(cuda::StreamAccessor::getStream(s), hostSleep, ms));
 }
+
+// A bounded gate keeps pending work a state, not a guess about elapsed time.
+// The watchdog only releases a broken scenario so a failed test cannot hang
+// the context; a watchdog release is an explicit test failure.
+class HostGate
+{
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false, timedOut_ = false, finished_ = false;
+    std::thread watchdog_;
+public:
+    HostGate() : watchdog_([this] {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(30), [this] { return released_; }))
+        {
+            timedOut_ = released_ = true;
+            changed_.notify_all();
+        }
+    }) {}
+    ~HostGate()
+    {
+        release();
+        watchdog_.join();
+        // An exception after submission must not destroy the callback's state
+        // while it is still leaving its wait.
+        std::unique_lock<std::mutex> lock(mutex_);
+        changed_.wait(lock, [this] { return !entered_ || finished_; });
+    }
+    void release()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        changed_.notify_all();
+    }
+    bool waitEntered()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        changed_.wait(lock, [this] { return entered_ || timedOut_; });
+        return entered_ && !timedOut_;
+    }
+    bool timedOut()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return timedOut_;
+    }
+    static void CUDA_CB callback(void* ptr)
+    {
+        HostGate& gate = *static_cast<HostGate*>(ptr);
+        std::unique_lock<std::mutex> lock(gate.mutex_);
+        gate.entered_ = true;
+        gate.changed_.notify_all();
+        gate.changed_.wait(lock, [&gate] { return gate.released_; });
+        gate.finished_ = true;
+        gate.changed_.notify_all();
+    }
+};
 
 static std::string configField(const std::string& key)
 {
@@ -135,58 +193,63 @@ TEST(Triton_Runtime, TableUploadOrderingAcrossStreams)
     EXPECT_TRUE(meetsContract(gb, oracle(hb, dsz, 0, 0, INTER_LINEAR), INTER_LINEAR));
 }
 
-// A launch still in flight holds its module and tables: evicting them from the caches frees nothing
-// until the launch's completion has been observed. Module load and unload block until the context
-// drains, so eviction under a truly pending launch must not need a load: both kernels are cached
-// first; the tables are evicted by another shape of the same kernel, the module by shrinking.
+// Eviction must retain resources referenced by a known-pending launch. All
+// resources are warmed before the gate: new allocations and blocking waits in
+// another stream may drain the context under compute-sanitizer. Only cached
+// submission and host cache operations occur while the gate is closed.
 TEST(Triton_Runtime, InFlightRetentionAndEviction)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
     Restore restore;
-    const Size sa(141, 83), da(67, 59), sb(123, 77), db(71, 43), sc(119, 73), dc(61, 47);   // unique to this test
+    const Size sa(141, 83), da(67, 59), sb(123, 77), db(71, 43), sc(119, 73), dc(61, 47);
     cuda::Stream a(cudaStreamNonBlocking), b(cudaStreamNonBlocking);
-    {   // both binaries are on disk and loaded
-        cuda::GpuMat d1, d2;
-        runOne(randomImage(Size(31, 29), CV_8UC1, 3), Size(13, 11), INTER_LINEAR, a, d2);
-        runOne(randomImage(Size(31, 29), CV_8UC1, 2), Size(13, 11), INTER_NEAREST, a, d1);
-    }
-    td::setCacheLimits(2, 1);
-    td::setPoisonNewTables(true);
-    td::reapCompleted();
-    td::resetRuntimeStats();
-
     const Mat ha = randomImage(sa, CV_8UC1, 21), hb = randomImage(sb, CV_8UC1, 22), hc = randomImage(sc, CV_8UC1, 23);
     cuda::GpuMat ga(ha), gb(hb), gc(hc), oa(da, CV_8UC1), ob(db, CV_8UC1), oc(dc, CV_8UC1);
-    int ms = 800;
-    const auto t0 = std::chrono::steady_clock::now();
-    blockStream(a, &ms);
-    cv::triton::resize(ga, oa, da, 0, 0, INTER_NEAREST, a);   // upload and launch sit behind the block
-    cv::triton::resize(gb, ob, db, 0, 0, INTER_NEAREST, b);   // same kernel, other tables: evicts A's tables
-    b.waitForCompletion();                                    // B runs to completion while A is blocked
-    cv::triton::resize(gc, oc, dc, 0, 0, INTER_LINEAR, b);    // the linear module becomes most recent
-    td::setCacheLimits(1, 1);                                 // evicts the nearest module A is using
-    td::reapCompleted();
-    td::RuntimeStats st = td::runtimeStats();
-    const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    EXPECT_LT(elapsed, 0.5 * ms) << "A's block had nearly ended: the scenario tests nothing";
-    EXPECT_EQ(0, st.module_loads) << "a load would have drained the context";
-    EXPECT_GE(st.table_evictions, 1);
-    EXPECT_GE(st.module_evictions, 1);
-    EXPECT_GE(st.deferred, 2) << "the evicted module and tables should still be held by the blocked launch";
-    EXPECT_EQ(0, st.module_frees) << "a module in use was unloaded";
-    EXPECT_GE(st.pending, 1);
-    // Exactly the table A holds is evicted but not freed: A's new table was evicted by B, while the
-    // warm-up's table (evicted by A) and B's table (evicted by C, B has completed) are gone.
-    EXPECT_EQ(st.table_evictions - 1, st.table_frees) << "tables in use were freed, or finished ones kept";
-    const long long tableFreesWhileBlocked = st.table_frees;
-
+    td::setCacheLimits(2, 3);
+    td::setPoisonNewTables(true);
+    cv::triton::resize(ga, oa, da, 0, 0, INTER_NEAREST, a);
+    cv::triton::resize(gb, ob, db, 0, 0, INTER_NEAREST, b);
+    cv::triton::resize(gc, oc, dc, 0, 0, INTER_LINEAR, b);
     a.waitForCompletion();
     b.waitForCompletion();
     td::reapCompleted();
+    td::resetRuntimeStats();
+
+    CUevent pending = nullptr;
+    ASSERT_EQ(CUDA_SUCCESS, cuEventCreate(&pending, CU_EVENT_DISABLE_TIMING));
+    HostGate gate;
+    const CUstream rawA = cuda::StreamAccessor::getStream(a);
+    ASSERT_EQ(CUDA_SUCCESS, cuLaunchHostFunc(rawA, HostGate::callback, &gate));
+    EXPECT_TRUE(gate.waitEntered()) << "host gate did not become active";
+    cv::triton::resize(ga, oa, da, 0, 0, INTER_NEAREST, a);
+    EXPECT_EQ(CUDA_SUCCESS, cuEventRecord(pending, rawA));
+    cv::triton::resize(gb, ob, db, 0, 0, INTER_NEAREST, b);
+    cv::triton::resize(gc, oc, dc, 0, 0, INTER_LINEAR, b);
+    // A's table and nearest module are now least recent. No resource needs
+    // allocation, upload or unload merely to evict them from the caches.
+    td::setCacheLimits(1, 2);
+    td::reapCompleted();
+    td::RuntimeStats st = td::runtimeStats();
+    EXPECT_FALSE(gate.timedOut()) << "the watchdog released the gate: pending scenario failed";
+    EXPECT_EQ(CUDA_ERROR_NOT_READY, cuEventQuery(pending)) << "A must still be pending";
+    EXPECT_EQ(0, st.module_loads);
+    EXPECT_EQ(0, st.table_uploads);
+    EXPECT_EQ(1, st.table_evictions);
+    EXPECT_EQ(1, st.module_evictions);
+    EXPECT_GE(st.deferred, 2);
+    EXPECT_EQ(0, st.module_frees) << "a module in use was unloaded";
+    EXPECT_EQ(0, st.table_frees) << "an evicted table in use was freed";
+    EXPECT_GE(st.pending, 1);
+
+    gate.release();
+    a.waitForCompletion();
+    b.waitForCompletion();
+    EXPECT_EQ(CUDA_SUCCESS, cuEventQuery(pending));
+    EXPECT_EQ(CUDA_SUCCESS, cuEventDestroy(pending));
+    td::reapCompleted();
     st = td::runtimeStats();
-    EXPECT_GE(st.module_frees, 1) << "the evicted module was not released after its launch completed";
-    EXPECT_GT(st.table_frees, tableFreesWhileBlocked) << "A's tables were not released after its launch completed";
-    EXPECT_EQ(st.table_evictions, st.table_frees);
+    EXPECT_GE(st.module_frees, 1) << "the evicted module was not released after completion";
+    EXPECT_EQ(st.table_evictions, st.table_frees) << "evicted tables were not released after completion";
     EXPECT_EQ(0, st.pending);
     Mat ra, rb, rc;
     oa.download(ra);

@@ -15,6 +15,8 @@
 // CUDA only; a build of this module without it is not offered.
 
 #include "precomp.hpp"
+#include <cuda.h>
+#include <limits>
 #include "runtime/cvtcolor.hpp"
 #include "runtime/warpaffine.hpp"
 #include "runtime/runtime.hpp"
@@ -64,6 +66,53 @@ ImageView toImageView(const cuda::GpuMat& m)
     return v;
 }
 
+// Validate actual CUDA ownership, rather than labelling every pointer with the
+// caller's selected device. Query before OutputArray::create so even a resized
+// foreign destination is rejected without touching its allocation.
+void checkCudaBuffer(const cuda::GpuMat& m, const char* name, bool layout)
+{
+    if (m.empty()) CV_Error(Error::StsBadArg, String(name) + " is empty");
+    CUcontext current = nullptr, owner = nullptr;
+    if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || !current ||
+        cuPointerGetAttribute(&owner, CU_POINTER_ATTRIBUTE_CONTEXT,
+                              reinterpret_cast<CUdeviceptr>(m.cudaPtr())) != CUDA_SUCCESS || owner != current)
+        CV_Error(Error::StsBadArg, String(name) + " must belong to the current CUDA context/device");
+    if (!layout) return;
+    CUdeviceptr base = 0;
+    size_t bytes = 0;
+    if (cuMemGetAddressRange(&base, &bytes, reinterpret_cast<CUdeviceptr>(m.cudaPtr())) != CUDA_SUCCESS)
+        CV_Error(Error::StsBadArg, String(name) + " has no verifiable CUDA allocation range");
+    const auto view = detail::toDeviceView(toImageView(m), cuda::getDevice(),
+                                         static_cast<std::uintptr_t>(base), bytes);
+    const auto checked = kf_resize_rt::validate_view(view, name);
+    if (!checked.ok()) CV_Error(Error::StsBadArg, checked.message);
+}
+
+void checkCudaArguments(const cuda::GpuMat& src, OutputArray dst, cuda::Stream& stream)
+{
+    if (src.empty()) CV_Error(Error::StsBadArg, "src is empty");
+    CUcontext current = nullptr;
+    if (cuCtxGetCurrent(&current) != CUDA_SUCCESS)
+        CV_Error(Error::StsBadArg, "cannot query the current CUDA context");
+    // OpenCV's current-device convention also applies on a new host thread.
+    // Initialize its selected runtime context before checking borrowed buffers;
+    // never switch an already-current driver context to make a foreign pointer fit.
+    if (!current) cuda::setDevice(cuda::getDevice());
+    checkCudaBuffer(src, "src", true);
+    if (dst.kind() == _InputArray::CUDA_GPU_MAT)
+    {
+        const cuda::GpuMat pre = dst.getGpuMat();
+        if (!pre.empty()) checkCudaBuffer(pre, "dst", false);
+    }
+    const CUstream handle = reinterpret_cast<CUstream>(cuda::StreamAccessor::getStream(stream));
+    if (handle)
+    {
+        CUcontext owner = nullptr;
+        if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || cuStreamGetCtx(handle, &owner) != CUDA_SUCCESS || owner != current)
+            CV_Error(Error::StsBadArg, "stream must belong to the current CUDA context/device");
+    }
+}
+
 }  // namespace
 
 void resize(InputArray _src, OutputArray _dst, Size dsize,
@@ -71,6 +120,7 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
 {
     CV_Assert(_src.kind() == _InputArray::CUDA_GPU_MAT);
     cuda::GpuMat src = _src.getGpuMat();
+    checkCudaArguments(src, _dst, stream);
 
     // dsize/fx-fy precedence, matching cv::cuda::resize (cudawarping/src/
     // resize.cpp:74-84) exactly: one of the two forms must be given, and
@@ -145,6 +195,7 @@ void resize(InputArray _src, OutputArray _dst, Size dsize,
     // re-read afterwards rather than captured before.
     _dst.create(dsize, src.type());
     cuda::GpuMat dst = _dst.getGpuMat();
+    checkCudaBuffer(dst, "dst", true);
     CV_Assert(dst.rows == dsize.height && dst.cols == dsize.width);
     CV_Assert(dst.type() == src.type());
 
@@ -171,6 +222,7 @@ void cvtColor(InputArray _src, OutputArray _dst, int code, cuda::Stream& stream)
 {
     CV_Assert(_src.kind() == _InputArray::CUDA_GPU_MAT);
     cuda::GpuMat src = _src.getGpuMat();
+    checkCudaArguments(src, _dst, stream);
 
     // The destination channel count is a property of the CODE, not of src: BGR2BGRA writes 4
     // channels from a 3-channel source, BGR2GRAY writes 1. Deriving it here (rather than
@@ -193,10 +245,25 @@ void cvtColor(InputArray _src, OutputArray _dst, int code, cuda::Stream& stream)
     }
 
     // Same type for src and dst here (CV_8U both ways for every supported code); the channel
-    // count comes from the code, the size from src.
-    _dst.create(src.size(), CV_MAKETYPE(src.depth(), spec->dcn));
+    // count comes from the code. The SIZE does not always come from src: a 4:2:0 decode takes one
+    // CV_8UC1 of (3H/2) x W and produces H x W, exactly as the CPU's CvtHelper does
+    // (`dstSz = Size(sz.width, sz.height * 2 / 3)`, color.simd_helpers.hpp:113-116). Creating dst
+    // at src.size() for those codes makes it 1.5x too tall, and the runtime then rejects the call
+    // -- measured before this fix: every NV12/NV21 call failed with "writes 130x16, dst is 130x24".
+    Size dsize = src.size();
+    if (spec->op == kf_cvtcolor::Op::Yuv420)
+    {
+        if (src.cols % 2 != 0 || src.rows % 3 != 0)
+            CV_Error(Error::StsBadArg,
+                     cv::format("cv::triton::cvtColor: %s needs an even width and a height "
+                                "divisible by 3 for a 4:2:0 source, got %dx%d",
+                                spec->name, src.cols, src.rows));
+        dsize = Size(src.cols, src.rows * 2 / 3);
+    }
+    _dst.create(dsize, CV_MAKETYPE(src.depth(), spec->dcn));
     cuda::GpuMat dst = _dst.getGpuMat();
-    CV_Assert(dst.rows == src.rows && dst.cols == src.cols);
+    checkCudaBuffer(dst, "dst", true);
+    CV_Assert(dst.rows == dsize.height && dst.cols == dsize.width);
     CV_Assert(dst.channels() == spec->dcn);
 
     const int device = cuda::getDevice();
@@ -218,6 +285,7 @@ void warpAffine(InputArray _src, OutputArray _dst, InputArray _M, Size dsize, in
 {
     CV_Assert(_src.kind() == _InputArray::CUDA_GPU_MAT);
     cuda::GpuMat src = _src.getGpuMat();
+    checkCudaArguments(src, _dst, stream);
 
     // INTER_AREA is accepted because cv::warpAffine rewrites it to INTER_LINEAR before doing
     // anything else, and the runtime follows that rewrite (see warpaffine.cpp normalize()).
@@ -226,7 +294,7 @@ void warpAffine(InputArray _src, OutputArray _dst, InputArray _M, Size dsize, in
         interpolation != INTER_CUBIC && interpolation != INTER_AREA)
         CV_Error(Error::StsUnsupportedFormat,
                  cv::format("cv::triton::warpAffine: interpolation %d is not served by this "
-                            "module (warpaffine/0.4.1 covers INTER_NEAREST, INTER_LINEAR, "
+                            "module (warpaffine/0.4.3 covers INTER_NEAREST, INTER_LINEAR, "
                             "INTER_CUBIC and INTER_AREA); INTER_LANCZOS4 is refused, not "
                             "approximated",
                             interpolation));
@@ -235,7 +303,7 @@ void warpAffine(InputArray _src, OutputArray _dst, InputArray _M, Size dsize, in
         if (depth != CV_8U && depth != CV_16U && depth != CV_32F)
             CV_Error(Error::StsUnsupportedFormat,
                      cv::format("cv::triton::warpAffine: depth %d is not served by this "
-                                "module (warpaffine/0.4.1 covers CV_8U, CV_16U and CV_32F)",
+                                "module (warpaffine/0.4.3 covers CV_8U, CV_16U and CV_32F)",
                                 depth));
     }
 
@@ -255,6 +323,7 @@ void warpAffine(InputArray _src, OutputArray _dst, InputArray _M, Size dsize, in
     // unlike cvtColor. dsize empty means "same size as src", as in cv::warpAffine.
     _dst.create(dsize.empty() ? src.size() : dsize, src.type());
     cuda::GpuMat dst = _dst.getGpuMat();
+    checkCudaBuffer(dst, "dst", true);
 
     const int device = cuda::getDevice();
     const std::uintptr_t cuStream = reinterpret_cast<std::uintptr_t>(cuda::StreamAccessor::getStream(stream));

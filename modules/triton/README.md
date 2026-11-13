@@ -25,10 +25,10 @@ has submitted the computation.
 | depth | `CV_8U`, `CV_32F` |
 | channels | 1, 3, 4 |
 | sizing | explicit `dsize`, or `fx`/`fy` when `dsize` is empty |
-| routes | same size (a device copy), `INTER_NEAREST`, `INTER_LINEAR`, `INTER_AREA` at integer ratios or with an upscaled axis |
+| routes | same size (a device copy), `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC`, `INTER_AREA` (integer and fractional ratios) |
 
 A same-size copy does not perform interpolation, including when `INTER_CUBIC`
-is requested; `INTER_CUBIC` and fractional `INTER_AREA` are otherwise refused.
+is requested. Nonidentity CUBIC and fractional AREA execute their generic CPU-aligned kernels.
 
 What it computes is OpenCV **CPU** `cv::resize` of a pinned reference
 configuration, so uint8 output matches it bit-exactly. It is not a drop-in
@@ -36,56 +36,62 @@ replacement for `cv::cuda::resize`, which computes a different result.
 
 ### `cv::triton::cvtColor`
 
-`CV_8U` only, and only the conversions OpenCV computes with **integer**
-arithmetic — that is the set for which "bit-exact with the CPU" is a
-well-defined promise:
+The native module serves **84 distinct numeric conversion codes** (enum aliases
+share a code). It is wider than the KernelForge Python experiment adapter, which
+serves four uint8 codes on contiguous tensors. Native support is:
 
-| group | codes |
-|---|---|
-| channel permutes | `BGR2BGRA`, `BGRA2BGR`, `BGR2RGBA`, `RGBA2BGR`, `BGR2RGB`, `BGRA2RGBA` |
-| to gray | `BGR2GRAY`, `RGB2GRAY`, `BGRA2GRAY`, `RGBA2GRAY` |
-| YCrCb | `BGR2YCrCb`, `RGB2YCrCb`, `YCrCb2BGR`, `YCrCb2RGB` |
-| YUV | `BGR2YUV`, `RGB2YUV`, `YUV2BGR`, `YUV2RGB` |
-| HSV | `BGR2HSV`, `RGB2HSV`, `BGR2HSV_FULL`, `RGB2HSV_FULL` |
+| group | source → destination channels | depths |
+|---|---|---|
+| six channel permutes (`BGR2BGRA`, `BGRA2BGR`, `BGR2RGBA`, `RGBA2BGR`, `BGR2RGB`, `BGRA2RGBA`) | 3/4 → 3/4 | 8U, 32F |
+| colour to gray (`BGR`, `RGB`, `BGRA`, `RGBA`) | 3/4 → 1 | 8U, 16U, 32F |
+| gray to colour (`GRAY2BGR`, `GRAY2BGRA`) | 1 → 3/4 | 8U, 16U, 32F |
+| YCrCb and YUV, both BGR/RGB directions | 3 → 3 | 8U, 16U, 32F |
+| forward HSV and HSV_FULL, BGR/RGB | 3 → 3 | 8U |
+| packed BGR565/BGR555, colour/gray encode and decode | 1/3/4 ↔ 2 | 8U |
+| Bayer bilinear: BG/GB/RG/GR to BGR, BG to BGRA/GRAY | 1 → 1/3/4 | 8U, 16U |
+| XYZ (four), Lab (eight), Luv (six; no forward linear Luv) | 3 → 3 | 8U |
+| UYVY/YUY2/YVYU decode to BGR/RGB (six) | 2 → 3 | 8U; even width |
+| `YUV2GRAY_UYVY`, `YUV2GRAY_YUY2` channel extraction | 2 → 1 | 8U; odd width allowed |
+| NV12/NV21 decode to BGR/RGB/BGRA/RGBA (eight) | 1 → 3/4 | 8U; packed source `(3H/2) × W`, even W, source rows divisible by 3 |
 
-`HSV2BGR` and every HLS code are **refused on purpose**. OpenCV computes them
-in float32, and in the build that was characterised the SIMD body and the scalar
-tail round differently, so the result for a pixel depends on which of the two
-processes it and therefore on where it sits in the row. The CPU result is
-well-defined for a given build and a given pixel; what is missing is a value
-that is stable across positions and builds to hold a GPU kernel to. Refusing
-these codes by name is honest; serving them under a tolerance would not be.
-Also refused: `CV_32F`, `CV_16U`, 2-channel images, and codes that change the
-image size.
+The code fixes the channel count; there is no `dstCn` override. Packed 565/555
+uses **CV_8UC2**, two bytes per pixel, rather than CV_16UC1. There are 20 numeric
+codes at 16U and 20 at 32F. Except for NV12/NV21 decode, output size equals input.
+ROI and row pitch are supported for interleaved GpuMat pixels. An existing output
+is reused when its size/type match; otherwise OpenCV OutputArray creates a fitting
+buffer. Source/output overlap is refused. Work is asynchronous on the supplied
+stream; callers order producers/consumers and retain image allocations until it
+completes. Internal compiled modules and tables have their own in-flight lifetime.
 
-The reference here is the module's own `cv::cvtColor`. "Integer" is not what
-makes that a promise — a different integer implementation is still different
-numbers. What the integer arithmetic buys is that each output pixel depends only
-on its own input bytes and on constant tables: no reduction order, no SIMD
-width, and so the CPU result does not depend on where a pixel sits in the row.
-That property was measured by a directed probe (64 colours at two widths), and
-equality to the reference over all 256^3 colour triples for the 3-channel codes
-— 452M pixels total; the 4-channel codes sample alpha rather than enumerate all
-256^4. The probe is evidence for this build, not a proof for every build.
+8U/16U conversions and 32F channel copies compare exactly with this build's own
+CPU `cv::cvtColor`. Finite 32F arithmetic (colour to gray, YCrCb and YUV) uses:
 
-This is a statement about the build that was verified, not about "the CPU" in
-general: `cv::cvtColor` dispatches through `cv_hal_cvtBGRtoBGR`, `cvtBGRtoYUV`
-and `cvtBGRtoHSV`, so an IPP or custom-HAL build — or a later OpenCV with
-different coefficients — is a different reference and needs its own
-verification. The accuracy suite records `Intel IPP`, `Custom HAL` and the
-run-time IPP state by value, and fails on a build that differs from the one the
-evidence came from.
+```
+|got - ref| <= 8 * 2^-24 * max(1, |ref|, max(abs(input channels at this pixel)))
+```
 
-**The numeric tests compare against this build's own `cv::cvtColor`, not a
-portable oracle** (`test/test_helpers.hpp::cpuCvt`). Only resize has a portable
-oracle compiled into the test binary; cvtColor does not, because every code it
-serves is integer arithmetic and the reference was verified exhaustively against
-one recorded build (`runs/cvtcolor-module-0001`). An earlier version of this
-paragraph claimed a portable oracle for cvtColor and was wrong.
+The scale is per pixel, not the maximum of the whole image. Added alpha is 255,
+65535 or 1.0 at 8U, 16U or 32F. Float arithmetic is not a bit-exact promise:
+CPU SIMD bodies, scalar tails and FMA configurations can evaluate different
+expressions. Numerical comparisons use the actual host build; they do not certify
+an arbitrary IPP/custom-HAL build or substitute a portable independent oracle.
+Historical CPU characterization is separate from GPU execution evidence, and an
+older installed module does not gain new support because its source tree changed.
+
+Unsupported codes/depths raise without CPU or `cv::cuda` fallback. This includes
+reverse HSV, HLS, forward linear Luv, Bayer VNG/edge-aware, YUV encoding and other
+size-changing codes. Odd-width 4:2:2 conversions and malformed 4:2:0 buffers are
+rejected before launch. The two YUV gray extraction codes remain legal at odd widths.
+
+The F32 arithmetic bound is relative to each output pixel's reference/input
+scale; it is not a universal `1e-4` absolute bound at large magnitudes. A
+consumer requiring that separate absolute cap must not infer it from a pass
+under this scaled criterion. Integer conversions and float bit-copy families
+retain their exact comparisons.
 
 ### `cv::triton::warpAffine`
 
-`CV_8U`, `CV_16U` and `CV_32F`; 1/3/4 channels; `INTER_NEAREST`, `INTER_LINEAR`
+Contract `warpaffine/0.4.3`: `CV_8U`, `CV_16U` and `CV_32F`; 1/3/4 channels; `INTER_NEAREST`, `INTER_LINEAR`
 and `INTER_CUBIC`; `INTER_AREA` aliases `INTER_LINEAR`. The five standard border
 modes and `BORDER_TRANSPARENT` for NEAREST/LINEAR/AREA are supported, with
 `WARP_INVERSE_MAP` both ways.
@@ -111,7 +117,13 @@ taps are a separate contract, and approximating them behind an unmeasured
 tolerance is not acceptable. Also refused: `CV_64F`, channels outside 1/3/4, and
 overlapping input/output.
 
-For `INTER_NEAREST` and `INTER_LINEAR`, what it computes is OpenCV's CPU
+The module identifies fused versus separate multiply/add through fixed probes
+of the linked CPU implementation, separately for depth, channels and
+`cv::useOptimized()` state. It does not use hardware FMA support as a proxy for
+the compiled dispatch path. This bounded first-use calibration does not
+compute the user's output on the CPU.
+
+For `INTER_NEAREST` and `INTER_LINEAR` (including the `INTER_AREA` alias), what it computes is OpenCV's CPU
 `cv::warpAffine` on its **vector path**, and this needs stating because that
 build is not self-consistent: its SIMD body evaluates a column's coordinate as
 `v_fma(M0, x, (float)(y*M1 + M2))` and its scalar tail as `x*M0 + y*M1 + M2`,

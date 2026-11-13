@@ -44,19 +44,9 @@ inline Mat randomImage(Size sz, int type, uint64 seed)
     return m;
 }
 
-/** cvtColor's reference: this build's own cv::cvtColor -- and that is stated as such.
- *
- * For resize the host build is NOT a valid reference (the CPU result depends on the build),
- * which is why a portable oracle exists there. For cvtColor the host build IS the reference,
- * but not because the arithmetic is integer: an integer formula computed differently is still
- * a different formula. It is the reference because each served code is integer, so an output
- * pixel depends only on its own bytes and constant tables -- no reduction order, no SIMD width,
- * no position within the row -- and because that equality was measured on the build recorded in
- * ReferenceBuildIsCharacterised. It is NOT established that some other build computes the same
- * numbers: cv::cvtColor dispatches through cv_hal_cvtBGRtoBGR / cvtBGRtoYUV / cvtBGRtoHSV, so a
- * build with IPP or a custom HAL may differ, and the claim is scoped to the configuration the
- * evidence was gathered on. The codes that are not position independent at all (HSV2BGR, HLS --
- * float32) are refused by the module and never reach here.
+/** cvtColor uses this build's actual cv::cvtColor. Integer and bit-copy paths are exact;
+ * float arithmetic uses the contract's per-pixel input-channel-scale bound. This is not the
+ * portable resize oracle and is not a promise about a different IPP/HAL/dispatch build.
  */
 inline Mat cpuCvt(const Mat& src, int code)
 {
@@ -65,7 +55,10 @@ inline Mat cpuCvt(const Mat& src, int code)
     return dst;
 }
 
-/** The contract's answer: the portable CPU oracle, independent of this build's cv::resize. */
+/** Resize's answer: its portable CPU oracle, independent of this build's cv::resize.
+ * warpAffine does not use this helper: test_warpaffine.cpp selects this build's padded
+ * CPU vector path for NN/LINEAR/AREA and natural-width CPU call for CUBIC.
+ */
 inline Mat oracle(const Mat& src, Size dsize, double fx, double fy, int interp)
 {
     CV_Assert(src.depth() == CV_8U || src.depth() == CV_32F);
@@ -79,7 +72,8 @@ inline Mat oracle(const Mat& src, Size dsize, double fx, double fy, int interp)
 
 inline double f32Atol(int interp)   // contract cpu_aligned: 2E, derived from CPU's own rounding
 {
-    return interp == INTER_NEAREST ? 0.0 : (interp == INTER_LINEAR ? 4.948e-07 : 8.419e-07);
+    return interp == INTER_NEAREST ? 0.0 : (interp == INTER_LINEAR ? 4.948e-07 :
+           (interp == INTER_CUBIC ? 1.401e-06 : 8.419e-07));
 }
 
 /** Under the contract: CV_8U exact; CV_32F within the derived bound, NaN matched by NaN. */
