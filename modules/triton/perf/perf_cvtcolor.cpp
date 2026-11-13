@@ -5,9 +5,10 @@
 // Steady-state timing of cv::triton::cvtColor through the runtime JIT, with the native CUDA
 // path as a same-card timing baseline.
 //
-// The selected CV_8U conversions use CPU-aligned semantics. The optional cv::cuda baseline
-// is identified separately; its presence does not establish equality for every conversion.
-// Measurements below include public submission and stream completion, not pure device time.
+// Selected and extended rows cover only their named conversions and depths.
+// The optional cv::cuda baseline is identified separately; its presence does not
+// establish numerical equivalence. Measurements include public submission and
+// stream completion, not pure device time.
 //
 // Compile and first-load costs are excluded by warming up before the measured cycle, and the
 // destination is preallocated so allocation is not in the timed region.
@@ -18,6 +19,8 @@
 // floor being hit rather than to rank the implementations.
 
 #include "perf_precomp.hpp"
+#include "../validation/cvtcolor_cases.hpp"
+#include "../validation/reference.hpp"
 
 namespace opencv_test { namespace {
 
@@ -36,17 +39,6 @@ const int kCodes[] = {
     cv::COLOR_BGRA2BGR,
 };
 
-static int scnOf(int code)
-{
-    return code == cv::COLOR_BGRA2BGR || code == cv::COLOR_BGRA2GRAY ? 4 : 3;
-}
-
-static int dcnOf(int code)
-{
-    return code == cv::COLOR_BGR2BGRA ? 4 : code == cv::COLOR_BGR2GRAY ||
-                   code == cv::COLOR_BGRA2GRAY ? 1 : 3;
-}
-
 PERF_TEST_P(Sz_Code, TritonCvtColor, testing::Combine(
     testing::Values(cv::Size(640, 480), cv::Size(1920, 1080), cv::Size(3840, 2160)),
     testing::ValuesIn(kCodes)))
@@ -57,12 +49,14 @@ PERF_TEST_P(Sz_Code, TritonCvtColor, testing::Combine(
     if (!triton_validation::available())
         throw SkipTestException("no Triton backend available");
 
-    cv::Mat host(size, CV_8UC(scnOf(code)));
+    const auto* row = triton_test::cvt_cases::find(code, CV_8U);
+    CV_Assert(row != nullptr);
+    cv::Mat host(size, CV_8UC(row->scn));
     declare.in(host, WARMUP_RNG);
 
     triton_validation::Image src; src.upload(host);
     triton_validation::Stream stream(true);
-    triton_validation::Image dst(size, CV_8UC(dcnOf(code)));   // preallocated: reusable, excluded
+    triton_validation::Image dst(size, CV_8UC(row->dcn));   // preallocated: reusable, excluded
 
     for (int i = 0; i < 20; ++i)
         triton_validation::cvtColor(src, dst, code, stream);
@@ -75,6 +69,62 @@ PERF_TEST_P(Sz_Code, TritonCvtColor, testing::Combine(
     }
 
     const cv::Mat result = dst.download();
+    ASSERT_TRUE(triton_test::meetsCvtContract(result, triton_test::cpuCvt(host, row->code), host,
+                                             triton_test::cvt_cases::floatArithmetic(row->code)));
+    SANITY_CHECK(result, 1e-10);
+}
+
+// Representative depth/layout families; the accuracy tests enumerate all
+// 124 admitted code/depth pairs. Keep extended rows separate from the optional
+// native CUDA reference, whose supported conversions and semantics differ.
+struct ExtendedCvt { int code, depth; };
+static const ExtendedCvt kExtended[] = {
+    {cv::COLOR_BGR2GRAY, CV_32F},
+    {cv::COLOR_BGR2YUV, CV_32F},
+    {cv::COLOR_BGR2BGRA, CV_32F},
+    {cv::COLOR_BGR2GRAY, CV_16U},
+    {cv::COLOR_BGR2YCrCb, CV_16U},
+    {cv::COLOR_GRAY2BGRA, CV_16U},
+    {cv::COLOR_BayerBG2BGR, CV_16U},
+    {cv::COLOR_BGR5652BGRA, CV_8U},
+    {cv::COLOR_BayerBG2GRAY, CV_8U},
+    {cv::COLOR_BGR2XYZ, CV_8U},
+    {cv::COLOR_BGR2Lab, CV_8U},
+    {cv::COLOR_BGR2Luv, CV_8U},
+    {cv::COLOR_Luv2BGR, CV_8U},
+    {cv::COLOR_YUV2BGR_UYVY, CV_8U},
+    {cv::COLOR_YUV2BGR_NV12, CV_8U},
+    {cv::COLOR_YUV2BGRA_NV21, CV_8U}
+};
+
+typedef ::perf::TestBaseWithParam<testing::tuple<cv::Size, int>> Sz_ExtendedCvt;
+PERF_TEST_P(Sz_ExtendedCvt, TritonCvtColorExtended, testing::Combine(
+    testing::Values(cv::Size(1920,1080),cv::Size(3840,2160)),
+    testing::Range(0,static_cast<int>(sizeof(kExtended)/sizeof(kExtended[0])))))
+{
+    if (!triton_validation::available())
+        throw SkipTestException("no Triton backend available");
+    const cv::Size size = GET_PARAM(0);
+    const ExtendedCvt& selected = kExtended[GET_PARAM(1)];
+    const auto* row = triton_test::cvt_cases::find(selected.code, selected.depth);
+    CV_Assert(row != nullptr);
+    cv::Mat host(row->yuv420 ? size.height / 2 * 3 : size.height, size.width,
+                 CV_MAKETYPE(row->depth, row->scn));
+    declare.in(host, WARMUP_RNG);
+    triton_validation::Image src; src.upload(host);
+    triton_validation::Image dst(size, CV_MAKETYPE(row->depth, row->dcn));
+    triton_validation::Stream stream(true);
+    for (int i = 0; i < 20; ++i)
+        triton_validation::cvtColor(src, dst, row->code, stream);
+    stream.wait();
+    TEST_CYCLE()
+    {
+        triton_validation::cvtColor(src, dst, row->code, stream);
+        stream.wait();
+    }
+    const cv::Mat result = dst.download();
+    ASSERT_TRUE(triton_test::meetsCvtContract(result, triton_test::cpuCvt(host, row->code), host,
+                                             triton_test::cvt_cases::floatArithmetic(row->code)));
     SANITY_CHECK(result, 1e-10);
 }
 

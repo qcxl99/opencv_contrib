@@ -160,7 +160,7 @@ DEFAULT_CONFIG = {"BLOCK": 256, "num_warps": 4}
 
 
 @triton.jit
-def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs,
+def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows,
                          t32, t16, t64,
                          SCN: tl.constexpr, DCN: tl.constexpr,
                          OP: tl.constexpr, BLUE: tl.constexpr,
@@ -606,10 +606,10 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs,
         # narrowing and the alpha constant.
         srs = src_rs
         drs = dst_rs
-        # Row count. cols arrives as a runtime argument; the row count does not, so it is taken
-        # from the grid, which grid() sets to (rows, ceil(cols/BLOCK), 1). It is uniform across
-        # every program, so treating it as a scalar here costs nothing.
-        H = tl.num_programs(0)
+        # Explicit runtime height keeps the module ABI identical on CUDA and HIP.
+        # On HIP tl.num_programs introduces hidden block-count parameters, which
+        # the module intentionally refuses rather than guessing their values.
+        H = rows
         W = cols
 
         # Every interior write is above row 0 and left of column 0, so r and c are clamped into

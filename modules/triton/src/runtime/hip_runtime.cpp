@@ -1150,6 +1150,7 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
     // this division only appeared when Bayer made 16U reachable. normalize() has already
     // checked that step is a multiple of the element size, so the division is exact.
     i32("cols", n.cols);
+    i32("rows", n.rows);
     i32("src_rs", static_cast<long long>(req.src.step / kf_resize_rt::elem_size(req.src.type)));
     i32("dst_rs", static_cast<long long>(req.dst.step / kf_resize_rt::elem_size(req.dst.type)));
     // Where the chroma plane starts, in elements from `src`: the Y plane is `n.rows` tall. For a

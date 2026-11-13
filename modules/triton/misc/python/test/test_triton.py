@@ -39,6 +39,8 @@ class _TritonBase(NewOpenCVTests):
         super(_TritonBase, self).setUp()
         if not cv.cuda.getCudaEnabledDeviceCount():
             self.skipTest("No CUDA-capable device is detected")
+        if cv.triton.backendName() == "hip-jit":
+            self.skipTest("CUDA GpuMat numerical tests do not run on the HIP device-buffer backend")
         if not cv.triton.haveBackend():
             self.skipTest("No Triton backend available")
 
@@ -55,6 +57,7 @@ class triton_hip_binding_test(NewOpenCVTests):
         gpu = cv.cuda_GpuMat()
         matrix = np.array([[1., 0., 0.], [0., 1., 0.]], np.float64)
         for fn, args in ((cv.triton.resize, (gpu, (32, 24))),
+                         (cv.triton.cvtColor, (gpu, cv.COLOR_BGR2GRAY)),
                          (cv.triton.warpAffine, (gpu, matrix, (32, 24)))):
             for kwargs in ({}, {"stream": None}):
                 with self.assertRaises(cv.error) as raised:
@@ -129,35 +132,59 @@ class triton_numeric_test(_TritonBase):
 # cvtColor compares with this build's own CPU entry, not the resize portable
 # oracle. Integer conversions and float copies compare exactly; finite float
 # arithmetic uses the documented per-pixel input-channel scale bound.
-_CVT_CODES = [
-    (cv.COLOR_BGR2BGRA, 3, 4), (cv.COLOR_BGRA2BGR, 4, 3),
-    (cv.COLOR_BGR2RGBA, 3, 4), (cv.COLOR_RGBA2BGR, 4, 3),
-    (cv.COLOR_BGR2RGB, 3, 3), (cv.COLOR_BGRA2RGBA, 4, 4),
-    (cv.COLOR_BGR2GRAY, 3, 1), (cv.COLOR_RGB2GRAY, 3, 1),
-    (cv.COLOR_BGRA2GRAY, 4, 1), (cv.COLOR_RGBA2GRAY, 4, 1),
-    (cv.COLOR_BGR2YCrCb, 3, 3), (cv.COLOR_RGB2YCrCb, 3, 3),
-    (cv.COLOR_YCrCb2BGR, 3, 3), (cv.COLOR_YCrCb2RGB, 3, 3),
-    (cv.COLOR_BGR2HSV, 3, 3), (cv.COLOR_RGB2HSV, 3, 3),
-    (cv.COLOR_BGR2HSV_FULL, 3, 3), (cv.COLOR_RGB2HSV_FULL, 3, 3),
-    (cv.COLOR_BGR2YUV, 3, 3), (cv.COLOR_RGB2YUV, 3, 3),
-    (cv.COLOR_YUV2BGR, 3, 3), (cv.COLOR_YUV2RGB, 3, 3),
-]
+def _cvt_codes(names, scn, dcn):
+    """Group related conversion names without duplicating their channel metadata."""
+    return [(getattr(cv, "COLOR_" + name), scn, dcn) for name in names.split()]
 
 
-_CVT_F32_COPY = [
-    (cv.COLOR_BGR2BGRA, 3, 4), (cv.COLOR_BGRA2BGR, 4, 3),
-    (cv.COLOR_BGR2RGBA, 3, 4), (cv.COLOR_RGBA2BGR, 4, 3),
-    (cv.COLOR_BGR2RGB, 3, 3), (cv.COLOR_BGRA2RGBA, 4, 4),
-    (cv.COLOR_GRAY2BGR, 1, 3), (cv.COLOR_GRAY2BGRA, 1, 4),
-]
-_CVT_F32_ARITHMETIC = [
-    (cv.COLOR_BGR2GRAY, 3, 1), (cv.COLOR_RGB2GRAY, 3, 1),
-    (cv.COLOR_BGRA2GRAY, 4, 1), (cv.COLOR_RGBA2GRAY, 4, 1),
-    (cv.COLOR_BGR2YCrCb, 3, 3), (cv.COLOR_RGB2YCrCb, 3, 3),
-    (cv.COLOR_YCrCb2BGR, 3, 3), (cv.COLOR_YCrCb2RGB, 3, 3),
-    (cv.COLOR_BGR2YUV, 3, 3), (cv.COLOR_RGB2YUV, 3, 3),
-    (cv.COLOR_YUV2BGR, 3, 3), (cv.COLOR_YUV2RGB, 3, 3),
-]
+_CVT_F32_COPY = (
+    _cvt_codes("BGR2BGRA BGR2RGBA", 3, 4) +
+    _cvt_codes("BGRA2BGR RGBA2BGR", 4, 3) +
+    _cvt_codes("BGR2RGB", 3, 3) + _cvt_codes("BGRA2RGBA", 4, 4) +
+    _cvt_codes("GRAY2BGR", 1, 3) + _cvt_codes("GRAY2BGRA", 1, 4))
+_CVT_F32_ARITHMETIC = (
+    _cvt_codes("BGR2GRAY RGB2GRAY", 3, 1) +
+    _cvt_codes("BGRA2GRAY RGBA2GRAY", 4, 1) +
+    _cvt_codes("BGR2YCrCb RGB2YCrCb YCrCb2BGR YCrCb2RGB "
+               "BGR2YUV RGB2YUV YUV2BGR YUV2RGB", 3, 3))
+_CVT_BAYER = (_cvt_codes("BayerBG2BGR BayerGB2BGR BayerRG2BGR BayerGR2BGR", 1, 3) +
+              _cvt_codes("BayerBG2BGRA", 1, 4) + _cvt_codes("BayerBG2GRAY", 1, 1))
+_CVT_422_COLOR = _cvt_codes("YUV2BGR_UYVY YUV2RGB_UYVY YUV2BGR_YUY2 "
+                             "YUV2RGB_YUY2 YUV2BGR_YVYU YUV2RGB_YVYU", 2, 3)
+_CVT_422_GRAY = _cvt_codes("YUV2GRAY_UYVY YUV2GRAY_YUY2", 2, 1)
+_CVT_420 = sum((_cvt_codes("YUV2BGR_" + layout + " YUV2RGB_" + layout, 1, 3) +
+                 _cvt_codes("YUV2BGRA_" + layout + " YUV2RGBA_" + layout, 1, 4)
+                 for layout in ("NV12", "NV21")), [])
+_CVT_PACKED = []
+for _packed in ("BGR565", "BGR555"):
+    for _color, _cn in (("BGR", 3), ("RGB", 3), ("BGRA", 4), ("RGBA", 4), ("GRAY", 1)):
+        _CVT_PACKED += _cvt_codes(_color + "2" + _packed, _cn, 2)
+        _CVT_PACKED += _cvt_codes(_packed + "2" + _color, 2, _cn)
+_CVT_CIE = _cvt_codes("BGR2XYZ RGB2XYZ XYZ2BGR XYZ2RGB "
+                       "BGR2Lab RGB2Lab Lab2BGR Lab2RGB "
+                       "BGR2Luv RGB2Luv Luv2BGR Luv2RGB "
+                       "LBGR2Lab LRGB2Lab Lab2LBGR Lab2LRGB Luv2LBGR Luv2LRGB", 3, 3)
+_CVT_CODES = (_CVT_F32_COPY + _CVT_F32_ARITHMETIC +
+              _cvt_codes("BGR2HSV RGB2HSV BGR2HSV_FULL RGB2HSV_FULL", 3, 3) +
+              _CVT_422_COLOR + _CVT_422_GRAY + _CVT_420 +
+              _CVT_PACKED + _CVT_BAYER + _CVT_CIE)
+# 16U supports Bayer, gray expansion, and the gray/YCrCb/YUV integer families;
+# the six 3/4-channel bit-copy codes remain outside its current contract.
+_CVT_U16_CODES = _CVT_BAYER + _CVT_F32_COPY[-2:] + _CVT_F32_ARITHMETIC
+
+
+def _cvt_input(rng, dtype, h, w, scn):
+    shape = (h, w) if scn == 1 else (h, w, scn)
+    return rng.randint(0, 256 if dtype == np.uint8 else 65536, shape).astype(dtype)
+
+
+def _cvt_sizes(code):
+    if code in {case[0] for case in _CVT_420}:
+        # Logical output H/W: source is 3H/2 by W.
+        return ((2, 2), (6, 14), (62, 98))
+    if code in {case[0] for case in _CVT_422_COLOR}:
+        return ((1, 2), (7, 14), (61, 98))
+    return ((1, 1), (7, 13), (61, 97))
 
 
 def _cvt_f32_allow(src, ref):
@@ -167,22 +194,84 @@ def _cvt_f32_allow(src, ref):
     return (8.0 * 2.0 ** -24) * np.maximum(np.maximum(1.0, np.abs(ref.astype(np.float64))), scale)
 
 
+
+class triton_reference_fixture_test(NewOpenCVTests):
+    """CPU-only checks for the shape/depth fixtures used by the CUDA tests."""
+
+    def test_cvtcolor_fixture_coverage_and_shapes(self):
+        rng = np.random.RandomState(29)
+        for cases, dtype, expected in ((_CVT_CODES, np.uint8, 84),
+                                        (_CVT_U16_CODES, np.uint16, 20),
+                                        (_CVT_F32_COPY + _CVT_F32_ARITHMETIC, np.float32, 20)):
+            self.assertEqual(expected, len(cases))
+            self.assertEqual(expected, len({code for code, _, _ in cases}))
+            for code, scn, dcn in cases:
+                for h, w in _cvt_sizes(code):
+                    source_h = h * 3 // 2 if code in {c[0] for c in _CVT_420} else h
+                    if dtype == np.float32:
+                        shape = (h, w) if scn == 1 else (h, w, scn)
+                        img = rng.uniform(-2, 2, shape).astype(dtype)
+                    else:
+                        img = _cvt_input(rng, dtype, source_h, w, scn)
+                    ref = cv.cvtColor(img, code)
+                    self.assertEqual((h, w, dcn) if dcn > 1 else (h, w), ref.shape)
+                    self.assertEqual(dtype, ref.dtype)
+
+    def test_cpu_bayer_single_pixel_axes(self):
+        for dtype in (np.uint8, np.uint16):
+            for code, scn, dcn in _CVT_BAYER:
+                for h, w in ((1, 1), (1, 7), (7, 1)):
+                    ref = cv.cvtColor(np.zeros((h, w), dtype), code)
+                    self.assertEqual((h, w, dcn) if dcn > 1 else (h, w), ref.shape)
+                    self.assertEqual(dtype, ref.dtype)
+
+    def test_cpu_transparent_reference_preserves_background(self):
+        matrix = np.array([[1., 0., 100.], [0., 1., 100.]], np.float64)
+        for dtype in (np.uint8, np.uint16, np.float32):
+            for cn in (1, 3, 4):
+                shape = (7, 9) if cn == 1 else (7, 9, cn)
+                img, initial = np.zeros(shape, dtype), np.full(shape, 17, dtype)
+                for direction in (0, cv.WARP_INVERSE_MAP):
+                    for interpolation in (cv.INTER_NEAREST, cv.INTER_LINEAR, cv.INTER_AREA):
+                        ref = _wa_cpu_reference(img, matrix, (9, 7), interpolation | direction,
+                                                cv.BORDER_TRANSPARENT, initial=initial)
+                        np.testing.assert_array_equal(ref, initial)
+
+
+
 class triton_cvtcolor_test(_TritonBase):
     """The cvtColor binding, against this build's own integer CPU path."""
 
-    def test_matches_cpu_exactly(self):
+    def _check_integer_matrix(self, cases, dtype):
         rng = np.random.RandomState(3)
-        for code, scn, dcn in _CVT_CODES:
-            for h, w in ((1, 1), (7, 13), (61, 97), (480, 640)):
-                img = rng.randint(0, 256, (h, w, scn)).astype(np.uint8)
-                got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
-                ref = cv.cvtColor(img, code)
-                # Integer arithmetic on both sides: exact, not "within a tolerance".
-                self.assertEqual((h, w, dcn) if dcn > 1 else (h, w), got.shape)
-                self.assertEqual(got.dtype, np.uint8)
-                self.assertEqual(int(np.abs(got.astype(np.int16) -
-                                            ref.astype(np.int16)).max()), 0,
-                                 msg="code " + str(code))
+        for code, scn, dcn in cases:
+            for h, w in _cvt_sizes(code):
+                with self.subTest(code=code, dtype=dtype, size=(h, w)):
+                    source_h = h * 3 // 2 if code in {c[0] for c in _CVT_420} else h
+                    img = _cvt_input(rng, dtype, source_h, w, scn)
+                    got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
+                    ref = cv.cvtColor(img, code)
+                    self.assertEqual((h, w, dcn) if dcn > 1 else (h, w), got.shape)
+                    self.assertEqual(got.dtype, dtype)
+                    np.testing.assert_array_equal(got, ref, err_msg="code " + str(code))
+
+    def test_all_uint8_codes_exactly(self):
+        self.assertEqual(84, len({code for code, _, _ in _CVT_CODES}))
+        self._check_integer_matrix(_CVT_CODES, np.uint8)
+
+    def test_all_uint16_codes_exactly(self):
+        self.assertEqual(20, len({code for code, _, _ in _CVT_U16_CODES}))
+        self._check_integer_matrix(_CVT_U16_CODES, np.uint16)
+
+    def test_bayer_single_pixel_axes(self):
+        rng = np.random.RandomState(31)
+        for dtype in (np.uint8, np.uint16):
+            for code, scn, dcn in _CVT_BAYER:
+                for h, w in ((1, 1), (1, 7), (7, 1)):
+                    img = _cvt_input(rng, dtype, h, w, scn)
+                    got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
+                    np.testing.assert_array_equal(got, cv.cvtColor(img, code))
+                    self.assertEqual((h, w, dcn) if dcn > 1 else (h, w), got.shape)
 
     def test_float_bound_does_not_borrow_another_pixels_scale(self):
         src = np.array([[[1.0, 1.0, 1.0], [65535.0, 65535.0, 65535.0]]], np.float32)
@@ -223,12 +312,14 @@ class triton_cvtcolor_test(_TritonBase):
                      cv.COLOR_YUV2BGR_YVYU, cv.COLOR_YUV2RGB_YVYU):
             with self.assertRaises(cv.error):
                 cv.triton.cvtColor(cv.cuda_GpuMat(np.zeros((1, 3, 2), np.uint8)), code)
-        for shape in ((24, 31), (23, 32)):
-            with self.assertRaises(cv.error):
-                cv.triton.cvtColor(cv.cuda_GpuMat(np.zeros(shape, np.uint8)), cv.COLOR_YUV2BGR_NV12)
+        for code, _, _ in _CVT_420:
+            for shape in ((24, 31), (23, 32)):
+                with self.assertRaises(cv.error):
+                    cv.triton.cvtColor(cv.cuda_GpuMat(np.zeros(shape, np.uint8)), code)
         img = np.arange(6, dtype=np.uint8).reshape(1, 3, 2)
-        got = cv.triton.cvtColor(cv.cuda_GpuMat(img), cv.COLOR_YUV2GRAY_UYVY).download()
-        np.testing.assert_array_equal(got, cv.cvtColor(img, cv.COLOR_YUV2GRAY_UYVY))
+        for code, _, _ in _CVT_422_GRAY:
+            got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
+            np.testing.assert_array_equal(got, cv.cvtColor(img, code))
 
     def test_rejected_codes_raise(self):
         img = np.zeros((32, 32, 3), np.uint8)
@@ -298,6 +389,20 @@ def _wa_within(got, ref):
     return int((~(d <= allowed)).sum()), float(np.max(d / allowed, initial=0.0))
 
 
+
+def _wa_cpu_reference(img, matrix, dsize, flags, border, border_value=0, initial=None):
+    """Selected CPU path, preserving the same initialized destination region."""
+    interp = flags & cv.INTER_MAX
+    width = dsize[0] if interp == cv.INTER_CUBIC else ((dsize[0] + 255) // 128) * 128
+    shape = (dsize[1], width) + img.shape[2:]
+    wide = np.zeros(shape, img.dtype)
+    if initial is not None:
+        wide[:, :dsize[0]] = initial
+    cv.warpAffine(img, matrix, (width, dsize[1]), dst=wide, flags=flags,
+                  borderMode=border, borderValue=border_value)
+    return wide[:, :dsize[0]].copy()
+
+
 class triton_warpaffine_binding_test(_TritonBase):
     """The binding works -- shape, dtype, channels, matrix types, output reuse, refusals."""
 
@@ -362,6 +467,37 @@ class triton_warpaffine_binding_test(_TritonBase):
         self.assertEqual(int(np.abs(first.astype(np.int16) -
                                     dst.download().astype(np.int16)).max()), 0)
 
+    def test_area_alias_all_depths_channels_and_directions(self):
+        rng = np.random.RandomState(23)
+        matrix = np.array(_WA_GEOMS[2][1], np.float64)
+        for dtype in (np.uint8, np.uint16, np.float32):
+            for cn in (1, 3, 4):
+                shape = (19, 27) if cn == 1 else (19, 27, cn)
+                img = (rng.uniform(-2, 2, shape).astype(dtype) if dtype == np.float32
+                       else _cvt_input(rng, dtype, 19, 27, cn))
+                gpu = cv.cuda_GpuMat(img)
+                for direction in (0, cv.WARP_INVERSE_MAP):
+                    area = cv.triton.warpAffine(gpu, matrix, (27, 19),
+                                               flags=cv.INTER_AREA | direction,
+                                               borderMode=cv.BORDER_REFLECT_101).download()
+                    linear = cv.triton.warpAffine(gpu, matrix, (27, 19),
+                                                 flags=cv.INTER_LINEAR | direction,
+                                                 borderMode=cv.BORDER_REFLECT_101).download()
+                    np.testing.assert_array_equal(area, linear)
+
+    def test_cubic_transparent_is_refused_without_changing_destination(self):
+        matrix = np.eye(3, dtype=np.float64)[:2]
+        for dtype in (np.uint8, np.uint16, np.float32):
+            for cn in (1, 3, 4):
+                shape = (7, 9) if cn == 1 else (7, 9, cn)
+                img = np.zeros(shape, dtype)
+                initial = np.full(shape, 17, dtype)
+                dst = cv.cuda_GpuMat(initial)
+                with self.assertRaises(cv.error):
+                    cv.triton.warpAffine(cv.cuda_GpuMat(img), matrix, (9, 7), dst=dst,
+                                         flags=cv.INTER_CUBIC, borderMode=cv.BORDER_TRANSPARENT)
+                np.testing.assert_array_equal(dst.download(), initial)
+
     def test_rejected_inputs_raise(self):
         u8 = np.zeros((32, 32, 3), np.uint8)
         M = np.eye(3, dtype=np.float64)[:2]
@@ -401,21 +537,9 @@ class triton_warpaffine_numeric_test(_TritonBase):
         g = cv.cuda_GpuMat(img)
         got = cv.triton.warpAffine(g, M, dsize, flags=flags, borderMode=border,
                                    borderValue=bv).download()
-        ref = cv.warpAffine(img, M, dsize, flags=flags, borderMode=border, borderValue=bv)
+        ref = _wa_cpu_reference(img, M, dsize, flags, border, bv)
         self.assertEqual(got.shape, ref.shape)
         nbad, worst = _wa_within(got, ref)
-        # Against a NATURAL-width CPU call the two can differ at critical coordinates: under
-        # NEAREST by an adjacent pixel's value, under LINEAR by one level. This is the
-        # compatibility cost the contract states, so the test asserts the LINEAR bound and only
-        # checks NEAREST on geometries where the CPU accepts the shared region -- using the
-        # vector-path reference, which pads and crops, exactly as the C++ suite does.
-        if (flags & cv.INTER_MAX) in (cv.INTER_NEAREST, cv.INTER_LINEAR):
-            # The invoker-family paths have the body/tail split, so the reference is the
-            # padded vector path. CUBIC does not: it keeps the natural-width ref above.
-            wide = ((dsize[0] + 128 + 127) // 128) * 128
-            ref_v = cv.warpAffine(img, M, (wide, dsize[1]), flags=flags,
-                                  borderMode=border, borderValue=bv)[:, :dsize[0]]
-            nbad, worst = _wa_within(got, ref_v)
         self.assertEqual(nbad, 0, msg="%d elements outside the contract, worst %.3f"
                                      % (nbad, worst))
 
@@ -436,6 +560,37 @@ class triton_warpaffine_numeric_test(_TritonBase):
                                           (cv.INTER_CUBIC, cv.BORDER_CONSTANT),
                                           (cv.INTER_CUBIC, cv.BORDER_REFLECT_101)):
                         self._check(img, M, (53, 37), flags, border, 7)
+
+    def test_transparent_initialized_destination(self):
+        rng = np.random.RandomState(37)
+        # Partial, rotated, and wholly outside maps exercise the old-dst blend,
+        # sampling locality and the no-write rule independently.
+        matrices = ([[1., 0., .5], [0., 1., -.5]], _WA_GEOMS[2][1],
+                    [[1., 0., 100.], [0., 1., 100.]])
+        for dtype in (np.uint8, np.uint16, np.float32):
+            for cn in (1, 3, 4):
+                shape = (19, 27) if cn == 1 else (19, 27, cn)
+                img = (rng.uniform(-2, 2, shape).astype(dtype) if dtype == np.float32
+                       else _cvt_input(rng, dtype, 19, 27, cn))
+                initial = np.full(shape, 17, dtype)
+                for geometry, values in enumerate(matrices):
+                    matrix = np.array(values, np.float64)
+                    for direction in (0, cv.WARP_INVERSE_MAP):
+                        for interpolation in (cv.INTER_NEAREST, cv.INTER_LINEAR, cv.INTER_AREA):
+                            flags = interpolation | direction
+                            dst = cv.cuda_GpuMat(initial)
+                            got = cv.triton.warpAffine(cv.cuda_GpuMat(img), matrix, (27, 19),
+                                                       dst=dst, flags=flags,
+                                                       borderMode=cv.BORDER_TRANSPARENT).download()
+                            ref = _wa_cpu_reference(img, matrix, (27, 19), flags,
+                                                    cv.BORDER_TRANSPARENT, initial=initial)
+                            self.assertEqual(img.shape, got.shape)
+                            self.assertEqual(img.dtype, got.dtype)
+                            nbad, worst = _wa_within(got, ref)
+                            self.assertEqual(0, nbad, msg="transparent %s C%d flags=%d geometry=%d worst=%g" %
+                                             (dtype, cn, flags, geometry, worst))
+                            if geometry == 2:
+                                np.testing.assert_array_equal(got, initial)
 
     def test_matches_cpu_larger_destination(self):
         rng = np.random.RandomState(5)

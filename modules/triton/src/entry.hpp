@@ -8,12 +8,12 @@
 namespace cv { namespace triton { namespace detail {
 // Adapter-facing metadata only. Allocation and native ownership stay with the adapter.
 struct OutputInfo { Size size; int type; };
-void requireStatus(const kf_resize_rt::Status& status, const char* operation, bool submittedOnly = false);
-OutputInfo resizeOutput(const kf_resize_rt::DeviceView& src, Size dsize,
+CV_EXPORTS void requireStatus(const kf_resize_rt::Status& status, const char* operation, bool submittedOnly = false);
+CV_EXPORTS OutputInfo resizeOutput(const kf_resize_rt::DeviceView& src, Size dsize,
                         double fx, double fy, int interpolation);
-OutputInfo cvtColorOutput(const kf_resize_rt::DeviceView& src, int code);
-kf_warpaffine::Request warpRequest(const kf_resize_rt::DeviceView& src, InputArray matrix,
+CV_EXPORTS OutputInfo cvtColorOutput(const kf_resize_rt::DeviceView& src, int code);
+CV_EXPORTS kf_warpaffine::Request warpRequest(const kf_resize_rt::DeviceView& src, InputArray matrix,
                                    int flags, int border, const Scalar& value);
-OutputInfo warpOutput(const kf_warpaffine::Request& request, Size dsize);
+CV_EXPORTS OutputInfo warpOutput(const kf_warpaffine::Request& request, Size dsize);
 }}}
 #endif

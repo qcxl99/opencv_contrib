@@ -7,6 +7,7 @@
 #include "opencv2/ts.hpp"
 #include "opencv2/imgproc.hpp"
 #include "../src/runtime/reference_cpu.hpp"
+#include "numerics.hpp"
 #include <algorithm>
 #include <cmath>
 namespace opencv_test { namespace triton_test {
@@ -54,8 +55,7 @@ inline Mat oracle(const Mat& src, Size dsize, double fx, double fy, int interp)
 
 inline double f32Atol(int interp)   // contract cpu_aligned: 2E, derived from CPU's own rounding
 {
-    return interp == INTER_NEAREST ? 0.0 : (interp == INTER_LINEAR ? 4.948e-07 :
-           (interp == INTER_CUBIC ? 1.401e-06 : 8.419e-07));
+    return triton_validation::numeric::resizeF32Atol(interp);
 }
 
 /** Under the contract: CV_8U exact; CV_32F within the derived bound, NaN matched by NaN. */
@@ -109,11 +109,57 @@ inline Mat warpReference(const Mat& src, const Mat& matrix, Size size, int flags
 }
 inline double warpF32Tolerance(double value)
 {
-    return std::min(5.0e-5 * std::max(std::abs(value), 1.0), 1.0e-4);
+    return triton_validation::numeric::warpF32Tolerance(value);
 }
 inline double cvtF32Tolerance(double reference, double inputScale)
 {
-    return 8 * std::ldexp(1.0, -24) * std::max(1.0, std::max(std::abs(reference), inputScale));
+    return triton_validation::numeric::cvtF32Tolerance(reference,inputScale);
 }
+/** cvtColor's numeric owner, shared by accuracy/perf and device fixtures.
+ * Exact paths retain the existing NORM_INF == 0 comparison; floating arithmetic
+ * uses only the input channels of the corresponding pixel, never an image max.
+ */
+inline ::testing::AssertionResult meetsCvtContract(const Mat& got, const Mat& reference,
+                                                  const Mat& input, bool arithmetic)
+{
+    if (got.size() != reference.size() || got.type() != reference.type())
+        return ::testing::AssertionFailure() << "cvtColor output size/type mismatch";
+    if (got.depth() != CV_32F || !arithmetic)
+    {
+        const double difference = cv::norm(got, reference, NORM_INF);
+        if (difference == 0) return ::testing::AssertionSuccess();
+        return ::testing::AssertionFailure() << "cvtColor exact path |diff| " << difference;
+    }
+    if (input.depth() != CV_32F || input.size() != got.size())
+        return ::testing::AssertionFailure() << "cvtColor float input size/depth mismatch";
+    long long bad = 0;
+    double worst = 0;
+    for (int y = 0; y < got.rows; ++y)
+        for (int x = 0; x < got.cols; ++x)
+        {
+            double inputScale = 0;
+            for (int c = 0; c < input.channels(); ++c)
+            {
+                const double value = input.ptr<float>(y)[x * input.channels() + c];
+                if (!std::isfinite(value))
+                    return ::testing::AssertionFailure() << "non-finite cvtColor input at " << x << "," << y;
+                inputScale = std::max(inputScale, std::abs(value));
+            }
+            for (int c = 0; c < got.channels(); ++c)
+            {
+                const double expected = reference.ptr<float>(y)[x * got.channels() + c];
+                const double actual = got.ptr<float>(y)[x * got.channels() + c];
+                if (!std::isfinite(expected) || !std::isfinite(actual))
+                    return ::testing::AssertionFailure() << "non-finite cvtColor result at " << x << "," << y;
+                const double ratio = std::abs(actual - expected) / cvtF32Tolerance(expected, inputScale);
+                worst = std::max(worst, ratio);
+                if (ratio > 1) ++bad;
+            }
+        }
+    if (bad)
+        return ::testing::AssertionFailure() << bad << " cvtColor elements outside per-pixel bound, worst ratio " << worst;
+    return ::testing::AssertionSuccess();
+}
+
 }}
 #endif

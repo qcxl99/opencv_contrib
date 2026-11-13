@@ -69,6 +69,7 @@ OutputInfo warpOutput(const kf_warpaffine::Request& request, Size dsize)
 {
     requireStatus(kf_warpaffine::validate_source(request), "warpAffine");
     if (dsize.empty()) dsize = Size(request.src.cols, request.src.rows);
+    requireStatus(kf_warpaffine::validate_output(request, dsize.height, dsize.width), "warpAffine");
     const int depth = request.src.type == kf_resize_rt::ElemType::F32 ? CV_32F :
                       (request.src.type == kf_resize_rt::ElemType::U16 ? CV_16U : CV_8U);
     return {dsize, CV_MAKETYPE(depth, request.src.channels)};

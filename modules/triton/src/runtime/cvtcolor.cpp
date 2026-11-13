@@ -389,9 +389,19 @@ Status resolve_output(const kf_resize_rt::DeviceView& s, int code, Output& out) 
                                "width and a height divisible by 3 (got " +
                                std::to_string(s.cols) + "x" + std::to_string(s.rows) + ")");
     }
+    const Status source = kf_resize_rt::validate_view(s, "src");
+    if (!source.ok()) return source;
+    const int rows = spec->op == Op::Yuv420 ? (s.rows / 3) * 2 : s.rows;
+    if (static_cast<long long>(rows) * s.cols > 0x7fffffffLL)
+        return unsupported(Reason::IndexRange, "pixel count exceeds int32 indexing");
+    // Admission precedes output allocation in every adapter. uv_rs is i32,
+    // while the pointer arithmetic itself is 64-bit.
+    if (spec->op == Op::Yuv420 && static_cast<unsigned long long>(rows) *
+        (s.step / kf_resize_rt::elem_size(s.type)) > 0x7fffffffULL)
+        return unsupported(Reason::IndexRange, "4:2:0 chroma-plane offset exceeds int32 indexing");
     out.spec = spec;
     out.cols = s.cols;
-    out.rows = spec->op == Op::Yuv420 ? (s.rows / 3) * 2 : s.rows;
+    out.rows = rows;
     return prepared();
 }
 
@@ -412,11 +422,8 @@ Status normalize(const Request& req, Normalized& out) {
                            std::to_string(expected.cols) + "x" + std::to_string(expected.rows) +
                            ", dst is " + std::to_string(d.cols) + "x" + std::to_string(d.rows));
     if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
-    for (const char* which : {"src", "dst"}) {
-        const kf_resize_rt::DeviceView& v = which[0] == 's' ? s : d;
-        const Status checked = kf_resize_rt::validate_view(v, which);
-        if (!checked.ok()) return checked;
-    }
+    const Status destination = kf_resize_rt::validate_view(d, "dst");
+    if (!destination.ok()) return destination;
     if (s.ptr < d.end() && d.ptr < s.end())
         return unsupported(Reason::InPlaceOrOverlap, "src and dst overlap (in-place is not supported)");
     // The pixel count and the launch geometry are the DESTINATION's: grid() emits one program per
@@ -833,7 +840,7 @@ std::string signature(const Normalized& n) {
     // height times the row pitch). It is a runtime argument like the strides, and it is only read
     // by Op::Yuv420; every other op ignores it, so one signature serves all codes.
     o << "src:*" << t << ", dst:*" << t << ", cols:i32, src_rs:i32, dst_rs:i32, sdiv:*i32, hdiv:*i32"
-      << ", uv_rs:i32, t32:*i32, t16:*i16, t64:*i64";
+      << ", uv_rs:i32, rows:i32, t32:*i32, t16:*i16, t64:*i64";
     return o.str();
 }
 

@@ -17,14 +17,14 @@
 //               CV_32F within min(5e-5 * max(|ref|, 1), 1e-4).
 // Each accepted case also checks that only dst was written: the destination is a ROI of a
 // padded parent whose border bytes must be unchanged. A refused case must raise the documented
-// error and leave dst untouched. The bounds are copied from test/test_helpers.hpp and
-// test/test_warpaffine.cpp; a change there must be made here too (kept as literals so this
-// target builds without gtest / opencv_ts).
+// error and leave dst untouched. Scalar bounds use validation/numerics.hpp, the
+// same owner as the standard fixtures, without requiring gtest / opencv_ts.
 //
 // Plain main, no gtest: the target builds in a minimal core,imgproc,triton tree. It accepts the
-// gtest flags a harness passes (--gtest_filter=SUITE.*, --gtest_output=xml:FILE,
-// --gtest_list_tests) and writes gtest-shaped XML, so it is read like opencv_test_triton. Exit is
-// 0 when every selected case passed, 1 otherwise, 77 when there is no usable device.
+// gtest-style filters select five registered group tests, not individual inner checks.
+// Each group runs only when selected. XML lists those same group names and records
+// the inner-check count separately. Exit is 0 for passing nonempty execution, 1 on
+// failed checks, 2 on invalid/empty selection, and 77 when no usable device exists.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -39,10 +39,12 @@
 #include "opencv2/triton.hpp"
 #include "opencv2/core.hpp"
 #include "../../src/runtime/runtime.hpp"
+#include "../../src/runtime/cvtcolor.hpp"
 #include "opencv2/imgproc.hpp"
 #include "opencv2/triton/device.hpp"
 
 #include "../../src/runtime/reference_cpu.hpp"
+#include "../../validation/numerics.hpp"
 
 namespace ref = kf_resize_ref;
 namespace tr = cv::triton;
@@ -52,8 +54,8 @@ namespace tr = cv::triton;
 
 static int g_fail = 0, g_pass = 0;
 
-// Every case, for --gtest_output=xml:FILE: the same JUnit/gtest XML shape opencv_test_triton
-// writes, so a harness that reads one reads the other. The suite is the operator.
+// Inner checks remain individually visible in stdout. XML aggregates them under
+// the five registered groups, whose names also own list/filter behavior.
 struct Result { std::string suite, name, failure; };
 static std::vector<Result> g_results;
 static std::string g_suite = "Triton_Hip";
@@ -80,52 +82,105 @@ static std::string xmlEscape(const std::string& t)
     return o;
 }
 
-static bool writeXml(const std::string& path)
+// This standalone target intentionally registers five coarse tests. Standard
+// OpenCV gtest fixtures provide fine-grained parameter selection elsewhere.
+struct GroupTest { const char* suite; const char* name; };
+static const GroupTest g_inventory[] = {
+    {"Triton_HipResize", "Accuracy"}, {"Triton_HipCvtColor", "Accuracy"},
+    {"Triton_HipWarpAffine", "Accuracy"}, {"Triton_HipRefusals", "NoFallback"},
+    {"Triton_HipRuntime", "AsyncAndCapture"}
+};
+static std::string g_filter = "*";
+
+static bool globMatches(const std::string& pattern, const std::string& value)
 {
-    FILE* f = std::fopen(path.c_str(), "w");
-    if (!f) return false;
-    std::fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites tests=\"%zu\" failures=\"%d\">\n",
-                 g_results.size(), g_fail);
-    std::string open;
-    for (const Result& r : g_results)
+    std::size_t p=0, v=0, star=std::string::npos, retry=0;
+    while (v < value.size())
     {
-        if (r.suite != open)
-        {
-            if (!open.empty()) std::fprintf(f, "  </testsuite>\n");
-            std::fprintf(f, "  <testsuite name=\"%s\">\n", xmlEscape(r.suite).c_str());
-            open = r.suite;
-        }
-        std::fprintf(f, "    <testcase classname=\"%s\" name=\"%s\" status=\"run\"",
-                     xmlEscape(r.suite).c_str(), xmlEscape(r.name).c_str());
-        if (r.failure.empty()) std::fprintf(f, "/>\n");
-        else std::fprintf(f, ">\n      <failure message=\"%s\"/>\n    </testcase>\n", xmlEscape(r.failure).c_str());
+        if (p < pattern.size() && (pattern[p]=='?' || pattern[p]==value[v])) { ++p; ++v; }
+        else if (p < pattern.size() && pattern[p]=='*') { star=p++; retry=v; }
+        else if (star!=std::string::npos) { p=star+1; v=++retry; }
+        else return false;
     }
-    if (!open.empty()) std::fprintf(f, "  </testsuite>\n");
-    std::fprintf(f, "</testsuites>\n");
-    return std::fclose(f) == 0;
+    while (p < pattern.size() && pattern[p]=='*') ++p;
+    return p==pattern.size();
 }
 
-// --gtest_filter=SUITE.* selects one operator (Triton_HipResize / _HipCvtColor / _HipWarpAffine /
-// _HipRefusals), as the CUDA test binary's filters do; anything else runs all of them.
-static std::string g_filter;
+static bool anyPatternMatches(const std::string& patterns, const std::string& name)
+{
+    std::size_t begin=0;
+    do {
+        const std::size_t end=patterns.find(':',begin);
+        if (globMatches(patterns.substr(begin,end==std::string::npos ? end : end-begin),name)) return true;
+        if (end==std::string::npos) break;
+        begin=end+1;
+    } while (begin<=patterns.size());
+    return false;
+}
+
+static bool groupSelected(const GroupTest& group)
+{
+    const std::size_t minus=g_filter.find('-');
+    std::string positive=g_filter.substr(0,minus);
+    if (minus!=std::string::npos && positive.empty()) positive="*";
+    const std::string name=std::string(group.suite)+"."+group.name;
+    return anyPatternMatches(positive,name) &&
+           (minus==std::string::npos || !anyPatternMatches(g_filter.substr(minus+1),name));
+}
+
 static bool selected(const char* suite)
 {
-    if (g_filter.empty() || g_filter == "*") return true;
-    const std::string want = g_filter.substr(0, g_filter.find('.'));
-    return want == suite || want == "*";
+    for (const auto& group:g_inventory)
+        if (std::string(group.suite)==suite) return groupSelected(group);
+    return false;
+}
+
+static bool writeXml(const std::string& path)
+{
+    FILE* f=std::fopen(path.c_str(),"w");
+    if (!f) return false;
+    std::size_t groups=0, failedGroups=0;
+    for (const auto& group:g_inventory) if (groupSelected(group)) {
+        ++groups;
+        bool failed=false, ran=false;
+        for (const auto& result:g_results) if (result.suite==group.suite) {
+            ran=true;
+            failed|=!result.failure.empty();
+        }
+        failedGroups+=failed || !ran;
+    }
+    std::fprintf(f,"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                   "<testsuites tests=\"%zu\" failures=\"%zu\" checks=\"%zu\" check_failures=\"%d\">\n",
+                 groups,failedGroups,g_results.size(),g_fail);
+    for (const auto& group:g_inventory) if (groupSelected(group)) {
+        std::size_t checks=0, failures=0;
+        std::string details;
+        for (const auto& result:g_results) if (result.suite==group.suite) {
+            ++checks;
+            if (!result.failure.empty()) { ++failures; details+=result.failure+"\n"; }
+        }
+        if (!checks) { ++failures; details="selected group executed no checks"; }
+        std::fprintf(f,"  <testsuite name=\"%s\" tests=\"1\" failures=\"%d\" checks=\"%zu\">\n"
+                       "    <testcase classname=\"%s\" name=\"%s\" status=\"run\" checks=\"%zu\" check_failures=\"%zu\"",
+                     group.suite,failures ? 1 : 0,checks,group.suite,group.name,checks,failures);
+        if (failures) std::fprintf(f,">\n      <failure message=\"%s\"/>\n    </testcase>\n",xmlEscape(details).c_str());
+        else std::fprintf(f,"/>\n");
+        std::fprintf(f,"  </testsuite>\n");
+    }
+    std::fprintf(f,"</testsuites>\n");
+    return std::fclose(f)==0;
 }
 
 // ---------------------------------------------------------------- bounds (owned elsewhere)
 
-static double resizeF32Atol(int interp)   // test/test_helpers.hpp::f32Atol
+static double resizeF32Atol(int interp)
 {
-    return interp == cv::INTER_NEAREST ? 0.0 : (interp == cv::INTER_LINEAR ? 4.948e-07 :
-           (interp == cv::INTER_CUBIC ? 1.401e-06 : 8.419e-07));
+    return triton_validation::numeric::resizeF32Atol(interp);
 }
 
-static double warpF32Tol(double r)        // test/test_warpaffine.cpp::f32Tol
+static double warpF32Tol(double r)
 {
-    return std::min(5.0e-5 * std::max(std::abs(r), 1.0), 1.0e-4);
+    return triton_validation::numeric::warpF32Tolerance(r);
 }
 
 // ------------------------------------------------------------------- device images
@@ -298,28 +353,97 @@ static void resizeCase(cv::Size ssz, cv::Size dsz, int type, int interp, hipStre
 
 // ------------------------------------------------------------------------- cvtColor
 
-static void cvtCase(cv::Size sz, int code, int scn, int dcn, hipStream_t stream, uint64 seed)
+static void cvtCase(cv::Size sz, const kf_cvtcolor::CodeSpec& spec, int depth,
+                    hipStream_t stream, uint64 seed, bool boundaries = false)
 {
     const unsigned char fill = 0x5A;
-    const cv::Mat host = randomImage(sz, CV_MAKETYPE(CV_8U, scn), seed);
-    DevImg s, d;
-    alloc(s, sz.height, sz.width, CV_MAKETYPE(CV_8U, scn), 1, 0);
-    alloc(d, sz.height, sz.width, CV_MAKETYPE(CV_8U, dcn), 2, fill);
-    upload(s, host);
-    const std::string name = cv::format("cvtColor code=%d %dx%d C%d->C%d", code, sz.width, sz.height, scn, dcn);
+    const int sourceHeight = spec.op == kf_cvtcolor::Op::Yuv420 ? sz.height / 2 * 3 : sz.height;
+    cv::Mat host = randomImage({sz.width, sourceHeight}, CV_MAKETYPE(depth, spec.scn), seed);
+    if (boundaries)
+    {
+        cv::Mat flat = host.reshape(1);
+        const double values[] = {0, 1, 2, 15, 16, 127, 128, 235, 240, 254, 255, 65535};
+        for (int y = 0; y < flat.rows; ++y)
+            for (int x = 0; x < flat.cols; ++x)
+            {
+                const double value = values[(x + 7*y) % 12];
+                if (depth == CV_8U) flat.at<uchar>(y,x) = cv::saturate_cast<uchar>(value);
+                else if (depth == CV_16U) flat.at<ushort>(y,x) = static_cast<ushort>(value);
+                else flat.at<float>(y,x) = static_cast<float>((x % 3 == 0 ? -1 : 1) * value);
+            }
+    }
+    if (depth == CV_32F && !boundaries)
+        for (int y = 0; y < host.rows; ++y)
+            for (int x = 0; x < host.cols; x += 3)
+                for (int c = 0; c < spec.scn; ++c) host.ptr<float>(y)[x*spec.scn+c] *= 32767.5f;
+    DevImg src, dst;
+    alloc(src, sourceHeight, sz.width, host.type(), 1, 0xC3);
+    alloc(dst, sz.height, sz.width, CV_MAKETYPE(depth, spec.dcn), 2, fill);
+    upload(src, host);
+    const std::string name = cv::format("cvtColor %s depth=%d %dx%d%s", spec.name, depth,
+                                        sz.width, sz.height, boundaries ? " boundaries" : "");
     try
     {
-        tr::cvtColorDevice(s.view(), d.view(), code, 0, reinterpret_cast<std::uintptr_t>(stream));
+        tr::cvtColorDevice(src.view(), dst.view(), spec.code, 0, reinterpret_cast<std::uintptr_t>(stream));
         HIPOK(hipStreamSynchronize(stream));
     }
     catch (const cv::Exception& e) { report(false, name + ": " + e.what()); return; }
     cv::Mat want;
-    cv::cvtColor(host, want, code);
-    const cv::Mat parent = downloadParent(d);
+    cv::cvtColor(host, want, spec.code);
+    const cv::Mat parent = downloadParent(dst), got = roiOf(parent, dst);
     std::string why;
-    const bool ok = compare(roiOf(parent, d), want, [](double) { return 0.0; }, why);
-    const bool clean = untouchedOutside(parent, d, fill);
-    report(ok && clean, name + (ok ? "" : ": " + why) + (clean ? "" : ": wrote outside dst"));
+    bool ok = true;
+    if (depth != CV_32F || spec.op == kf_cvtcolor::Op::Permute)
+        ok = compare(got, want, [](double) { return 0.0; }, why);
+    else
+    {
+        // Scale is local to the pixel's input channels, never the image maximum.
+        for (int y = 0; y < got.rows; ++y)
+            for (int x = 0; x < got.cols; ++x)
+            {
+                double scale = 1;
+                for (int c = 0; c < spec.scn; ++c)
+                    scale = std::max(scale, std::abs(static_cast<double>(host.ptr<float>(y)[x*spec.scn+c])));
+                for (int c = 0; c < spec.dcn; ++c)
+                {
+                    const double a = got.ptr<float>(y)[x*spec.dcn+c], b = want.ptr<float>(y)[x*spec.dcn+c];
+                    if (!std::isfinite(a) || std::abs(a-b) > triton_validation::numeric::cvtF32Tolerance(b,scale))
+                    { ok = false; why = cv::format("pixel(%d,%d,%d) got=%.12g ref=%.12g", y,x,c,a,b); }
+                }
+            }
+    }
+    const cv::Mat sourceParent = downloadParent(src);
+    const bool sourceClean = cv::norm(roiOf(sourceParent, src), host, cv::NORM_INF) == 0 &&
+                             untouchedOutside(sourceParent, src, 0xC3);
+    const bool clean = untouchedOutside(parent, dst, fill);
+    report(ok && clean && sourceClean, name + (ok ? "" : ": " + why) +
+           (clean ? "" : ": wrote outside dst") + (sourceClean ? "" : ": modified src"));
+}
+
+static void cvtCoverage(hipStream_t stream)
+{
+    uint64 seed = 10001;
+    int rows8 = 0, rows16 = 0, rows32 = 0;
+    for (const auto& spec : kf_cvtcolor::all())
+        for (int depth : {CV_8U, CV_16U, CV_32F})
+        {
+            using kf_cvtcolor::Op;
+            const bool word = spec.op == Op::Bayer || spec.op == Op::Gray || spec.op == Op::Yuv ||
+                              spec.op == Op::YCrCb || (spec.op == Op::Permute && spec.scn == 1);
+            const bool floating = spec.op == Op::Gray || spec.op == Op::Yuv || spec.op == Op::YCrCb ||
+                                  (spec.op == Op::Permute && spec.scn != 2);
+            if ((depth == CV_16U && !word) || (depth == CV_32F && !floating)) continue;
+            if (depth == CV_8U) ++rows8; else if (depth == CV_16U) ++rows16; else ++rows32;
+            const std::vector<cv::Size> sizes = spec.op == Op::Yuv420 ?
+                std::vector<cv::Size>{{2,2},{14,6},{16,4},{18,8},{258,6}} :
+                spec.op == Op::Yuv422 ? std::vector<cv::Size>{{2,1},{14,3},{16,5},{18,7},{258,3}} :
+                spec.op == Op::Bayer ? std::vector<cv::Size>{{1,1},{2,2},{3,3},{7,5},{258,9}} :
+                std::vector<cv::Size>{{1,1},{7,3},{16,5},{17,7},{257,3}};
+            for (const auto& size : sizes) cvtCase(size, spec, depth, stream, seed++);
+            cvtCase(sizes.back(), spec, depth, stream, seed++, true);
+        }
+    report(rows8 == 84 && rows16 == 20 && rows32 == 20,
+           cv::format("cvtColor table coverage: %d uint8 / %d uint16 / %d float32 code-depth rows", rows8, rows16, rows32));
 }
 
 // ----------------------------------------------------------------------- warpAffine
@@ -511,20 +635,32 @@ static void runtimeChecks(hipStream_t stream)
     HIPOK(hipStreamDestroy(other));
 }
 
+#include "test_hip_cvt_runtime.hpp"
+#include "test_hip_ownership.hpp"
+
 int main(int argc, char** argv)
 {
     std::string xml;
-    for (int i = 1; i < argc; ++i)
-    {
-        const std::string a = argv[i];
-        if (a.rfind("--gtest_output=xml:", 0) == 0) xml = a.substr(19);
-        else if (a.rfind("--gtest_filter=", 0) == 0) g_filter = a.substr(15);
-        else if (a == "--gtest_list_tests")
-        {
-            std::printf("Triton_HipResize.\n  Accuracy\nTriton_HipCvtColor.\n  Accuracy\n"
-                        "Triton_HipWarpAffine.\n  Accuracy\nTriton_HipRefusals.\n  NoFallback\nTriton_HipRuntime.\n  AsyncAndCapture\n");
-            return 0;
-        }
+    bool list=false;
+    if (const char* filter=std::getenv("GTEST_FILTER")) g_filter=filter;
+    if (std::getenv("GTEST_SHARD_INDEX") || std::getenv("GTEST_TOTAL_SHARDS")) {
+        std::fprintf(stderr,"standalone HIP group tests do not support sharding\n");
+        return 2;
+    }
+    for (int i=1;i<argc;++i) {
+        const std::string a=argv[i];
+        if (a.rfind("--gtest_output=xml:",0)==0 && a.size()>19) xml=a.substr(19);
+        else if (a.rfind("--gtest_filter=",0)==0) g_filter=a.substr(15);
+        else if (a=="--gtest_list_tests") list=true;
+        else { std::fprintf(stderr,"unknown argument: %s\n",a.c_str()); return 2; }
+    }
+    std::size_t groupCount=0;
+    for (const auto& group:g_inventory) if (groupSelected(group)) ++groupCount;
+    if (!groupCount) { std::fprintf(stderr,"filter selected zero registered HIP groups: %s\n",g_filter.c_str()); return 2; }
+    if (list) {
+        for (const auto& group:g_inventory) if (groupSelected(group))
+            std::printf("%s.\n  %s\n",group.suite,group.name);
+        return 0;
     }
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev < 1 || !tr::haveDevice(0))
@@ -561,16 +697,8 @@ int main(int argc, char** argv)
     g_suite = "Triton_HipCvtColor";
     if (selected("Triton_HipCvtColor"))
     {
-    seed = 10001;
-    std::printf("== cvtColor vs this build's cv::cvtColor (integer codes)\n");
-    struct Cvt { int code, scn, dcn; };
-    const Cvt codes[] = {{cv::COLOR_BGR2GRAY, 3, 1}, {cv::COLOR_RGB2GRAY, 3, 1}, {cv::COLOR_BGRA2GRAY, 4, 1},
-                         {cv::COLOR_BGR2BGRA, 3, 4}, {cv::COLOR_BGRA2BGR, 4, 3}, {cv::COLOR_BGR2RGB, 3, 3},
-                         {cv::COLOR_BGR2RGBA, 3, 4}, {cv::COLOR_BGRA2RGBA, 4, 4}};
-    const cv::Size csizes[] = {{64, 48}, {97, 61}, {1, 1}, {1920, 1080}};
-    for (const Cvt& c : codes)
-        for (const cv::Size& sz : csizes)
-            cvtCase(sz, c.code, c.scn, c.dcn, stream, seed++);
+    std::printf("== cvtColor all supported code/depth rows vs linked CPU reference\n");
+    cvtCoverage(stream);
     }
 
     g_suite = "Triton_HipWarpAffine";
@@ -699,14 +827,59 @@ int main(int argc, char** argv)
     }
     }
 
+    // Depth, channel and video-layout refusals preserve the existing destination.
+    g_suite = "Triton_HipCvtColor";
+    if (selected("Triton_HipCvtColor"))
+    {
+        struct BadCvt { int code, depth, scn, dcn, width, height; };
+        const BadCvt bad[] = {
+            {cv::COLOR_BGR2HSV, CV_32F, 3, 3, 17, 7},
+            {cv::COLOR_BGR2XYZ, CV_16U, 3, 3, 17, 7},
+            {cv::COLOR_BGR2Lab, CV_32F, 3, 3, 17, 7},
+            {cv::COLOR_BGR2BGRA, CV_16U, 3, 4, 17, 7},
+            {cv::COLOR_YUV2GRAY_UYVY, CV_32F, 2, 1, 17, 7},
+            {cv::COLOR_YUV2BGR_UYVY, CV_8U, 2, 3, 17, 7},
+            {cv::COLOR_YUV2BGR_NV12, CV_8U, 1, 3, 17, 6},
+            {cv::COLOR_YUV2BGR_NV21, CV_8U, 1, 3, 18, 7},
+            {cv::COLOR_BGR2GRAY, CV_8U, 1, 1, 17, 7},
+            {cv::COLOR_BGR2GRAY, CV_8U, 3, 4, 17, 7},
+            {cv::COLOR_HSV2BGR, CV_8U, 3, 3, 17, 7},
+            {cv::COLOR_LBGR2Luv, CV_8U, 3, 3, 17, 7},
+            {cv::COLOR_BGR2YUV_I420, CV_8U, 3, 1, 18, 6}
+        };
+        for (const auto& c : bad)
+        {
+            DevImg source, target;
+            alloc(source,c.height,c.width,CV_MAKETYPE(c.depth,c.scn),1,0);
+            const int targetHeight = c.code == cv::COLOR_YUV2BGR_NV12 || c.code == cv::COLOR_YUV2BGR_NV21 ?
+                                     (c.height/3)*2 : c.height;
+            alloc(target,targetHeight,c.width,CV_MAKETYPE(c.depth,c.dcn),2,0x5A);
+            bool rejected = false;
+            try { tr::cvtColorDevice(source.view(),target.view(),c.code,0,reinterpret_cast<std::uintptr_t>(stream)); }
+            catch (const cv::Exception& e) { rejected = e.code == cv::Error::StsBadArg || e.code == cv::Error::StsUnsupportedFormat; }
+            HIPOK(hipStreamSynchronize(stream));
+            const cv::Mat parent = downloadParent(target);
+            bool preserved = true;
+            for (size_t i=0;i<parent.total();++i) preserved = preserved && parent.data[i] == 0x5A;
+            report(rejected && preserved,cv::format("cvtColor refused code=%d depth=%d C%d->C%d %dx%d without writing",
+                   c.code,c.depth,c.scn,c.dcn,c.width,c.height));
+        }
+    }
+
     g_suite="Triton_HipRuntime";
-    if (selected("Triton_HipRuntime")) runtimeChecks(stream);
+    if (selected("Triton_HipRuntime")) { runtimeChecks(stream); cvtRuntimeChecks(stream); ownershipChecks(stream); }
     HIPOK(hipStreamDestroy(stream));
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     if (!xml.empty() && !writeXml(xml))
     {
         std::fprintf(stderr, "cannot write %s\n", xml.c_str());
         return 2;
+    }
+    if (g_results.empty()) { std::fprintf(stderr,"selected groups executed zero checks\n"); return 2; }
+    for (const auto& group:g_inventory) if (groupSelected(group)) {
+        bool ran=false;
+        for (const auto& result:g_results) ran|=result.suite==group.suite;
+        if (!ran) { std::fprintf(stderr,"selected group executed no checks: %s.%s\n",group.suite,group.name); return 2; }
     }
     return g_fail ? 1 : 0;
 }

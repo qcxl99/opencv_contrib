@@ -761,6 +761,93 @@ TEST(Triton_WarpAffine, TransparentMatchesCpu)
 
 // ---------------------------------------------------------------- rejection surface
 
+// These requests carry address identities only; normalize never dereferences them.
+// Keep validation coverage runnable on a host without a CUDA device.
+TEST(Triton_WarpAffine, PureOutputAdmission)
+{
+    // Source/options resolution must need neither a destination allocation nor
+    // a readable source pointer or CPU fusion calibration.
+    wa::Request request;
+    request.src.type = kf_resize_rt::ElemType::F32;
+    request.src.channels = 3;
+    request.inverse_map = true;
+    EXPECT_TRUE(wa::validate_source(request).ok());
+    EXPECT_TRUE(wa::validate_output(request, 37, 53).ok());
+    EXPECT_EQ(kf_resize_rt::Reason::EmptyOrSize, wa::validate_output(request, 0, 53).reason);
+    request.border[0] = 1e100;
+    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::validate_source(request).reason);
+    request.border[0] = 0;
+    request.M[2] = 2147483648.0;
+    EXPECT_TRUE(wa::validate_source(request).ok());
+    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::validate_output(request, 37, 53).reason);
+    request.interpolation = INTER_CUBIC;
+    EXPECT_TRUE(wa::validate_output(request, 37, 53).ok());
+    request.M[0] = 1e38; request.M[2] = 0;
+    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::validate_output(request, 37, 53).reason);
+    request.M[0] = 1;
+    request.interpolation = INTER_AREA;
+    request.border_mode = BORDER_TRANSPARENT;
+    EXPECT_TRUE(wa::validate_output(request, 1, 1).ok());
+    request.interpolation = INTER_CUBIC;
+    EXPECT_EQ(kf_resize_rt::Reason::Interpolation, wa::validate_source(request).reason);
+}
+
+TEST(Triton_WarpAffine, HostSamplingBoundaries)
+{
+    wa::Request request;
+    request.src.ptr = 4096;
+    request.src.rows = 37; request.src.cols = 53; request.src.channels = 1;
+    request.src.step = 53;
+    request.dst = request.src;
+    request.dst.ptr = 16384;
+    request.inverse_map = true;
+    wa::Normalized normalized;
+    for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_AREA}) {
+        request.interpolation = interp;
+        request.M[2] = 2147483648.0;
+        EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+    }
+    request.interpolation = INTER_CUBIC;
+    EXPECT_TRUE(wa::normalize(request, normalized).ok()); // CUBIC clamps before int32 conversion
+    request.M[0] = 1e38; request.M[2] = 0;
+    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+    request.M[0] = 1;
+    for (double invalid : {std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity()}) {
+        request.M[2] = invalid;
+        EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+        request.M[2] = 0;
+        request.border[0] = invalid;
+        EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+    }
+    request.border[0] = 1e100;
+    request.src.type = request.dst.type = kf_resize_rt::ElemType::F32;
+    request.src.step = request.dst.step = 53 * sizeof(float);
+    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+}
+
+TEST(Triton_WarpAffine, HostAreaTransparentNormalization)
+{
+    wa::Request request;
+    request.src.ptr = 4096;
+    request.src.rows = 1; request.src.cols = 1; request.src.channels = 1;
+    request.src.step = 1;
+    request.dst = request.src; request.dst.ptr = 16384;
+    request.border_mode = BORDER_TRANSPARENT;
+    request.interpolation = INTER_AREA;
+    wa::Normalized area, linear;
+    ASSERT_TRUE(wa::normalize(request, area).ok());
+    request.interpolation = INTER_LINEAR;
+    ASSERT_TRUE(wa::normalize(request, linear).ok());
+    EXPECT_EQ(wa::Mode::Linear, area.mode);
+    EXPECT_EQ(wa::constexprs_text(linear), wa::constexprs_text(area));
+    EXPECT_EQ(BORDER_TRANSPARENT, area.border_x);
+    EXPECT_EQ(BORDER_TRANSPARENT, area.border_y);
+    EXPECT_NE(std::string::npos, wa::constexprs_text(area).find("TRANSPARENT=1"));
+    request.interpolation = INTER_CUBIC;
+    EXPECT_EQ(kf_resize_rt::Reason::Interpolation, wa::normalize(request, area).reason);
+}
+
 TEST(Triton_WarpAffine, RejectsWithoutFallback)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
@@ -777,6 +864,13 @@ TEST(Triton_WarpAffine, RejectsWithoutFallback)
         cuda::GpuMat src(host), dst;
         EXPECT_THROW(cv::triton::warpAffine(src, dst, M, Size(32, 32), interp, BORDER_CONSTANT),
                      cv::Exception);
+    }
+    // Only interpolation plus WARP_INVERSE_MAP belongs to this entry's flag
+    // surface. Known-but-unserved flags must not silently change the request.
+    for (int flags : {INTER_LINEAR | WARP_FILL_OUTLIERS, INTER_LINEAR | 32, -1})
+    {
+        cuda::GpuMat src(host), dst;
+        EXPECT_THROW(cv::triton::warpAffine(src, dst, M, host.size(), flags), cv::Exception);
     }
     // C2 and CV_16S need the CPU's other numerical path and are deliberately refused.
     for (int type : {CV_8UC2, CV_16UC2, CV_32FC2, CV_16SC1, CV_16SC3, CV_16SC4, CV_8UC(5)})

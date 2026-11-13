@@ -42,6 +42,12 @@ Unsupported depths, channels and interpolation modes raise
 CPU-aligned kernels; there is no implicit fallback to CPU or to `cv::cuda`.
 Windows is not built in this milestone. HIP uses the device-buffer entries described below.
 
+Sizing and interpolation are validated before an adapter allocates the output.
+Scale-derived dimensions require finite positive `fx`/`fy` and must fit positive
+int32 dimensions; explicit `dsize` takes precedence and ignores `fx`/`fy`, including
+nonfinite values. Interpolation is a single declared mode: warp flags and
+`INTER_NEAREST_EXACT`/`INTER_LINEAR_EXACT` are refused.
+
 How a call runs
 ---------------
 

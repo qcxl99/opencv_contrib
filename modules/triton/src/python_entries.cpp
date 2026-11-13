@@ -19,6 +19,18 @@ void resizeForPython(const cuda::GpuMat& src, cuda::GpuMat& dst, Size dsize,
 #endif
 }
 
+void cvtColorForPython(const cuda::GpuMat& src, cuda::GpuMat& dst, int code,
+                       Ptr<cuda::Stream> stream)
+{
+#ifdef OPENCV_TRITON_HAVE_CUDA_ADAPTER
+    cvtColor(src, dst, code, stream ? *stream : cuda::Stream::Null());
+#else
+    CV_UNUSED(src); CV_UNUSED(dst); CV_UNUSED(code); CV_UNUSED(stream);
+    CV_Error(Error::StsNotImplemented,
+             "cv::triton::cvtColor: this HIP build serves C++ device buffers; the Python GpuMat adapter needs CUDA");
+#endif
+}
+
 void warpAffineForPython(const cuda::GpuMat& src, cuda::GpuMat& dst, InputArray M, Size dsize,
                          int flags, int borderMode, const Scalar& borderValue, Ptr<cuda::Stream> stream)
 {

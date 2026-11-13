@@ -5,7 +5,7 @@
 # CPU-aligned resize kernels (contract resize/0.15.0) for the runtime JIT of modules/triton.
 # GENERATED, do not edit: exported from kernelforge-lab by tools/export_module_kernels.py.
 #   lab file:    operators/warpaffine/kernel.py
-#   lab sha256:  09f274acc76943052e0976a3147f156d5f0a994d17ed7ec27c8fcf709845bc4b
+#   lab sha256:  f19f9d99c4ce204fdace13e85145a30c45dbdc1950b3be7b302d1865f1a8be51
 #   functions:   _pmod, _bm, _fma, _mapped_coord, _warp_nearest, _warp_linear, _bicubic_weights_t, _warp_cubic
 # The runtime compiles these through tools/compile_helper.py; the compile key carries this
 # file's own sha256, so editing it here only changes which binaries are built, never which

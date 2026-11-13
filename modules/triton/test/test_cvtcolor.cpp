@@ -127,37 +127,9 @@ TEST(Triton_CvtColor, MatchesCpu32F)
             // alpha = 1.0f the inserted channel gets at 32F -- it is 255 at 8U, which is why the
             // kernel derives it). The arithmetic codes have several CPU answers, so they are
             // checked against the measured bound, not for equality.
-            const bool arithmetic = c.code == COLOR_BGR2GRAY || c.code == COLOR_RGB2GRAY ||
-                                    c.code == COLOR_BGRA2GRAY || c.code == COLOR_RGBA2GRAY ||
-                                    c.code == COLOR_BGR2YCrCb || c.code == COLOR_RGB2YCrCb ||
-                                    c.code == COLOR_YCrCb2BGR || c.code == COLOR_YCrCb2RGB ||
-                                    c.code == COLOR_BGR2YUV || c.code == COLOR_RGB2YUV ||
-                                    c.code == COLOR_YUV2BGR || c.code == COLOR_YUV2RGB;
+            const bool arithmetic = cvt_cases::floatArithmetic(c.code);
             const Mat ref = cpuCvt(host, c.code);
-            if (!arithmetic)
-            {
-                EXPECT_EQ(0.0, cvtest::norm(got, ref, NORM_INF));
-            }
-            else
-            {
-                // |got-ref| <= 8 * 2^-24 * max(1, |ref|, max|input|). max|input| is required: a
-                // chroma channel can be computed from 6.5e4-scale operands and land near zero, so
-                // a |ref|-only normaliser over-claims by orders of magnitude (contract-32f.md 5.2).
-                double worst = 0;
-                for (int y = 0; y < got.rows; ++y)
-                    for (int x = 0; x < got.cols * got.channels(); ++x)
-                    {
-                        const double r = ref.ptr<float>(y)[x], g = got.ptr<float>(y)[x];
-                        double maxin = 0;
-                        const int pixel = x / got.channels();
-                        for (int ch = 0; ch < host.channels(); ++ch)
-                            maxin = std::max(maxin, std::fabs(double(host.ptr<float>(y)[pixel*host.channels()+ch])));
-                        ASSERT_TRUE(std::isfinite(r) && std::isfinite(g));
-                        const double allow = cvtF32Tolerance(r, maxin);
-                        worst = std::max(worst, std::fabs(g - r) / allow);
-                    }
-                EXPECT_LE(worst, 1.0) << "outside the measured 32F bound (k=" << worst << ")";
-            }
+            EXPECT_TRUE(meetsCvtContract(got, ref, host, arithmetic));
         }
 }
 
@@ -745,25 +717,57 @@ TEST(Triton_CvtColor, CoversEverySupportedCode)
 // whose code names are aliases. Exact counts name numeric rows, not aliases.
 TEST(Triton_CvtColor, CoversEverySupportedDepth)
 {
-    int count16 = 0, count32 = 0;
+    int counts[] = {0, 0, 0};
     for (const auto& spec : kf_cvtcolor::all())
-    {
-        using Op = kf_cvtcolor::Op;
-        const bool admitted16 = spec.op == Op::Bayer || spec.op == Op::Gray ||
-            spec.op == Op::Yuv || spec.op == Op::YCrCb ||
-            (spec.op == Op::Permute && spec.scn == 1);
-        const bool admitted32 = (spec.op == Op::Permute && spec.scn != 2) || spec.op == Op::Gray ||
-            spec.op == Op::Yuv || spec.op == Op::YCrCb;
-        bool found16 = false, found32 = false;
-        for (const auto& c : kCases16U) found16 |= c.code == spec.code;
-        for (const auto& c : kCases32F) found32 |= c.code == spec.code;
-        EXPECT_EQ(admitted16, found16) << spec.name;
-        EXPECT_EQ(admitted32, found32) << spec.name;
-        count16 += admitted16; count32 += admitted32;
-    }
-    EXPECT_EQ(20, count16); EXPECT_EQ(20, count32);
-    EXPECT_EQ(size_t(count16), sizeof(kCases16U) / sizeof(kCases16U[0]));
-    EXPECT_EQ(size_t(count32), sizeof(kCases32F) / sizeof(kCases32F[0]));
+        for (int index = 0; index < 3; ++index)
+        {
+            const int depth = index == 0 ? CV_8U : index == 1 ? CV_16U : CV_32F;
+            kf_resize_rt::DeviceView src;
+            src.ptr = 4096;
+            src.rows = spec.op == kf_cvtcolor::Op::Yuv420 ? 48 : 32;
+            src.cols = 32;
+            src.channels = spec.scn;
+            src.type = depth == CV_8U ? kf_resize_rt::ElemType::U8 :
+                       depth == CV_16U ? kf_resize_rt::ElemType::U16 : kf_resize_rt::ElemType::F32;
+            src.step = src.cols * src.channels * kf_resize_rt::elem_size(src.type);
+            kf_cvtcolor::Output output;
+            const bool admitted = kf_cvtcolor::resolve_output(src, spec.code, output).ok();
+            const CvtCase* row = cvt_cases::find(spec.code, depth);
+            EXPECT_EQ(admitted, row != nullptr) << spec.name << " depth=" << depth;
+            if (!admitted) continue;
+            ++counts[index];
+            ASSERT_TRUE(row != nullptr);
+            EXPECT_EQ(spec.scn, row->scn);
+            EXPECT_EQ(spec.dcn, row->dcn);
+            EXPECT_EQ(row->yuv420 ? 32 : src.rows, output.rows);
+            EXPECT_EQ(src.cols, output.cols);
+        }
+    EXPECT_EQ(84, counts[0]); EXPECT_EQ(20, counts[1]); EXPECT_EQ(20, counts[2]);
+    EXPECT_EQ(size_t(counts[0]), sizeof(kCases) / sizeof(kCases[0]));
+    EXPECT_EQ(size_t(counts[1]), sizeof(kCases16U) / sizeof(kCases16U[0]));
+    EXPECT_EQ(size_t(counts[2]), sizeof(kCases32F) / sizeof(kCases32F[0]));
+}
+
+// The public adapters call this source-only owner before allocating output.
+// Synthetic addresses are never dereferenced; malformed views must be refused here.
+TEST(Triton_CvtColor, ResolvesAndRefusesBeforeOutputAllocation)
+{
+    kf_resize_rt::DeviceView source;
+    source.ptr = 4096; source.rows = 48; source.cols = 32;
+    source.channels = 1; source.step = 32;
+    kf_cvtcolor::Output output;
+    ASSERT_TRUE(kf_cvtcolor::resolve_output(source, COLOR_YUV2BGR_NV12, output).ok());
+    EXPECT_EQ(32, output.rows); EXPECT_EQ(32, output.cols); EXPECT_EQ(3, output.spec->dcn);
+    auto reject = [&](const kf_resize_rt::DeviceView& src)
+    { EXPECT_FALSE(kf_cvtcolor::resolve_output(src, COLOR_YUV2BGR_NV12, output).ok()); };
+    auto bad = source; bad.ptr = 0; reject(bad);
+    bad = source; bad.rows = 0; reject(bad);
+    bad = source; bad.cols = 31; reject(bad);
+    bad = source; bad.rows = 47; reject(bad);
+    bad = source; bad.step = 31; reject(bad);
+    bad = source; bad.type = kf_resize_rt::ElemType::F32; reject(bad);
+    bad = source; bad.rows = 2147483646; bad.cols = 2; bad.step = 2; reject(bad);
+    bad = source; bad.rows = 6; bad.step = 536870912; reject(bad);
 }
 
 // The Xyz/Lab/Luv rows carry coefficients that cvtcolor.cpp computes (coeffs_for) when the table

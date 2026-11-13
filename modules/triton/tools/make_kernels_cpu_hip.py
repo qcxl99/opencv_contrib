@@ -12,8 +12,8 @@ the cuda path is verified on other hardware and must not change because of a bac
 not serve.
 
 Which operators need one is decided by the source, not by a list: a kernel that imports
-libdevice and calls one of those primitives is derived (resize, warpaffine); one that imports
-none is portable as written and the hip runtime reads it directly (cvtcolor).
+libdevice and calls one of those primitives is derived (resize, cvtcolor, warpaffine). A kernel that imports none is portable as
+written and the HIP runtime may read it directly.
 
 The shim text and the composer are the lab's tools/make_kernel_cpu_hip.py, byte for byte
 (kernelforge-lab tests/test_module_sync.py asserts it), so the lab and the module run the same

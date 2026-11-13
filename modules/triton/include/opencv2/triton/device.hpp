@@ -47,6 +47,11 @@ CV_EXPORTS bool haveDevice(int device);
 CV_EXPORTS void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
                              int interpolation, int device, std::uintptr_t stream);
 
+/** @brief Scale-aware form. Empty dsize resolves fx/fy with CPU resize precedence;
+ * dst must already have the resolved size. Original scales are preserved. */
+CV_EXPORTS void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
+                             double fx, double fy, int interpolation, int device, std::uintptr_t stream);
+
 /** @brief cv::triton::cvtColor on device buffers. dst's channel count is the code's. */
 CV_EXPORTS void cvtColorDevice(const DeviceImage& src, const DeviceImage& dst, int code,
                                int device, std::uintptr_t stream);

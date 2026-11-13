@@ -172,17 +172,46 @@ Status validate_source(const Request& req)
                            "cv::triton::warpAffine: CV_8U, CV_16U and CV_32F only");
     if (s.channels != 1 && s.channels != 3 && s.channels != 4)
         return unsupported(Reason::DepthOrChannels, "channels must be 1, 3 or 4");
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 4; ++i) {
         if (!std::isfinite(req.border[i]))
             return unsupported(Reason::IndexRange, "border components must be finite");
+        if (s.type == kf_resize_rt::ElemType::F32 &&
+            std::abs(req.border[i]) > std::numeric_limits<float>::max())
+            return unsupported(Reason::IndexRange, "float32 border components exceed finite float32 range");
+    }
     double matrix[6];
     return sampling_matrix(req, matrix);
+}
+
+Status validate_output(const Request& req, int dst_h, int dst_w)
+{
+    const Status admitted = validate_source(req);
+    if (!admitted.ok()) return admitted;
+    if (dst_h <= 0 || dst_w <= 0)
+        return unsupported(Reason::EmptyOrSize, "destination size must be positive");
+    double matrix[6];
+    const Status prepared_matrix = sampling_matrix(req, matrix);
+    if (!prepared_matrix.ok()) return prepared_matrix;
+    // Bound each float multiply/add term before calibration or allocation.
+    // The conservative absolute-term bound covers both fused/split forms;
+    // CUBIC clamps before integer conversion, other modes need an int32 margin.
+    const double rounding = 1.0 + 8.0 * std::numeric_limits<float>::epsilon();
+    for (int row = 0; row < 2; ++row) {
+        const int i = row * 3;
+        const double bound = std::abs(matrix[i]) * (dst_w - 1) +
+                             std::abs(matrix[i + 1]) * (dst_h - 1) + std::abs(matrix[i + 2]);
+        if (!std::isfinite(bound) || bound > std::numeric_limits<float>::max() / rounding)
+            return unsupported(Reason::IndexRange, "sampling coordinate expression exceeds finite float32 range");
+        if (req.interpolation != cv::INTER_CUBIC && bound > 2147483392.0 / rounding)
+            return unsupported(Reason::IndexRange, "sampling coordinates exceed safe int32 range");
+    }
+    return prepared();
 }
 
 Status normalize(const Request& req, Normalized& out)
 {
     const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
-    const Status admitted = validate_source(req);
+    const Status admitted = validate_output(req, d.rows, d.cols);
     if (!admitted.ok()) return admitted;
     const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
     if (s.type != d.type || s.channels != d.channels)

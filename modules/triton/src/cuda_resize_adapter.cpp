@@ -136,8 +136,16 @@ void rejectSamePointer(const cuda::GpuMat& src, OutputArray dst, const char* ope
     if (dst.kind() == _InputArray::CUDA_GPU_MAT)
     {
         const cuda::GpuMat before = dst.getGpuMat();
-        if (!before.empty() && before.cudaPtr() == src.cudaPtr())
-            CV_Error(Error::StsBadArg, cv::format("cv::triton::%s: in-place operation is not supported", operation));
+        if (!before.empty())
+        {
+            checkCudaBuffer(before,"dst",true);
+            const auto first=reinterpret_cast<std::uintptr_t>(src.cudaPtr());
+            const auto second=reinterpret_cast<std::uintptr_t>(before.cudaPtr());
+            const auto srcEnd=first+(src.rows-1)*src.step+src.cols*src.elemSize();
+            const auto dstEnd=second+(before.rows-1)*before.step+before.cols*before.elemSize();
+            if (first<dstEnd && second<srcEnd)
+                CV_Error(Error::StsBadArg,cv::format("cv::triton::%s: overlapping images are not supported",operation));
+        }
     }
 }
 

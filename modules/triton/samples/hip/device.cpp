@@ -32,20 +32,21 @@ int main(int argc, char** argv)
     try
     {
         const std::string op = argc > 1 ? argv[1] : "resize";
-        if (op != "resize" && op != "warp")
-            throw std::runtime_error("usage: example_triton_device [resize|warp]");
+        if (op != "resize" && op != "warp" && op != "cvtcolor")
+            throw std::runtime_error("usage: example_triton_device [resize|warp|cvtcolor]");
         if (!cv::triton::haveDevice(0)) throw std::runtime_error("no usable HIP device");
         checked(hipStreamCreate(&stream));
         const int rows=96, cols=128;
-        cv::Mat host(rows,cols,CV_8UC1);
+        cv::Mat host(rows,cols,op == "cvtcolor" ? CV_8UC3 : CV_8UC1);
         for (int y=0;y<rows;++y)
-            for (int x=0;x<cols;++x) host.at<uchar>(y,x)=static_cast<uchar>((x*3+y*7)%256);
+            for (int x=0;x<cols;++x) for (int c=0;c<host.channels();++c)
+                host.ptr<uchar>(y)[x*host.channels()+c]=static_cast<uchar>((x*3+y*7+c*59)%256);
         const cv::Size size = op == "resize" ? cv::Size(63,47) : host.size();
-        Buffer input(host.total()), output(static_cast<std::size_t>(size.area()));
+        Buffer input(host.total()*host.elemSize()), output(static_cast<std::size_t>(size.area()));
         checked(hipMemcpyAsync(input.ptr,host.data,input.bytes,hipMemcpyHostToDevice,stream));
         cv::triton::DeviceImage src, dst;
         src.ptr=reinterpret_cast<std::uintptr_t>(input.ptr);
-        src.rows=rows; src.cols=cols; src.type=CV_8UC1; src.step=cols;
+        src.rows=rows; src.cols=cols; src.type=host.type(); src.step=host.step;
         dst.ptr=reinterpret_cast<std::uintptr_t>(output.ptr);
         dst.rows=size.height; dst.cols=size.width; dst.type=CV_8UC1; dst.step=size.width;
         cv::Mat reference;
@@ -53,6 +54,11 @@ int main(int argc, char** argv)
         {
             cv::triton::resizeDevice(src,dst,size,cv::INTER_AREA,0,reinterpret_cast<std::uintptr_t>(stream));
             cv::resize(host,reference,size,0,0,cv::INTER_AREA);
+        }
+        else if (op == "cvtcolor")
+        {
+            cv::triton::cvtColorDevice(src,dst,cv::COLOR_BGR2GRAY,0,reinterpret_cast<std::uintptr_t>(stream));
+            cv::cvtColor(host,reference,cv::COLOR_BGR2GRAY);
         }
         else
         {

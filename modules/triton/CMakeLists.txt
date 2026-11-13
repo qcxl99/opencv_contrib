@@ -169,7 +169,7 @@ else()
   target_include_directories(${the_module} SYSTEM PRIVATE "${TRITON_HIP_INCLUDE_DIR}")
   ocv_target_link_libraries(${the_module} LINK_PRIVATE "${TRITON_HIP_LIBRARY}" ${CMAKE_DL_LIBS})
   ocv_target_compile_definitions(${the_module} PRIVATE
-    __HIP_PLATFORM_AMD__=1
+    __HIP_PLATFORM_AMD__=1 OPENCV_TRITON_HAVE_HIP_ADAPTER=1
     OPENCV_TRITON_ROCM_PATH_DEFAULT="${_triton_rocm}")
   message(STATUS "triton: hip ${TRITON_HIP_INCLUDE_DIR}, ${TRITON_HIP_LIBRARY}, ROCM_PATH default ${_triton_rocm}")
 
@@ -269,10 +269,29 @@ if(_triton_backend STREQUAL "cuda")
     endif()
   endforeach()
 else()
-  # test/, perf/ and samples/ are written against cuda::GpuMat / cuda::Stream and the CUDA driver
-  # API, so they are not built here. The hip backend's accuracy test drives the device entries
-  # (opencv2/triton/device.hpp) on real hip buffers, against the same portable oracle and the
-  # same contract bounds (test/test_helpers.hpp owns them; the test reads them from there).
+  # Standard common accuracy/perf sources use the HIP implementation of the
+  # private validation boundary. Legacy driver-specific checks remain separate.
+  ocv_add_accuracy_tests(FILES "Src"
+      "${CMAKE_CURRENT_LIST_DIR}/test/test_main.cpp"
+      "${CMAKE_CURRENT_LIST_DIR}/test/test_common.cpp"
+      "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp")
+  file(GLOB _triton_common_perf_sources "${CMAKE_CURRENT_LIST_DIR}/perf/*.cpp"
+                                      "${CMAKE_CURRENT_LIST_DIR}/perf/*.hpp")
+  ocv_add_perf_tests(FILES "Src" ${_triton_common_perf_sources})
+  foreach(_target opencv_test_triton opencv_perf_triton)
+    if(TARGET ${_target})
+      target_sources(${_target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/validation/device_hip.cpp")
+      # Perf also compares against the independently compiled portable oracle.
+      if(_target STREQUAL "opencv_perf_triton")
+        target_sources(${_target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp")
+      endif()
+      target_include_directories(${_target} SYSTEM PRIVATE "${TRITON_HIP_INCLUDE_DIR}")
+      target_compile_definitions(${_target} PRIVATE __HIP_PLATFORM_AMD__=1)
+      target_compile_options(${_target} PRIVATE -ffp-contract=off)
+      target_link_libraries(${_target} PRIVATE "${TRITON_HIP_LIBRARY}")
+    endif()
+  endforeach()
+  # HIP sample and backend-specific lifecycle/refusal groups supplement the common tests.
   if(BUILD_EXAMPLES)
     add_executable(example_triton_device "${CMAKE_CURRENT_LIST_DIR}/samples/hip/device.cpp")
     ocv_target_include_modules(example_triton_device opencv_core opencv_imgproc ${the_module})
@@ -281,8 +300,8 @@ else()
     target_link_libraries(example_triton_device PRIVATE opencv_core opencv_imgproc ${the_module} "${TRITON_HIP_LIBRARY}")
     set_target_properties(example_triton_device PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
   endif()
-  option(TRITON_BUILD_HIP_TEST "Build opencv_test_triton_hip, the hip backend's accuracy test" ON)
-  if(TRITON_BUILD_HIP_TEST)
+  option(TRITON_BUILD_HIP_TEST "Build backend-specific HIP lifecycle tests" ${BUILD_TESTS})
+  if(BUILD_TESTS AND TRITON_BUILD_HIP_TEST)
     set(_t opencv_test_triton_hip)
     add_executable(${_t} "${CMAKE_CURRENT_LIST_DIR}/test/hip/test_hip.cpp" "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp")
     ocv_target_include_modules(${_t} opencv_core opencv_imgproc ${the_module})

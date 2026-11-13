@@ -196,9 +196,13 @@ that returns has submitted the computation.
 How a call runs
 ---------------
 
-1. The matrix is converted to `double` and inverted by `cv::warpAffine`'s
-   closed form unless `WARP_INVERSE_MAP` is set; the request is validated
-   (types, steps, int32 index range, overlap).
+1. Shared entry resolution validates source depth/channels, flags, matrix and
+   border options before output allocation. It resolves the requested destination
+   size and checks its sampling expressions through a pure output-admission API;
+   this step performs no device work or CPU arithmetic calibration. The matrix is
+   inverted with the CPU closed form unless `WARP_INVERSE_MAP` is set. After
+   allocation, the planner validates the actual destination type, pitch, allocation
+   span, overlap and context, and identifies the linked CPU arithmetic path.
 2. The compiled kernel for the request's compile key (kernel, signature
    dtypes, the constexprs, launch options, target, Triton version, kernel
    source hash) is taken from an in-process cache, else from the on-disk cache
@@ -216,7 +220,8 @@ How a call runs
 
 The vendored kernels include the current `FUSED` constexpr for both mapped
 coordinates and interpolation accumulation. The native planner observes the
-linked OpenCV CPU vector path at rounding-sensitive coordinates once, instead
+linked OpenCV CPU vector path at rounding-sensitive coordinates for each
+dtype, channel count and `cv::useOptimized()` state, instead
 of inferring that path solely from CPU hardware features. A reference outside
 both supported arithmetic forms is refused. The selected value participates
 in the compile key, so fused and split binaries cannot alias in the cache.
@@ -225,7 +230,13 @@ normalized interpolation mode; matrices and border values remain runtime inputs.
 
 Integer border components are rounded and saturated to the destination depth;
 floating components keep their precision. Unknown flags, nonfinite matrix entries and sampling matrices outside finite
-float32 range are refused before device work. HIP uses measured launch shapes with
+float32 range are refused before device work. Finite matrix entries alone do
+not guarantee representable coordinates: the planner bounds the absolute affine
+terms over the destination rectangle, rejects float32 intermediate overflow, and
+requires NEAREST/LINEAR/AREA coordinates to fit the safe int32 sampling domain.
+This conservative bound can reject maps whose large terms cancel. CUBIC clamps
+finite float32 coordinates before int32 conversion. Float32 border components
+must also fit finite float32. HIP uses measured launch shapes with
 small/narrow-image and C3 NEAREST fallback conditions. CUDA uses `1×256` tiles
 for NEAREST and `2×64` for LINEAR/CUBIC (including the AREA alias). These are
 tuning choices, not changes to interpolation meaning.

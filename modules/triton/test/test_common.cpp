@@ -64,7 +64,13 @@ static void checkCvt(const cvt_cases::CvtCase& c, uint64 seed, device::Stream& s
 {
     const Size size(34, c.yuv420 ? 24 : 17);
     const int type = CV_MAKETYPE(c.depth, c.scn);
-    const Mat host = randomImage(size, type, seed);
+    Mat host = randomImage(size, type, seed);
+    if (c.depth == CV_32F)
+        for (int y = 0; y < host.rows; ++y)
+            for (int x = 0; x < host.cols; ++x)
+                if ((x + y) % 3 == 0)
+                    for (int channel = 0; channel < c.scn; ++channel)
+                        host.ptr<float>(y)[x * c.scn + channel] *= 32767.5f;
     const Mat reference = cpuCvt(host, c.code);
     Mat parent(size + Size(12, 7), type, Scalar::all(17));
     host.copyTo(parent(Rect(Point(2, 1), size)));
@@ -80,29 +86,27 @@ static void checkCvt(const cvt_cases::CvtCase& c, uint64 seed, device::Stream& s
     ASSERT_EQ(address, dst.address());
     const Mat got = dst.download();
     ASSERT_EQ(reference.size(), got.size()); ASSERT_EQ(reference.type(), got.type());
-    if (c.depth != CV_32F) EXPECT_EQ(0, cv::norm(got, reference, NORM_INF));
-    else
-    {
-        const bool arithmetic = c.code == COLOR_BGR2GRAY || c.code == COLOR_RGB2GRAY ||
-            c.code == COLOR_BGRA2GRAY || c.code == COLOR_RGBA2GRAY ||
-            (c.code >= COLOR_BGR2YCrCb && c.code <= COLOR_YCrCb2RGB) ||
-            (c.code >= COLOR_BGR2YUV && c.code <= COLOR_YUV2RGB);
-        if (!arithmetic) EXPECT_EQ(0, cv::norm(got, reference, NORM_INF));
-        else for (int y = 0; y < got.rows; ++y)
-            for (int x = 0; x < got.cols; ++x)
-            {
-                double inputScale = 0;
-                for (int channel = 0; channel < c.scn; ++channel)
-                    inputScale = std::max(inputScale, std::abs(double(host.ptr<float>(y)[x * c.scn + channel])));
-                for (int channel = 0; channel < c.dcn; ++channel)
-                {
-                    const double ref = reference.ptr<float>(y)[x * c.dcn + channel];
-                    EXPECT_LE(std::abs(double(got.ptr<float>(y)[x * c.dcn + channel]) - ref),
-                              cvtF32Tolerance(ref, inputScale));
-                }
-            }
-    }
+    EXPECT_TRUE(meetsCvtContract(got, reference, host, cvt_cases::floatArithmetic(c.code)));
     EXPECT_TRUE(guardsEqual(initial, target.download(), outputRect));
+}
+
+TEST(Triton_Common, CvtColorCriterionUsesLocalPixelScale)
+{
+    Mat input(1, 2, CV_32FC3, Scalar::all(0));
+    input.at<Vec3f>(0, 1) = Vec3f(65535.f, 1.f, -65535.f);
+    Mat reference(1, 2, CV_32FC1, Scalar::all(0));
+    Mat got = reference.clone();
+    got.at<float>(0, 1) = 0.02f;
+    EXPECT_TRUE(meetsCvtContract(got, reference, input, true));
+    // The neighbouring large pixel must not lend its tolerance to this one.
+    got.at<float>(0, 0) = 0.001f;
+    EXPECT_FALSE(meetsCvtContract(got, reference, input, true));
+    EXPECT_FALSE(meetsCvtContract(got, reference, input, false));
+    got = reference.clone(); got.at<float>(0, 0) = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(meetsCvtContract(got, reference, input, true));
+    Mat exact(1, 2, CV_16UC1, Scalar::all(65535));
+    Mat changed = exact.clone(); changed.at<ushort>(0, 0) = 65534;
+    EXPECT_FALSE(meetsCvtContract(changed, exact, exact, false));
 }
 
 TEST(Triton_Common, CvtColorAllDeclaredCodesAndDepths)
@@ -203,6 +207,36 @@ TEST(Triton_Common, RejectionsPreserveExistingOutput)
     stream.wait();
     EXPECT_TRUE(meetsContract(dst.download(), oracle(host, Size(16, 12), 0, 0, INTER_LINEAR), INTER_LINEAR));
 
+}
+
+TEST(Triton_Common, InvalidDepthAndOffsetOverlapPreserveOutput)
+{
+    requireDevice(); device::Stream stream;
+    const Mat identity=Mat::eye(2,3,CV_64F);
+    const Mat initial(7,9,CV_8UC1,Scalar(63));
+    device::Image output;output.upload(initial);
+    const auto address=output.address();
+    for (int depth : {CV_16S,CV_64F})
+    {
+        device::Image source;source.upload(Mat(24,32,CV_MAKETYPE(depth,3),Scalar::all(11)));
+        EXPECT_THROW(device::resize(source,output,Size(16,12),0,0,INTER_LINEAR,stream),cv::Exception);
+        EXPECT_THROW(device::cvtColor(source,output,COLOR_BGR2GRAY,stream),cv::Exception);
+        EXPECT_THROW(device::warpAffine(source,output,identity,Size(16,12),INTER_LINEAR,
+                                       BORDER_REPLICATE,Scalar(),stream),cv::Exception);
+        EXPECT_EQ(address,output.address());EXPECT_EQ(0,cv::norm(initial,output.download(),NORM_INF));
+    }
+    const Mat parent(32,48,CV_8UC3,Scalar(11,23,47));
+    device::Image storage;storage.upload(parent);
+    device::Image source(storage,Rect(1,1,32,24)), overlapping(storage,Rect(2,2,16,12));
+    const auto overlapAddress=overlapping.address();
+    const Mat overlapInitial=overlapping.download();
+    EXPECT_THROW(device::resize(source,overlapping,Size(15,11),0,0,INTER_LINEAR,stream),cv::Exception);
+    EXPECT_THROW(device::cvtColor(source,overlapping,COLOR_BGR2GRAY,stream),cv::Exception);
+    EXPECT_THROW(device::warpAffine(source,overlapping,identity,Size(15,11),INTER_LINEAR,
+                                   BORDER_REPLICATE,Scalar(),stream),cv::Exception);
+    EXPECT_EQ(overlapAddress,overlapping.address());
+    EXPECT_EQ(0,cv::norm(overlapInitial,overlapping.download(),NORM_INF));
+    EXPECT_EQ(0,cv::norm(parent,storage.download(),NORM_INF));
 }
 
 TEST(Triton_Common, ThreeOperatorPipelineOnCallerStream)

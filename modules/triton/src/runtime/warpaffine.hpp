@@ -73,7 +73,11 @@ struct Normalized {
 // Source/options admission before dst allocation; no device work or reference calibration.
 kf_resize_rt::Status validate_source(const Request& req);
 
-// Pure checks. Fills every field of `out` including the sampling matrix and the block shape.
+// Pure output-dependent admission before allocation. Dimensions are rows then columns.
+// Reuses source rules and rejects unrepresentable sampling expressions; no CPU calibration.
+kf_resize_rt::Status validate_output(const Request& req, int dst_h, int dst_w);
+
+// Validation, then a cached linked-CPU arithmetic probe (no GPU). Fills every field of out.
 kf_resize_rt::Status normalize(const Request& req, Normalized& out);
 
 // The closed-form 2x3 inverse cv::warpAffine uses (D = m0*m4 - m1*m3; D = D != 0 ? 1/D : 0).

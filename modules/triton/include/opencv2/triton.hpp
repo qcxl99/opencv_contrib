@@ -163,8 +163,12 @@ CV_EXPORTS void cvtColor(InputArray src, OutputArray dst, int code,
  * As with `resize`, the `InputArray` overload above is C++-only because the bindings
  * generator only adds a GpuMat variant for functions in `cv::cuda`.
  */
-CV_EXPORTS_W void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, int code,
-                           cuda::Stream& stream = cuda::Stream::Null());
+CV_EXPORTS void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, int code,
+                         cuda::Stream& stream = cuda::Stream::Null());
+
+/** @internal Nullable Python stream bridge; HIP raises inside the wrapped call. */
+CV_EXPORTS_AS(cvtColor) void cvtColorForPython(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
+                                             int code, Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
 
 /** @brief Apply an affine transformation to an image using a Triton-generated kernel.
  *

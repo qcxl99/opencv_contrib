@@ -11,6 +11,7 @@
 #include "test_helpers.hpp"
 #include "../validation/resize_cases.hpp"
 #include <climits>
+#include <limits>
 #include <thread>
 
 namespace opencv_test { namespace {
@@ -141,6 +142,33 @@ TEST(Triton_Resize, RejectsWithoutFallback)
     parent.setTo(Scalar::all(0));
     cuda::GpuMat s0 = parent(Rect(0, 0, 32, 32)), d0 = parent(Rect(16, 16, 16, 16));
     EXPECT_EQ(Error::StsBadArg, code([&] { cv::triton::resize(s0, d0, Size(16, 16)); }));
+}
+
+TEST(Triton_Resize, ScaleAndInterpolationValidationPrecedesOutputAllocation)
+{
+    if (!ready()) throw SkipTestException("no Triton backend");
+    const Mat host = randomImage(Size(12, 8), CV_8UC3, 901);
+    cuda::GpuMat src(host), dst;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    const td::RuntimeStats before = td::runtimeStats();
+    for (double fx : {nan, inf, -inf, 1e300})
+    {
+        EXPECT_THROW(cv::triton::resize(src, dst, Size(), fx, 0.5), cv::Exception);
+        EXPECT_TRUE(dst.empty()) << "invalid scale allocated dst";
+    }
+    for (int mode : {-1, INTER_LINEAR | WARP_INVERSE_MAP, int(INTER_NEAREST_EXACT), int(INTER_LINEAR_EXACT)})
+    {
+        EXPECT_THROW(cv::triton::resize(src, dst, Size(6, 4), 0, 0, mode), cv::Exception);
+        EXPECT_TRUE(dst.empty()) << "invalid interpolation allocated dst";
+    }
+    EXPECT_EQ(before.launches, td::runtimeStats().launches);
+    EXPECT_EQ(before.copies, td::runtimeStats().copies);
+    // Explicit dsize ignores fx/fy, including their finiteness.
+    cv::triton::resize(src, dst, Size(6, 4), nan, inf, INTER_LINEAR);
+    Mat got;
+    dst.download(got);
+    EXPECT_TRUE(meetsContract(got, oracle(host, Size(6, 4), 0, 0, INTER_LINEAR), INTER_LINEAR));
 }
 
 

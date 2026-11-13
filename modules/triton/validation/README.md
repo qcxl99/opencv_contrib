@@ -29,6 +29,22 @@ then re-read and validate the destination before submission. Runtime still owns
 JIT caches and internal resources. UMat/non-CPU HAL can supply a future adapter;
 no new public memory manager or upstream registration ABI is prescribed here.
 
-Only the CUDA support implementation is supplied/validated in this checkout.
-The merged HIP code has a separate public device-buffer entry and remains
-an independent port/acceptance task; no HIP runtime is replaced by a CUDA stub.
+CMake selects device_cuda.cpp for CUDA and device_hip.cpp for HIP. HIP calls
+public device-buffer entries, including a scale-aware resize overload that
+preserves the original fx/fy values. Both implementations share cases and
+reference/criteria owners. validation/numerics.hpp is also reused by the
+backend-specific HIP lifecycle groups. No validation header is installed.
+
+The HIP adapter preserves parent allocation lifetime in ROI views and enqueues
+event dependencies for waitFor. Setup/result transfers are synchronous. Standard
+accuracy and perf targets obey BUILD_TESTS/BUILD_PERF_TESTS; CUDA-only lifecycle
+sources and native CUDA baselines are excluded on HIP. The separate
+opencv_test_triton_hip exposes five registered group tests: list, positive and
+negative glob filters and XML refer to those groups; inner checks are recorded
+separately, not presented as independently registered gtests.
+
+On DTK, HIP_POINTER_ATTRIBUTE_CONTEXT is unsupported. The production device
+entry checks actual allocation device/range and obtains active context/generation
+and stream context through supported queries. This is not evidence that arbitrary
+foreign driver-context allocation ownership can be identified on DTK.
+Acceptance remains backend-specific; H20 evidence does not qualify BW1000.

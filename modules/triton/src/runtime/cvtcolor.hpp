@@ -106,7 +106,8 @@ struct Normalized {
     bool f32 = false;
 };
 
-// Metadata/admission used by every adapter before output allocation. No device access.
+// Source admission used by every adapter before output allocation. A real source
+// view (pointer, shape, byte step and optional allocation span) is required; no device access.
 struct Output { const CodeSpec* spec = nullptr; int rows = 0, cols = 0; };
 kf_resize_rt::Status resolve_output(const kf_resize_rt::DeviceView& src, int code, Output& out);
 

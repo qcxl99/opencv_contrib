@@ -213,22 +213,24 @@ helper's compiler finds its device libraries through it.
 OpenCV has no `cv::cuda` on such a build, so the `GpuMat` entries raise
 `StsNotImplemented`. Use the device-buffer entries in `opencv2/triton/device.hpp`
 (`resizeDevice`, `cvtColorDevice`, `warpAffineDevice`): same validation, same runtime, same
-results, with your own device buffers and a `hipStream_t`. The accuracy test is
-`opencv_test_triton_hip` (`test/hip/`), against the same references and bounds as `test/`;
-`test/`, `perf/` and `samples/` are `GpuMat`-based and are built on CUDA only.
+results, with your own device buffers and a `hipStream_t`. Standard
+`opencv_test_triton` and `opencv_perf_triton` use the common cases/references via
+the HIP validation adapter. `opencv_test_triton_hip` adds HIP lifecycle/refusal
+groups. CUDA-specific legacy tests and GpuMat samples remain CUDA-only; the HIP
+sample is selected from `samples/hip/`.
 
 ### HIP examples and Python boundary
 
-With `BUILD_EXAMPLES=ON`, `example_triton_device resize` and
-`example_triton_device warp` demonstrate caller-owned HIP buffers, an explicit
-stream, synchronization and a CPU comparison; neither needs Torch.
+With `BUILD_EXAMPLES=ON`, `example_triton_device resize`,
+`example_triton_device warp` and `example_triton_device cvtcolor` demonstrate
+caller-owned HIP buffers, an explicit stream, synchronization and a CPU
+comparison. These examples require no Torch dependency.
 
 The Python module can be built and imported on HIP, and its backend queries
-work. Its `resize` and `warpAffine` GpuMat adapters raise a catchable
-`StsNotImplemented`; HIP numerical calls currently use the C++ device-buffer
-entries. This change does not extend or modify cvtColor. The existing Python
-cvtColor GpuMat adapter is outside this change and must not be advertised as a
-HIP numerical entry.
+work. Its resize, cvtColor and warpAffine GpuMat adapters share a nullable-stream
+bridge: omitting the stream or passing None raises a catchable
+`StsNotImplemented`. HIP numerical calls currently use the C++ device-buffer
+entries; numerical Python GpuMat adapters remain unsupported.
 
 ## Using it
 
@@ -290,12 +292,18 @@ built by `-DBUILD_EXAMPLES=ON` and need a Triton backend at run time:
 
 ## Further reading
 
+- [Module maintenance](doc/maintenance.markdown) — source ownership, local generation,
+  shared validation and evidence boundaries
+- [BW1000 first use](doc/bw1000-first-use.markdown) — HIP build, tests, perf and deployment
+
 - [H20 first use](doc/h20-first-use.markdown) — standard source build/install,
   C++ and Python use, native tests and deployment checks on Ubuntu/H20
 - [resize guide](doc/resize.markdown) — resize in depth: dependencies, the JIT
   and its cache, the numerical contract, streams, limitations and troubleshooting.
   Everything except the resize-specific sections applies to `cvtColor` and
   `warpAffine` as well
+- [cvtColor guide](doc/cvtcolor.markdown) — depth-specific conversions, video layouts,
+  numerical bounds and HIP/Python boundaries
 - [warpAffine guide](doc/warpaffine.markdown) — which CPU path is the reference and
   why that question exists, the tolerance formulas, and the compatibility cost
 - [API reference](include/opencv2/triton.hpp)
@@ -313,8 +321,10 @@ built by `-DBUILD_EXAMPLES=ON` and need a Triton backend at run time:
 
 Proposed for opencv_contrib; not yet merged. The public API and build switches
 are part of the proposal and may change during review. The HIP backend has scoped verification on one
-platform (Hygon BW1000, gfx936, DTK 26.04, flagtree 3.6.0); its routes are the CUDA backend's
-(all four resize modes, and all three warpAffine modes).
+platform (Hygon BW1000, gfx936, DTK 26.04, flagtree 3.6.0); its C++ device-buffer routes include four resize modes, the documented
+warpAffine modes/borders, and all 124 cvtColor code/depth pairs. Validation
+support selects real CUDA or HIP public APIs and shares cases and numerical
+criteria; results remain specific to each backend.
 
 ## Backend integration boundary
 
@@ -326,7 +336,29 @@ cache identities and numerical contracts are unchanged by this refactoring.
 Tests and Triton candidate perf cases use private backend support described in
 [validation/README.md](validation/README.md). Existing CUDA-specific compatibility
 and lifecycle tests remain. This supplies a reuse boundary for other platforms;
-it does not claim a unified public DeviceMat/Stream API or HIP acceptance.
+it does not claim a unified public DeviceMat/Stream API or transfer H20 acceptance to HIP.
 Future UMat/non-CPU HAL integration would provide another thin adapter after
 OpenCV finalizes its extension interfaces. This module does not modify or
 intercept standard `cv::*` calls; unsupported inputs raise rather than fall back.
+
+
+### HIP validation and scale semantics
+
+The HIP backend builds standard `opencv_test_triton` common accuracy tests with
+`BUILD_TESTS=ON` and standard `opencv_perf_triton` candidate perf rows with
+`BUILD_PERF_TESTS=ON`. CUDA-specific tests/baselines are not compiled into those
+HIP targets. `opencv_test_triton_hip` supplements them with five registered
+backend lifecycle/refusal groups; its XML records inner-check counts separately.
+All three HIP examples use `example_triton_device [resize|warp|cvtcolor]`.
+
+The existing six-argument `resizeDevice` requires explicit dsize. Its scale-aware
+overload additionally takes fx/fy before interpolation; when dsize is empty the
+original scales reach the calculation unchanged. An explicit dsize takes
+precedence. The caller preallocates dst to the resolved size; the API does not
+allocate, copy to contiguous storage, change streams or synchronize implicitly.
+This adds parameter parity, not a public memory-management layer.
+
+The HIP SDK verifies allocation device/range plus active context generation and
+stream context. DTK does not expose allocation context through
+HIP_POINTER_ATTRIBUTE_CONTEXT, so arbitrary foreign driver-context allocation
+ownership is not an advertised verified capability.
