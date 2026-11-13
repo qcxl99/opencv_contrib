@@ -39,7 +39,7 @@ struct Request {
     kf_resize_rt::DeviceView src, dst;
     // The 2x3 matrix as cv::warpAffine takes it (row-major, 6 doubles).
     double M[6] = {1, 0, 0, 0, 1, 0};
-    int interpolation = 1;     // cv::INTER_LINEAR
+    int interpolation = 1;     // cv::INTER_LINEAR; cv::INTER_AREA normalizes to Linear
     int border_mode = 0;       // cv::BORDER_CONSTANT
     // The border value is a Scalar: up to four components, one per channel. A scalar v means
     // Scalar(v, 0, 0, 0), a sequence means its components zero-padded to four. It stays a
@@ -58,7 +58,8 @@ struct Normalized {
     // inverse cv::warpAffine computes in double.
     double A[6] = {1, 0, 0, 0, 1, 0};
     // Border codes per axis. A 1-pixel axis is sampled with REPLICATE whatever the requested
-    // mode (cv::warpAffine's border_type_x/y), unless the mode is CONSTANT.
+    // mode (cv::warpAffine's border_type_x/y), unless the mode is CONSTANT or TRANSPARENT.
+    // Code 5 is TRANSPARENT; it selects a separate constexpr and requires initialized dst.
     int border_mode_code = 0, border_x = 0, border_y = 0;
     double border[4] = {0, 0, 0, 0};
     int block_h = 1, block_w = 128, num_warps = 4;

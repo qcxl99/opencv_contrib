@@ -287,8 +287,9 @@ void warpAffine(InputArray _src, OutputArray _dst, InputArray _M, Size dsize, in
     cuda::GpuMat src = _src.getGpuMat();
     checkCudaArguments(src, _dst, stream);
 
-    // INTER_AREA is accepted because cv::warpAffine rewrites it to INTER_LINEAR before doing
-    // anything else, and the runtime follows that rewrite (see warpaffine.cpp normalize()).
+    if (flags & ~(INTER_MAX | WARP_INVERSE_MAP))
+        CV_Error(Error::StsUnsupportedFormat,"cv::triton::warpAffine: unsupported flags");
+    // INTER_AREA follows the CPU's rewrite to INTER_LINEAR in normalize().
     const int interpolation = flags & INTER_MAX;
     if (interpolation != INTER_NEAREST && interpolation != INTER_LINEAR &&
         interpolation != INTER_CUBIC && interpolation != INTER_AREA)
@@ -298,6 +299,9 @@ void warpAffine(InputArray _src, OutputArray _dst, InputArray _M, Size dsize, in
                             "INTER_CUBIC and INTER_AREA); INTER_LANCZOS4 is refused, not "
                             "approximated",
                             interpolation));
+    if (interpolation == INTER_CUBIC && borderMode == BORDER_TRANSPARENT)
+        CV_Error(Error::StsUnsupportedFormat,
+                 "cv::triton::warpAffine: BORDER_TRANSPARENT with INTER_CUBIC is not served");
     {
         const int depth = src.depth();
         if (depth != CV_8U && depth != CV_16U && depth != CV_32F)

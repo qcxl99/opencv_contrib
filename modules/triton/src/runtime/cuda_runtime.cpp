@@ -855,7 +855,7 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
         Status u;
         u.code = Code::Unsupported;
         u.reason = Reason::RouteNotEnabled;
-        u.message = std::string("route ") + ref::route_name(n.route.kind) + " is not served by this build (P1: copy, nearest, linear, area_fast)";
+        u.message = std::string("route ") + ref::route_name(n.route.kind) + " is not served by this build";
         return u;
     }
     const Config& c = config();
@@ -902,7 +902,7 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
     Toolchain tc;
     tc.compiler = c.compiler;
     tc.source_sha256 = c.source_sha256;
-    const LaunchShape shape = launch_shape(n, LaunchConfig{}, target, tc);
+    const LaunchShape shape = launch_shape(n, LaunchConfig{}, target, tc, 1, &req.src, &req.dst);
 
     std::shared_ptr<ModuleRes> mod = moduleFor(shape.key, ctx, gen, st, c.kernels);
     if (!mod) return st;
@@ -922,9 +922,10 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
     ptr("dst", req.dst.ptr);
     i32("src_h", n.src_h); i32("src_w", n.src_w); i32("dst_h", n.dst_h);
     i32("W", static_cast<long long>(n.dst_w) * n.channels);
+    i32("dst_w", n.dst_w);
     i32("src_rs", static_cast<long long>(req.src.step / es)); i32("dst_rs", static_cast<long long>(req.dst.step / es));
     i32("src_bs", 0); i32("dst_bs", 0);
-    if (n.route.kind == ref::ROUTE_NEAREST)
+    if (shape.key.kernel == "_resize_cpu_nearest_kernel")
     {
         ptr("xofs", tab->at("xofs")); ptr("yofs", tab->at("yofs"));
     }
@@ -1124,6 +1125,21 @@ Status warpAffine(const kf_warpaffine::Request& req, const ExecContext& ex)
     cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
     cuDeviceGetAttribute(&warp, CU_DEVICE_ATTRIBUTE_WARP_SIZE, dev);
 
+    // CUDA uses the upstream per-mode tiles: interpolation benefits from a
+    // shorter source-row span, while single-tap nearest keeps contiguous rows.
+    if (std::string(name()) == "cuda-jit") {
+        n.block_h = n.mode == kf_warpaffine::Mode::Nearest ? 1 : 2;
+        n.block_w = n.mode == kf_warpaffine::Mode::Nearest ? 256 : 64;
+    }
+    // HIP keeps its independently measured defaults.
+    if (std::string(name()) == "hip-jit" && n.dst_h >= 64 && n.dst_w >= 256 &&
+        static_cast<long long>(n.dst_h)*n.dst_w >= 65536 &&
+        !(n.channels == 3 && n.mode == kf_warpaffine::Mode::Nearest &&
+          static_cast<long long>(n.dst_h)*n.dst_w < (1<<22))) {
+        n.block_h = n.channels == 1 && n.mode != kf_warpaffine::Mode::Cubic ? 2 : 1;
+        n.block_w = n.block_h == 2 ? 128 : 256;
+        n.num_warps = 4;
+    }
     const kf_warpaffine::Mode wmode = n.mode;
     const char* wkernel = wmode == kf_warpaffine::Mode::Nearest ? "_warp_nearest"
                         : (wmode == kf_warpaffine::Mode::Linear ? "_warp_linear" : "_warp_cubic");
@@ -1152,14 +1168,9 @@ Status warpAffine(const kf_warpaffine::Request& req, const ExecContext& ex)
                       {"BORDER", n.border_mode_code},
                       {"BORDER_X", n.border_x},
                       {"BORDER_Y", n.border_y},
-                      // TRANSPARENT is a separate constexpr rather than folded into BORDER so the
-                      // kernels keep their existing border switch and only add the store mask.
+                      {"FUSED", n.fused ? 1 : 0},
                       {"TRANSPARENT", n.border_mode_code == 5 ? 1 : 0},
                       {"cn", n.channels}};
-    // All three kernels take FUSED. CUBIC's *coordinate* has no fma (that is what makes it
-    // width-invariant), but its bicubic weights and its accumulation are v_fma on the CPU, so
-    // it follows the same switch as the other two.
-    key.constexprs.push_back({"FUSED", n.fused ? 1 : 0});
     if (n.mode != kf_warpaffine::Mode::Nearest) {
         key.constexprs.push_back({"U8", n.u8 ? 1 : 0});
         key.constexprs.push_back({"U16", n.u16 ? 1 : 0});

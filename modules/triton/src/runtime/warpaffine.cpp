@@ -13,6 +13,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <limits>
 
 namespace kf_warpaffine {
 
@@ -129,13 +130,7 @@ Status normalize(const Request& req, Normalized& out)
 {
     const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
 
-    // INTER_AREA is not an approximation here: cv::warpAffine rewrites it to INTER_LINEAR before
-    // doing anything else (imgwarp.cpp, `if (interpolation == INTER_AREA) interpolation =
-    // INTER_LINEAR;`). Measured on the reference build: INTER_AREA and INTER_LINEAR produce
-    // byte-identical output for the same matrix and size. So the rewrite is followed rather than
-    // refused -- refusing it made the module reject a call the CPU accepts and answers exactly.
-    // INTER_LANCZOS4 stays refused: the CPU has no rewrite for it and its result is not the same
-    // computation.
+    // OpenCV's warpAffine rewrites AREA to LINEAR before selecting its kernel.
     const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
     if (interp != 0 && interp != 1 && interp != 2)
         return unsupported(Reason::Interpolation,
@@ -151,32 +146,19 @@ Status normalize(const Request& req, Normalized& out)
     if (req.border_mode == cv::BORDER_TRANSPARENT && req.interpolation == cv::INTER_CUBIC)
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: BORDER_TRANSPARENT with INTER_CUBIC is not "
-                           "served (its destination-fill blend is not reproduced); TRANSPARENT "
-                           "works with INTER_NEAREST, INTER_LINEAR and INTER_AREA");
+                           "served; TRANSPARENT works with INTER_NEAREST, INTER_LINEAR and INTER_AREA");
     if (!is_border(req.border_mode))
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: border mode " + std::to_string(req.border_mode) +
-                               " is not one of CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101");
+                               " is not one of CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT");
     if (s.type != d.type || s.channels != d.channels)
         return unsupported(Reason::TypeMismatch, "src and dst must have the same depth and channel count");
     if (s.type != kf_resize_rt::ElemType::U8 && s.type != kf_resize_rt::ElemType::U16 &&
         s.type != kf_resize_rt::ElemType::F32)
         return unsupported(Reason::DepthOrChannels,
                            "cv::triton::warpAffine: CV_8U, CV_16U and CV_32F only");
-    // 2-channel and CV_16S are legal cv::warpAffine inputs but are NOT served here yet, and the
-    // reason is measured rather than assumed: cv::warpAffine does not use one arithmetic for all
-    // types. genericWarp's getImgWarpFunc (imgwarp.cpp:70) returns non-null only for
-    // INTER_CUBIC, so NEAREST/LINEAR fall through to hal::warpAffine (imgwarp.cpp:2272), whose
-    // switches list C1/C3/C4 of 8U, 16U and 32F -- "// no default" after each. C2 and every CV_16S
-    // type therefore run the legacy fixed-point WarpAffineInvoker, not the float invoker this
-    // kernel reproduces. Measured: a CV_8UC2 warp differs from the same data warped as two
-    // CV_8UC1 planes by up to 6 levels, while CV_8UC3 matches the split-C1 control exactly (0).
-    // Serving them from the float model would be silently wrong, so they are refused by name.
     if (s.channels != 1 && s.channels != 3 && s.channels != 4)
-        return unsupported(Reason::DepthOrChannels,
-                           "cv::triton::warpAffine: channels must be 1, 3 or 4; 2-channel data is "
-                           "accepted by cv::warpAffine but runs its fixed-point path, which this "
-                           "module does not reproduce yet");
+        return unsupported(Reason::DepthOrChannels, "channels must be 1, 3 or 4");
     if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
     Status valid = kf_resize_rt::validate_view(s, "src");
     if (!valid.ok()) return valid;
@@ -201,36 +183,29 @@ Status normalize(const Request& req, Normalized& out)
     out.border_mode_code = req.border_mode;
     out.border_x = req.border_mode;
     out.border_y = req.border_mode;
-    if (req.border_mode != 0) {          // not BORDER_CONSTANT: a 1-pixel axis replicates
+    // A degenerate transparent axis must still detect missing taps and preserve
+    // their old destination contribution; it cannot become a replicate axis.
+    if (req.border_mode != cv::BORDER_CONSTANT && req.border_mode != cv::BORDER_TRANSPARENT) {
         if (out.src_w <= 1) out.border_x = 1;
         if (out.src_h <= 1) out.border_y = 1;
     }
-    for (int i = 0; i < 4; ++i) out.border[i] = req.border[i];
+    for (int i = 0; i < 6; ++i)
+        if (!std::isfinite(req.M[i])) return unsupported(Reason::IndexRange,"matrix entries must be finite");
+    for (int i = 0; i < 6; ++i)
+        if (!std::isfinite(out.A[i]) ||
+            std::abs(out.A[i]) > static_cast<double>(std::numeric_limits<float>::max()))
+            return unsupported(Reason::IndexRange,"sampling matrix exceeds finite float32 range");
+    for (int i = 0; i < 4; ++i) {
+        if (!std::isfinite(req.border[i])) return unsupported(Reason::IndexRange,"border components must be finite");
+        out.border[i] = (out.u8 || out.u16) ?
+            std::max(0.0,std::min(out.u8 ? 255.0 : 65535.0,std::nearbyint(req.border[i]))) : req.border[i];
+    }
 
     // One tile of output pixels per program, the same knob shape resize and cvtColor expose.
-    //
-    // The tile SHAPE measured faster for the interpolating modes on a rotating geometry, and the
-    // likely reason -- a hypothesis, the causal link was not profiled -- is that a rotation maps
-    // an output row onto a diagonal: over 128 lanes of one row the source row moves by about
-    // 0.44*128 ~= 56 rows, so one warp's request scatters across ~56 source rows. A 2x64 tile
-    // covers the same 128 pixels with half that vertical spread. The timings below are measured
-    // (one SM-90 device, same process, median of graph replays):
-    //
-    //   CUBIC  1920x1080 98.2 -> 84.9 us (1.16x), 3840x2160 399 -> 341 us (1.17x)
-    //   rotate 1920x1080 29.5 -> 26.9 us (1.10x), 3840x2160 114 -> 104 us (1.10x)
-    //   linear (identity map) unchanged at 26.0 / 103 us
-    //
-    // NEAREST measured the opposite preference: 1x256 gave 8.9/32.1 us against 10.9/45.5 for
-    // 1x128 (1.23x at 1080p, 1.42x at 4K), and using the interpolation shape there cost 8%.
-    // One reading consistent with both results is the tap count -- 1 tap rather than 16 -- but
-    // that is an interpretation, not something this measurement separates from other causes.
-    if (out.mode == Mode::Nearest) {
-        out.block_h = 1;
-        out.block_w = 256;
-    } else {
-        out.block_h = 2;
-        out.block_w = 64;
-    }
+    // BLOCK_W 128 with BLOCK_H 1 measured best on the qualification set
+    // (runs/warpaffine-0001); the search can still override it through LaunchConfig.
+    out.block_h = 1;
+    out.block_w = 128;
     out.num_warps = 4;
 
     const int depth = out.u8 ? CV_8U : (out.u16 ? CV_16U : CV_32F);
@@ -266,13 +241,13 @@ std::string constexprs_text(const Normalized& n)
     std::ostringstream o;
     o << "BLOCK_H=" << n.block_h << ",BLOCK_W=" << n.block_w << ",BORDER=" << n.border_mode_code
       << ",BORDER_X=" << n.border_x
-      << ",BORDER_Y=" << n.border_y;
+      << ",BORDER_Y=" << n.border_y << ",FUSED=" << (n.fused ? 1 : 0)
+      << ",TRANSPARENT=" << (n.border_mode_code == cv::BORDER_TRANSPARENT ? 1 : 0);
     // U8/U16 exist only on the kernels that convert their loads (LINEAR, CUBIC); the NEAREST
     // kernel copies the element unchanged, so its dtype is carried by the pointer type alone
     // and declaring an unused constexpr would make the compile helper's key check fail.
     if (n.mode != Mode::Nearest)
         o << ",U8=" << (n.u8 ? 1 : 0) << ",U16=" << (n.u16 ? 1 : 0);
-    o << ",FUSED=" << (n.fused ? 1 : 0);
     o << ",cn=" << n.channels;
     return o.str();
 }

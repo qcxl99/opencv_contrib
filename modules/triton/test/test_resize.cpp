@@ -25,6 +25,8 @@ struct RouteCase
 };
 
 const RouteCase kCases[] = {
+    {Size(97,61),Size(131,53),0,0,INTER_CUBIC,"cubic"},
+    {Size(100,80),Size(37,29),0,0,INTER_AREA,"area"},
     // copy: identity, whatever the mode
     {Size(97, 53), Size(97, 53), 0, 0, INTER_NEAREST, "copy"},
     {Size(97, 53), Size(97, 53), 0, 0, INTER_LINEAR, "copy"},
@@ -207,7 +209,8 @@ TEST(Triton_Boundary, RejectsInvalidAllocationAndStrideBeforeLaunch)
     cuda::GpuMat tooLarge(128, 128, CV_8UC1, allocation.cudaPtr(), 128);
     cuda::GpuMat hugeStride(2, 8, CV_8UC1, allocation.cudaPtr(), static_cast<size_t>(INT_MAX));
     cuda::GpuMat out;
-    const Mat M = (Mat_<double>(2,3) << 1,0,0,0,1,0);
+    const double matrix[6] = {1, 0, 0, 0, 1, 0};
+    const Mat M(2, 3, CV_64F, const_cast<double*>(matrix));
     cuda::GpuMat unaligned(2,4,CV_32FC1,static_cast<unsigned char*>(allocation.cudaPtr())+1,32);
     for (const cuda::GpuMat* bad : {&tooLarge, &hugeStride, &unaligned})
     {
@@ -224,7 +227,8 @@ TEST(Triton_Boundary, RejectsForeignBuffersAndStreamsBeforeAllocation)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
     if (cuda::getCudaEnabledDeviceCount() < 2) throw SkipTestException("two devices required for actual context rejection");
-    const Mat M = (Mat_<double>(2,3) << 1,0,0,0,1,0);
+    const double matrix[6] = {1, 0, 0, 0, 1, 0};
+    const Mat M(2, 3, CV_64F, const_cast<double*>(matrix));
     cuda::setDevice(0);
     cuda::GpuMat local(16, 16, CV_8UC3), result;
     cuda::Stream localStream;
@@ -256,7 +260,8 @@ TEST(Triton_Boundary, RejectsForeignBuffersAndStreamsBeforeAllocation)
 TEST(Triton_Boundary, ExplicitProducerConsumerAndSustainedReuse)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
-    const Mat M = (Mat_<double>(2,3) << 1,0,0,0,1,0);
+    const double matrix[6] = {1, 0, 0, 0, 1, 0};
+    const Mat M(2, 3, CV_64F, const_cast<double*>(matrix));
     cuda::Stream producer, target, consumer;
     cuda::Event uploaded, completed;
     cuda::GpuMat src, resized, gray, warped;
@@ -297,7 +302,8 @@ TEST(Triton_Boundary, BorrowedBufferOnFreshHostThread)
             cuda::GpuMat small,gray,warped;
             cv::triton::resize(src,small,Size(24,16));
             cv::triton::cvtColor(src,gray,COLOR_BGR2GRAY);
-            Mat M=(Mat_<double>(2,3)<<1,0,0,0,1,0);
+            const double matrix[6] = {1, 0, 0, 0, 1, 0};
+            Mat M(2, 3, CV_64F, const_cast<double*>(matrix));
             cv::triton::warpAffine(src,warped,M,src.size(),INTER_NEAREST);
             cuda::Stream::Null().waitForCompletion();
             Mat a,b,c;small.download(a);gray.download(b);warped.download(c);

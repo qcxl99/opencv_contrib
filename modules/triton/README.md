@@ -100,22 +100,24 @@ modes and `BORDER_TRANSPARENT` for NEAREST/LINEAR/AREA are supported, with
 |---|---|
 | depth | `CV_8U`, `CV_16U`, `CV_32F` |
 | channels | 1, 3, 4 |
-| interpolation | `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC`; `INTER_AREA` aliases `INTER_LINEAR` |
+| interpolation | `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC`; `INTER_AREA` aliases LINEAR |
 | border modes | `CONSTANT`, `REPLICATE`, `REFLECT`, `REFLECT_101`, `WRAP`; `TRANSPARENT` for NEAREST/LINEAR/AREA |
 | `borderValue` | a `Scalar` of up to four components, one per channel, kept in full precision |
 | matrix | 2x3 `CV_32F` or `CV_64F`, forward map inverted internally unless `WARP_INVERSE_MAP` |
 
-`BORDER_TRANSPARENT` reads the previous destination: NEAREST preserves it when
-its rounded source point is outside; LINEAR/AREA substitute that destination
-pixel for each outside tap with the original weight. Initialize a destination
-of the requested size/type when these contents matter. `INTER_CUBIC` with
-`BORDER_TRANSPARENT` is explicitly refused. C2 and `CV_16S` are also deliberately
-refused: they need the CPU's other numerical path, rather than an input-check change.
-
 `INTER_LANCZOS4` is **refused on purpose**: its 8x8 weight table and clamped
 taps are a separate contract, and approximating them behind an unmeasured
-tolerance is not acceptable. Also refused: `CV_64F`, channels outside 1/3/4, and
-overlapping input/output.
+tolerance is not acceptable. Also refused: `CV_64F`, channels outside 1/3/4,
+overlapping input/output, and `INTER_CUBIC` with `BORDER_TRANSPARENT`.
+
+`INTER_AREA` follows LINEAR sampling here; it does not integrate a resize area.
+`BORDER_TRANSPARENT` reads the previous destination. NEAREST preserves pixels
+whose rounded source point is outside. LINEAR/AREA replace each out-of-range
+tap with that destination pixel, retaining the original weights, and leave
+wholly outside neighbourhoods untouched. Supply an initialized destination of
+the requested size and type; allocating a new output supplies no defined
+background. These routes have independent cases in `perf/perf_warpaffine.cpp`;
+the native CUDA baseline does not establish matching transparent semantics.
 
 The module identifies fused versus separate multiply/add through fixed probes
 of the linked CPU implementation, separately for depth, channels and
@@ -126,7 +128,7 @@ compute the user's output on the CPU.
 For `INTER_NEAREST` and `INTER_LINEAR` (including the `INTER_AREA` alias), what it computes is OpenCV's CPU
 `cv::warpAffine` on its **vector path**, and this needs stating because that
 build is not self-consistent: its SIMD body evaluates a column's coordinate as
-`v_fma(M0, x, (float)(y*M1 + M2))` and its scalar tail as `x*M0 + y*M1 + M2`,
+`v_fma(M0, x, (float)(y*M1 + M2))` (fused only on the selected FMA path) and its scalar tail as `x*M0 + y*M1 + M2`,
 one ulp apart, and the tail's length depends on the destination width. Two
 destination widths therefore disagree on the region they share — under
 `INTER_NEAREST` by an adjacent pixel's value (measured up to 239 of 255 for
@@ -140,6 +142,14 @@ a column's coordinate as `M_x + M(0,0)*x` from the **absolute** x with no fma,
 so there is no body/tail split. Over 80 seeds × 4 widths, 0 of 320 (seed, width)
 pairs differ for `CV_8U`, `CV_16U` and `CV_32F`; its reference is therefore the
 natural-width call.
+
+The runtime calibrates fused versus split operations against the linked CPU reference
+at rounding-sensitive coordinates; the result participates in the compile key.
+Integer border components are rounded and saturated to their destination depth.
+CUDA uses per-mode tiles: `1×256` for NEAREST and `2×64` for LINEAR/CUBIC
+(including the AREA alias). HIP retains the measured launch-shape override with
+small/narrow-image and C3 NEAREST fallbacks. These choices change launch geometry,
+not sampling semantics.
 
 **This is an open interface question, not a settled equivalence.** The module
 asks the maintainers which behaviour a caller should be able to rely on; see
@@ -166,6 +176,45 @@ only the validated Triton 3.6.0 ABI; other compiler versions are rejected.
 A cold cache needs Python and Triton, which the module runs in a separate,
 Torch-free helper process. The hot path — cache lookup and kernel launch — is
 C++ and never enters an interpreter.
+
+### HIP backend (Hygon BW1000 / gfx936, DTK)
+
+```bash
+ROCM_PATH=/opt/dtk cmake -DOPENCV_EXTRA_MODULES_PATH=<opencv_contrib>/modules \
+      -DBUILD_opencv_triton=ON -DWITH_CUDA=OFF -DTRITON_BACKEND=hip \
+      -DTRITON_ROCM_PATH=/opt/dtk \
+      -DTRITON_PYTHON_EXECUTABLE=<python that can import a hip Triton> \
+      -DTRITON_PYTHONPATH=<flagtree, not upstream Triton> \
+      <opencv>
+```
+
+`TRITON_BACKEND` is `auto` (CUDA when OpenCV has it, else HIP when a HIP toolkit is found),
+`cuda` or `hip`. On a machine whose CUDA is a compatibility layer, say `hip` explicitly.
+The HIP build runs the same runtime (`src/runtime/hip_runtime.cpp` is generated from
+`cuda_runtime.cpp` by `tools/port_hip_runtime.py`) and the same kernels, with the libdevice
+primitives flagtree's HIP build lacks shimmed (`tools/make_kernels_cpu_hip.py`); the configure
+fails when either generated file is stale. `ROCM_PATH` must be set at run time too: the compile
+helper's compiler finds its device libraries through it.
+
+OpenCV has no `cv::cuda` on such a build, so the `GpuMat` entries raise
+`StsNotImplemented`. Use the device-buffer entries in `opencv2/triton/device.hpp`
+(`resizeDevice`, `cvtColorDevice`, `warpAffineDevice`): same validation, same runtime, same
+results, with your own device buffers and a `hipStream_t`. The accuracy test is
+`opencv_test_triton_hip` (`test/hip/`), against the same references and bounds as `test/`;
+`test/`, `perf/` and `samples/` are `GpuMat`-based and are built on CUDA only.
+
+### HIP examples and Python boundary
+
+With `BUILD_EXAMPLES=ON`, `example_triton_device resize` and
+`example_triton_device warp` demonstrate caller-owned HIP buffers, an explicit
+stream, synchronization and a CPU comparison; neither needs Torch.
+
+The Python module can be built and imported on HIP, and its backend queries
+work. Its `resize` and `warpAffine` GpuMat adapters raise a catchable
+`StsNotImplemented`; HIP numerical calls currently use the C++ device-buffer
+entries. This change does not extend or modify cvtColor. The existing Python
+cvtColor GpuMat adapter is outside this change and must not be advertised as a
+HIP numerical entry.
 
 ## Using it
 
@@ -246,4 +295,6 @@ built by `-DBUILD_EXAMPLES=ON` and need a Triton backend at run time:
 ## Status
 
 Proposed for opencv_contrib; not yet merged. The public API and build switches
-are part of the proposal and may change during review.
+are part of the proposal and may change during review. The HIP backend has scoped verification on one
+platform (Hygon BW1000, gfx936, DTK 26.04, flagtree 3.6.0); its routes are the CUDA backend's
+(all four resize modes, and all three warpAffine modes).

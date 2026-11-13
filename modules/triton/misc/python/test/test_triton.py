@@ -43,6 +43,25 @@ class _TritonBase(NewOpenCVTests):
             self.skipTest("No Triton backend available")
 
 
+class triton_hip_binding_test(NewOpenCVTests):
+    """HIP queries work, and CUDA-only Python adapters raise instead of aborting."""
+
+    def setUp(self):
+        super(triton_hip_binding_test, self).setUp()
+        if not hasattr(cv, "triton") or cv.triton.backendName() != "hip-jit":
+            self.skipTest("requires the HIP Triton module")
+
+    def test_gpumat_adapters_raise_safely(self):
+        gpu = cv.cuda_GpuMat()
+        matrix = np.array([[1., 0., 0.], [0., 1., 0.]], np.float64)
+        for fn, args in ((cv.triton.resize, (gpu, (32, 24))),
+                         (cv.triton.warpAffine, (gpu, matrix, (32, 24)))):
+            for kwargs in ({}, {"stream": None}):
+                with self.assertRaises(cv.error) as raised:
+                    fn(*args, **kwargs)
+                self.assertEqual(raised.exception.code, -213)  # StsNotImplemented
+
+
 class triton_binding_test(_TritonBase):
     """The binding works. No reference configuration required."""
 

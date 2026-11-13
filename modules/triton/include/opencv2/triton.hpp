@@ -113,7 +113,7 @@ CV_EXPORTS void resize(InputArray src, OutputArray dst, Size dsize,
  * adds a GpuMat variant for functions in `cv::cuda`, so exporting that one gave
  * Python a Mat/UMat signature that this CUDA-only module rejects at run time.
  */
-CV_EXPORTS_W void resize(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, Size dsize,
+CV_EXPORTS void resize(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, Size dsize,
                          double fx = 0, double fy = 0,
                          int interpolation = INTER_LINEAR,
                          cuda::Stream& stream = cuda::Stream::Null());
@@ -173,13 +173,20 @@ CV_EXPORTS_W void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, in
  * two differ in the last bits of any sub-pixel map. It is a timing baseline only.
  *
  * Supported: CV_8U, CV_16U and CV_32F; 1/3/4 channels; INTER_NEAREST, INTER_LINEAR and
- * INTER_CUBIC; INTER_AREA aliases INTER_LINEAR. The five standard border modes plus
- * BORDER_TRANSPARENT for NEAREST/LINEAR/AREA and WARP_INVERSE_MAP both ways are served.
- * CUBIC with TRANSPARENT, C2 and CV_16S are refused. Anything else raises
+ * INTER_CUBIC, with INTER_AREA as an alias for INTER_LINEAR; the five standard border modes
+ * plus BORDER_TRANSPARENT for NEAREST/LINEAR/AREA; and WARP_INVERSE_MAP both ways. Anything else raises
  * `cv::Error::StsUnsupportedFormat`; there is no fallback to the CPU or to cv::cuda.
  *
  * **Refused on purpose:** INTER_LANCZOS4. Its 8x8 weight table is a separate contract, and
  * claiming it behind an unmeasured tolerance is precisely the failure this module avoids.
+ * INTER_CUBIC with BORDER_TRANSPARENT is also refused.
+ *
+ * BORDER_TRANSPARENT uses the existing destination: NEAREST leaves out-of-range samples
+ * unchanged; LINEAR/AREA replace each out-of-range tap with that destination pixel and keep
+ * the original weights. A wholly outside neighbourhood leaves the destination unchanged.
+ * Supply a destination of the requested size and type with initialized contents before calling;
+ * allocation of an empty destination does not provide a defined background. INTER_AREA has
+ * LINEAR sampling semantics here, rather than resize-style area integration.
  *
  * Accuracy (contract warpaffine/0.4.3; measured against the selected reference on the core
  * suite, a deterministic combination sweep over this surface and a random sweep):
@@ -217,16 +224,14 @@ CV_EXPORTS_W void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, in
  *
  * @param src   Source GpuMat, CV_8U, CV_16U or CV_32F, 1/3/4 channels. ROI accepted.
  * @param dst   Destination GpuMat. Created if needed; never aliased with src. For
- *              BORDER_TRANSPARENT, initialize it at the requested size/type when previous
- *              values matter: outside taps use its existing pixel with their original weight
- *              under LINEAR/AREA, and outside rounded points remain unchanged under NEAREST.
+ *              BORDER_TRANSPARENT, supply initialized contents of the required size/type.
  * @param M     2x3 CV_32F or CV_64F matrix, interpreted as cv::warpAffine interprets it: the
  *              forward map, inverted internally, unless WARP_INVERSE_MAP is set in `flags`.
  * @param dsize Destination size; empty means the source size.
  * @param flags INTER_NEAREST, INTER_LINEAR, INTER_CUBIC or INTER_AREA (LINEAR alias), optionally OR-ed with
  *              WARP_INVERSE_MAP.
  * @param borderMode BORDER_CONSTANT, BORDER_REPLICATE, BORDER_REFLECT, BORDER_REFLECT_101 or
- *              BORDER_WRAP; BORDER_TRANSPARENT is supported for NEAREST/LINEAR/AREA.
+ *              BORDER_WRAP, or BORDER_TRANSPARENT (NEAREST/LINEAR/AREA only).
  * @param borderValue Used by BORDER_CONSTANT. A Scalar of up to four components, one per
  *              channel, exactly as cv::warpAffine reads it: Scalar(v) means (v, 0, 0, 0), not v
  *              on every channel, and the value keeps full double precision, so a CV_32F border
@@ -244,12 +249,29 @@ CV_EXPORTS void warpAffine(InputArray src, OutputArray dst, InputArray M, Size d
  * The form exposed to Python:
  * `cv2.triton.warpAffine(gpu_src, M, dsize[, dst[, flags[, borderMode[, borderValue[, stream]]]]]) -> dst`.
  */
-CV_EXPORTS_W void warpAffine(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
+CV_EXPORTS void warpAffine(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
                              InputArray M, Size dsize,
                              int flags = INTER_LINEAR,
                              int borderMode = BORDER_CONSTANT,
                              const Scalar& borderValue = Scalar(),
                              cuda::Stream& stream = cuda::Stream::Null());
+
+/** @brief Python binding bridge. A nullable stream avoids constructing a CUDA
+ * Stream before the generated wrapper enters its exception handler on HIP.
+ * The Python name and argument order remain resize(..., stream=None).
+ */
+CV_EXPORTS_AS(resize) void resizeForPython(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, Size dsize,
+                                         double fx = 0, double fy = 0,
+                                         int interpolation = INTER_LINEAR,
+                                         Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
+
+/** @brief Python binding bridge with a nullable, safely constructed stream. */
+CV_EXPORTS_AS(warpAffine) void warpAffineForPython(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
+                                                 InputArray M, Size dsize,
+                                                 int flags = INTER_LINEAR,
+                                                 int borderMode = BORDER_CONSTANT,
+                                                 const Scalar& borderValue = Scalar(),
+                                                 Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
 
 //! @}
 

@@ -61,12 +61,12 @@ multiple of 128 (past any SIMD width, so every compared column is in the body),
 then cropped. That is a pure function of `(src, M, dsize, flags)`, and it is
 stable: padding by 128 and by 256 give identical crops.
 
-Padding past the vector body's unroll factor puts every compared column in the
-body on the characterised build; padding by 128 and by 256 produced identical
-crops there. This removes the observed dependence on which columns reach the
-scalar tail. It does not prove ISA independence: fused versus separate arithmetic,
-compiler choices and dispatch can change results. The reference remains bound to
-the characterised CPU build; cross-ISA equality is unverified.
+Why 128 suffices is an argument about the code, not only a measurement: the body
+evaluates `v_fma(M0, x, Mx)` per lane with `x` the lane's own column, so a given
+column gets the same float on SSE, AVX2 and AVX-512. Only the tail's *length* is
+ISA-dependent, and it is at most 32 lanes with an unroll factor up to 64 on any
+`CV_SIMD` build. Padding past that puts every compared column in the body, which
+is what makes the reference ISA-independent.
 
 The module calibrates fused versus separate multiply/add from fixed probes of
 this linked CPU implementation, separately for depth, channel count and
@@ -157,19 +157,30 @@ Supported subset (this milestone)
 |---|---|
 | depth | `CV_8U`, `CV_16U`, `CV_32F` |
 | channels | 1, 3, 4 |
-| interpolation | `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC`; `INTER_AREA` aliases `INTER_LINEAR` |
+| interpolation | `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC`; `INTER_AREA` aliases LINEAR |
 | border modes | `BORDER_CONSTANT`, `BORDER_REPLICATE`, `BORDER_REFLECT`, `BORDER_REFLECT_101`, `BORDER_WRAP`; `BORDER_TRANSPARENT` for NEAREST/LINEAR/AREA |
 | map direction | forward, and `WARP_INVERSE_MAP` |
-| `borderValue` | a `Scalar` of up to four components, one per channel; kept as `double` to the kernel, so a `CV_32F` border of 0.5 is 0.5 |
+| `borderValue` | a `Scalar` of up to four components, one per channel; integer depths round and saturate it, while a `CV_32F` border of 0.5 stays 0.5 |
 | layout | ROI source/destination, padded row stride, 1-pixel axes (sampled with `BORDER_REPLICATE` as on the CPU), output reuse |
-| platform | Linux, CUDA (driver API), `sm_90` tested |
+| platform | Linux; CUDA GpuMat/device buffers and HIP device buffers (see module build instructions) |
 
-`BORDER_TRANSPARENT` reads the previous destination: NEAREST preserves it when
-its rounded source point is outside; LINEAR/AREA substitute that destination
-pixel for each outside tap with the original weight. Initialize a destination
-of the requested size/type when these contents matter. `INTER_CUBIC` with
-`BORDER_TRANSPARENT` is explicitly refused. C2 and `CV_16S` are also deliberately
-refused: they need the CPU's other numerical path, rather than an input-check change.
+`INTER_AREA` is normalized to LINEAR, as in CPU `warpAffine`; it is not the
+area-integration algorithm used by `resize`. Both flags use the same normalized
+mode and compile key.
+
+`BORDER_TRANSPARENT` uses the destination's existing value. For NEAREST, an
+out-of-range rounded source point leaves that destination pixel unchanged.
+For LINEAR/AREA, each out-of-range tap is replaced with the old destination
+pixel and the original interpolation weights are retained; if the whole 2x2
+neighbourhood is outside, the pixel stays unchanged. This is destination-fill
+blending, not weight renormalization or a requirement that every tap be inside.
+Supply an initialized destination of the required size/type: a newly allocated
+output has no defined background. `borderValue` does not provide that background.
+`INTER_CUBIC` with `BORDER_TRANSPARENT` is explicitly refused.
+
+The public module GpuMat and device-buffer entries serve these routes. The lab
+Python JIT frontend has a separate contract and still refuses AREA/TRANSPARENT;
+the shared JIT function's ability to compile them does not extend that frontend.
 
 `INTER_LANCZOS4` raises `cv::Error::StsUnsupportedFormat`, and so do other depths
 and channel counts, and overlapping input/output. LANCZOS4's 8x8 weight table and
@@ -196,18 +207,39 @@ How a call runs
    constexprs: a matrix or border value must not cause a new compilation, and
    a border value must not be narrowed to an integer.
 3. The kernel is launched on the caller's stream, with one program per
-   `(BLOCK_H rows, BLOCK_W pixels)` tile of the destination. The tile shape is
-   chosen per interpolation mode and is part of the compile key, so the two
-   shapes are separate artifacts rather than one kernel branched at run time:
-   `NEAREST` uses `1x256`, while `LINEAR` and `CUBIC` use `2x64`.
-
-   On a rotating geometry a squarer tile measured 1.10-1.17x faster at 1080p and
-   4K, and `NEAREST` measured 1.23-1.42x faster on a wider row. A plain translate
-   was unchanged in both cases. The suggested explanation -- not a profiled
-   result -- is that a rotation maps an output row onto a diagonal, so 128 lanes
-   of one row touch on the order of 56 source rows, and a squarer tile halves
-   that spread while a single-tap kernel has little spread to reduce. Treat the
-   explanation as a hypothesis and the timings as measurements on one device
-   class; neither is a cross-platform promise. The tile does not affect the
-   accuracy contract described in the module README.
+   `(BLOCK_H rows, BLOCK_W pixels)` tile of the destination.
 4. A completion event orders the work against later reads on other streams.
+
+
+### CPU arithmetic and HIP launch tiles
+
+The vendored kernels include the current `FUSED` constexpr for both mapped
+coordinates and interpolation accumulation. The native planner observes the
+linked OpenCV CPU vector path at rounding-sensitive coordinates once, instead
+of inferring that path solely from CPU hardware features. A reference outside
+both supported arithmetic forms is refused. The selected value participates
+in the compile key, so fused and split binaries cannot alias in the cache.
+The `TRANSPARENT` constexpr also participates in the key, separately from the
+normalized interpolation mode; matrices and border values remain runtime inputs.
+
+Integer border components are rounded and saturated to the destination depth;
+floating components keep their precision. Unknown flags, nonfinite matrix entries and sampling matrices outside finite
+float32 range are refused before device work. HIP uses measured launch shapes with
+small/narrow-image and C3 NEAREST fallback conditions. CUDA uses `1×256` tiles
+for NEAREST and `2×64` for LINEAR/CUBIC (including the AREA alias). These are
+tuning choices, not changes to interpolation meaning.
+
+Python `resize`/`warpAffine` use a nullable stream bridge so a HIP build raises
+a catchable error for its unavailable GpuMat adapter. HIP numerical examples use
+`opencv2/triton/device.hpp`; the CUDA Python call shape remains available.
+
+### Performance coverage
+
+`perf/perf_warpaffine.cpp` keeps opaque NEAREST/LINEAR/CUBIC comparisons with
+native CUDA separate from the AREA/TRANSPARENT group. The latter declares cases for 1080p
+and 4K rotated sampling, uint8 C3, uint16 C1 and float32 C1, with REPLICATE and
+TRANSPARENT borders. Its destination is initialized before warmup and reused
+through the timed loop, so reading and updating previous destination values is
+part of the measured workload. These rows provide no CUDA speedup claim for
+transparent semantics. They are warmed public-call timings, not isolated kernel
+or graph-replay measurements.

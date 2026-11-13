@@ -2,33 +2,19 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# warpAffine kernels (contract warpaffine/0.4.1) for the runtime JIT of modules/triton.
-# Exported from kernelforge-lab operators/warpaffine/kernel.py; the jit functions and their
-# helpers are copied verbatim. Regenerating is the only supported edit.
-#
-# CPU cv2.warpAffine semantics, per family:
-#   * NEAREST / LINEAR -- warpAffine{Nearest,Linear}Invoker_*: float coordinates (the row
-#     term rounds twice, the pixel term once through fma), cvRound for NEAREST, floor+fma
-#     chain for LINEAR, saturate_cast<uchar|ushort> for uint8/uint16, Scalar(v,0,0,0) border
-#     values, and a 1-pixel axis sampled with REPLICATE.
-#   * CUBIC -- genericWarp -> bicubicVec: M_x + M_xx*x with NO fma (which is why it has no
-#     width dependence), a float coordinate clamp to [-max(dim,16), 2*max(dim,16)], 4x4 taps,
-#     A = -0.75, and an fma accumulation chain.
+# CPU-aligned resize kernels (contract resize/0.15.0) for the runtime JIT of modules/triton.
+# GENERATED, do not edit: exported from kernelforge-lab by tools/export_module_kernels.py.
+#   lab file:    operators/warpaffine/kernel.py
+#   lab sha256:  09f274acc76943052e0976a3147f156d5f0a994d17ed7ec27c8fcf709845bc4b
+#   functions:   _pmod, _bm, _fma, _mapped_coord, _warp_nearest, _warp_linear, _bicubic_weights_t, _warp_cubic
+# The runtime compiles these through tools/compile_helper.py; the compile key carries this
+# file's own sha256, so editing it here only changes which binaries are built, never which
+# binaries are trusted.
 
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-DEFAULT_CONFIG = {"BLOCK_H": 1, "BLOCK_W": 128, "num_warps": 4}
-
-# cv::BorderTypes
-BORDER_CONSTANT = 0
-BORDER_REPLICATE = 1
-BORDER_REFLECT = 2
-BORDER_WRAP = 3
-BORDER_REFLECT_101 = 4
-
-MODES = ("NEAREST", "LINEAR", "CUBIC")
 
 @triton.jit
 def _pmod(p, n):
