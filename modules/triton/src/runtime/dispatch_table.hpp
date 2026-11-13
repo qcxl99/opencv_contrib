@@ -1,13 +1,10 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
-
-// Resize dispatch configuration; provenance is recorded in doc/maintenance.markdown.
-// See doc/maintenance.markdown for configuration maintenance.
-// Maintained as module source; not regenerated during OpenCV builds.
+// Private default resize launch configurations, indexed by route, layout and depth.
 #pragma once
 
-namespace kf_resize_rt {
+namespace cv_triton_runtime {
 
 struct DispatchRow {
     const char* route;   // route_name(): copy, nearest, linear, cubic, area_fast, area
@@ -65,4 +62,4 @@ inline constexpr DispatchRow DISPATCH_TABLE[] = {
     {"area_fast", 3, true, "down", true, 1, 64, 1},
 };
 
-}  // namespace kf_resize_rt
+}  // namespace cv_triton_runtime

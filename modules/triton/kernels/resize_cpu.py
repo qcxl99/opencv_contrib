@@ -2,9 +2,7 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# CPU-aligned resize kernels for the module runtime JIT.
-# Maintenance and numerical references are documented in doc/maintenance.markdown.
-# This installed source is self-contained; its content hash is part of the compile key.
+# Resize kernels for runtime compilation.
 
 import triton
 import triton.language as tl
@@ -16,8 +14,8 @@ def _cpu_tile(dst_h, W, cn: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.con
     """Pixel-major tile: BLOCK_H output rows x BLOCK_W output PIXELS (all cn channels each).
 
     Every per-pixel quantity (offset/weight tables, clamped tap columns, window
-    origin) is computed once per pixel and reused across the static channel loop;
-    sharing these quantities avoids repeating address work for each channel.
+    origin) is computed once per pixel and reused across the static channel loop
+    to avoid repeating coordinate and weight calculations for each channel.
     """
     rows = tl.program_id(0) * BLOCK_H + tl.arange(0, BLOCK_H)[:, None]
     px = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)[None, :]
@@ -25,7 +23,7 @@ def _cpu_tile(dst_h, W, cn: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.con
     return rows, px, rows < dst_h, px < dst_w, dst_w
 
 
-# Specialisation policy: the compile key is explicit. The
+# The compile key is explicit. The
 # channel count is a constexpr (`cn: tl.constexpr`), and every other runtime argument,
 # pointers included, is do_not_specialize, so Triton adds no implicit ==1 / %16 /
 # 16-byte-alignment keys. A C++ runtime can compute this key; it cannot portably
@@ -38,7 +36,7 @@ def _cpu_tile(dst_h, W, cn: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.con
 # when it repeats or advances by one the horizontal results already in registers are
 # reused or shifted instead of reloaded and recomputed -- OpenCV's CPU resize keeps
 # the same ring of horizontally resized rows. Each output value is computed from the
-# same terms in the same order.
+# same terms in the same order to preserve floating-point rounding.
 @triton.jit(do_not_specialize=['src', 'dst', 'xofs', 'yofs', 'dst_h', 'W', 'src_rs', 'dst_rs', 'src_bs', 'dst_bs'])
 def _resize_cpu_nearest_kernel(src, dst, xofs, yofs, dst_h, W, cn: tl.constexpr,
                         src_rs, dst_rs, src_bs, dst_bs,
@@ -503,7 +501,7 @@ def _resize_cpu_area_kernel(src, dst, xs, xa, xc, ys, ya, yc, KX, KY,
         h1 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
         h2 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
         h3 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
-        # Two-way unrolling exposes independent loads while limiting work on short tap lists.
+        # Unroll pairs of taps to limit instruction growth for short tap lists.
         for kx in tl.range(0, KX, loop_unroll_factor=2):
             xlive = kx < xcnt
             a = tl.where(kx == 0, a_first, tl.where(kx == last, a_last, a_mid))

@@ -77,7 +77,7 @@ void checkCudaBuffer(const cuda::GpuMat& m, const char* name, bool layout)
         CV_Error(Error::StsBadArg, String(name) + " has no verifiable CUDA allocation range");
     const auto view = detail::toDeviceView(toImageView(m), cuda::getDevice(),
                                          static_cast<std::uintptr_t>(base), bytes);
-    const auto checked = kf_resize_rt::validate_view(view, name);
+    const auto checked = cv_triton_runtime::validate_view(view, name);
     if (!checked.ok()) CV_Error(Error::StsBadArg, checked.message);
 }
 
@@ -106,23 +106,23 @@ void checkCudaArguments(const cuda::GpuMat& src, OutputArray dst, cuda::Stream& 
     }
 }
 
-kf_resize_rt::ContextId currentIdentity()
+cv_triton_runtime::ContextId currentIdentity()
 {
-    kf_resize_rt::ContextId id;
+    cv_triton_runtime::ContextId id;
     CUcontext context = nullptr;
     CUdevice device = 0;
     unsigned long long generation = 0;
     if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || !context ||
         cuCtxGetDevice(&device) != CUDA_SUCCESS || cuCtxGetId(context, &generation) != CUDA_SUCCESS)
         CV_Error(Error::StsBadArg, "cv::triton: cannot identify the current CUDA context");
-    id.backend = kf_resize_rt::Backend::CUDA;
+    id.backend = cv_triton_runtime::Backend::CUDA;
     id.device = static_cast<int>(device);
     id.native = reinterpret_cast<std::uintptr_t>(context);
     id.generation = generation;
     return id;
 }
 
-kf_resize_rt::DeviceView deviceView(const cuda::GpuMat& image, const kf_resize_rt::ContextId& context)
+cv_triton_runtime::DeviceView deviceView(const cuda::GpuMat& image, const cv_triton_runtime::ContextId& context)
 {
     auto view = detail::toDeviceView(toImageView(image), context.device,
                                    reinterpret_cast<std::uintptr_t>(image.datastart),
@@ -131,20 +131,17 @@ kf_resize_rt::DeviceView deviceView(const cuda::GpuMat& image, const kf_resize_r
     return view;
 }
 
-void rejectSamePointer(const cuda::GpuMat& src, OutputArray dst, const char* operation)
+void rejectOverlap(const cuda::GpuMat& src, OutputArray dst, const char* operation)
 {
     if (dst.kind() == _InputArray::CUDA_GPU_MAT)
     {
         const cuda::GpuMat before = dst.getGpuMat();
         if (!before.empty())
         {
-            checkCudaBuffer(before,"dst",true);
-            const auto first=reinterpret_cast<std::uintptr_t>(src.cudaPtr());
-            const auto second=reinterpret_cast<std::uintptr_t>(before.cudaPtr());
-            const auto srcEnd=first+(src.rows-1)*src.step+src.cols*src.elemSize();
-            const auto dstEnd=second+(before.rows-1)*before.step+before.cols*before.elemSize();
-            if (first<dstEnd && second<srcEnd)
-                CV_Error(Error::StsBadArg,cv::format("cv::triton::%s: overlapping images are not supported",operation));
+            checkCudaBuffer(before, "dst", true);
+            const auto context = currentIdentity();
+            if (cv_triton_runtime::views_overlap(deviceView(src, context), deviceView(before, context)))
+                CV_Error(Error::StsBadArg, cv::format("cv::triton::%s: overlapping images are not supported", operation));
         }
     }
 }
@@ -168,7 +165,7 @@ void resize(InputArray input, OutputArray output, Size dsize,
     const auto context = currentIdentity();
     const auto source = deviceView(src, context);
     const auto info = detail::resizeOutput(source, dsize, fx, fy, interpolation);
-    rejectSamePointer(src, output, "resize");  // before create can conceal an alias
+    rejectOverlap(src, output, "resize");  // before create can conceal an alias
     const cuda::GpuMat dst = prepareDestination(output, info);
     const auto native = reinterpret_cast<std::uintptr_t>(cuda::StreamAccessor::getStream(stream));
     // Preserve original fx/fy when dsize was omitted; do not derive them from rounded sizes.
@@ -189,11 +186,11 @@ void cvtColor(InputArray input, OutputArray output, int code, cuda::Stream& stre
     const cuda::GpuMat src = input.getGpuMat();
     checkCudaArguments(src, output, stream);
     const auto context = currentIdentity();
-    kf_cvtcolor::Request request;
+    cv_triton_color::Request request;
     request.src = deviceView(src, context);
     request.code = code;
     const auto info = detail::cvtColorOutput(request.src, code);
-    rejectSamePointer(src, output, "cvtColor");
+    rejectOverlap(src, output, "cvtColor");
     const cuda::GpuMat dst = prepareDestination(output, info);
     request.dst = deviceView(dst, context);
     detail::cvtColorDevice(request, context.device,
@@ -209,7 +206,7 @@ void warpAffine(InputArray input, OutputArray output, InputArray matrix, Size ds
     const auto context = currentIdentity();
     auto request = detail::warpRequest(deviceView(src, context), matrix, flags, borderMode, borderValue);
     const auto info = detail::warpOutput(request, dsize);
-    rejectSamePointer(src, output, "warpAffine");
+    rejectOverlap(src, output, "warpAffine");
     const cuda::GpuMat dst = prepareDestination(output, info);
     request.dst = deviceView(dst, context);
     detail::warpAffineDevice(request, context.device,

@@ -2,9 +2,7 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# CPU-aligned resize HIP kernels for the module runtime JIT.
-# Maintenance and numerical references are documented in doc/maintenance.markdown.
-# This installed source is self-contained; its content hash is part of the compile key.
+# HIP resize kernels for complete 2x2 area windows.
 
 import triton
 import triton.language as tl

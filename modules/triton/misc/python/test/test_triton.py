@@ -5,6 +5,7 @@
 
 import cv2 as cv
 import numpy as np
+from unittest import mock
 
 from tests_common import NewOpenCVTests, unittest
 
@@ -12,28 +13,35 @@ from tests_common import NewOpenCVTests, unittest
 # same test:
 #
 #   1. The binding exists and is callable, returns the requested shape, dtype and
-#      channel count, and raises on what the contract rejects. This holds on ANY
+#      channel count, and raises on unsupported inputs. This holds on ANY
 #      build that has a Triton backend -- it needs no particular CPU build.
 #   2. The numbers match CPU cv::resize of the PINNED reference configuration
 #      (OpenCV 5.0.0 generic resize.cpp path, SSE3 baseline, no IPP, no custom
 #      HAL). cv::resize of an arbitrary build is that reference only if the
 #      build is configured so.
 #
-# Binding tests run independently of the reference-build numerical check. The C++
-# resize suite uses a portable oracle; these tests also exercise the Python wrappers.
+# Binding checks run independently of resize's CPU reference configuration.
+# Numerical checks use the reference appropriate to each operation.
 
 _F32_ATOL = {cv.INTER_NEAREST: 0.0, cv.INTER_LINEAR: 4.948e-07, cv.INTER_CUBIC: 1.401e-06, cv.INTER_AREA: 8.419e-07}
 
 
-def _is_reference_build():
-    info = cv.getBuildInformation()
+def _is_reference_build(info=None, version=None, optimized=None):
+    """Recognize the generic resize reference, including runtime optimization state."""
+    info = cv.getBuildInformation() if info is None else info
+    version = cv.__version__ if version is None else version
+    optimized = cv.useOptimized() if optimized is None else optimized
     fields = {}
     for line in info.splitlines():
-        k, sep, v = line.strip().partition(":")
-        if sep and k.strip() not in fields:
-            fields[k.strip()] = v.strip()
-    return (fields.get("Baseline") == "SSE SSE2 SSE3" and fields.get("Custom HAL", "").startswith("NO")
-            and fields.get("Intel IPP", "NO") in ("NO", ""))
+        key, separator, value = line.strip().partition(":")
+        if separator and key not in fields:
+            fields[key] = value.strip()
+    return (version == "5.0.0" and optimized is True
+            and fields.get("Baseline") == "SSE SSE2 SSE3"
+            and not fields.get("Dispatched code generation", "")
+            and fields.get("Custom HAL") == "NO"
+            and fields.get("Intel IPP", "NO") in ("NO", "")
+            and fields.get("Algorithm Hint") == "ALGO_HINT_ACCURATE")
 
 
 class _TritonBase(NewOpenCVTests):
@@ -79,7 +87,7 @@ class triton_binding_test(_TritonBase):
         rng = np.random.RandomState(0)
         for channels in (1, 3, 4):
             shape = (60, 80) if channels == 1 else (60, 80, channels)
-            # Both depths the contract accepts: a float32 upload/download path
+            # Both supported depths: a float32 upload/download path
             # that silently returned uint8 (or the wrong channel count) would
             # not have been visible from a uint8-only check.
             for img in (rng.randint(0, 256, shape).astype(np.uint8),
@@ -171,7 +179,7 @@ _CVT_CODES = (_CVT_F32_COPY + _CVT_F32_ARITHMETIC +
               _CVT_422_COLOR + _CVT_422_GRAY + _CVT_420 +
               _CVT_PACKED + _CVT_BAYER + _CVT_CIE)
 # 16U supports Bayer, gray expansion, and the gray/YCrCb/YUV integer families;
-# the six 3/4-channel bit-copy codes remain outside its current contract.
+# the six 3/4-channel bit-copy codes remain unsupported at this depth.
 _CVT_U16_CODES = _CVT_BAYER + _CVT_F32_COPY[-2:] + _CVT_F32_ARITHMETIC
 
 
@@ -199,6 +207,39 @@ def _cvt_f32_allow(src, ref):
 
 class triton_reference_fixture_test(NewOpenCVTests):
     """CPU-only checks for the shape/depth fixtures used by the CUDA tests."""
+
+    def test_resize_reference_build_detection(self):
+        fields = {"Baseline": "SSE SSE2 SSE3", "Custom HAL": "NO",
+                  "Algorithm Hint": "ALGO_HINT_ACCURATE"}
+
+        def build_info(changes=None):
+            values = dict(fields)
+            values.update(changes or {})
+            return "\n".join("%s: %s" % item for item in values.items())
+
+        self.assertTrue(_is_reference_build(build_info(), "5.0.0", True))
+        self.assertTrue(_is_reference_build(build_info({"Dispatched code generation": ""}),
+                                            "5.0.0", True))
+        for changes in ({"Baseline": "SSE SSE2 SSE3 SSE4_1"},
+                        {"Dispatched code generation": "SSE4_1 AVX2"},
+                        {"Intel IPP": "2022.0"}, {"Custom HAL": "custom"},
+                        {"Algorithm Hint": "ALGO_HINT_APPROX"}):
+            self.assertFalse(_is_reference_build(build_info(changes), "5.0.0", True),
+                             msg=str(changes))
+        for version in ("4.13.0", "5.0.1", "5.1.0", "5.0.0-dev"):
+            self.assertFalse(_is_reference_build(build_info(), version, True))
+        self.assertFalse(_is_reference_build(build_info(), "5.0.0", False))
+        self.assertFalse(_is_reference_build("", "5.0.0", True))
+
+    def test_warpaffine_numeric_does_not_use_resize_build_gate(self):
+        def reject_resize_gate(*args, **kwargs):
+            raise AssertionError("warpAffine must use the linked reference")
+
+        with mock.patch.object(_TritonBase, "setUp") as setup:
+            with mock.patch.dict(globals(), {"_is_reference_build": reject_resize_gate}):
+                case = triton_warpaffine_numeric_test("test_matches_cpu")
+                case.setUp()
+            setup.assert_called_once_with()
 
     def test_cvtcolor_fixture_coverage_and_shapes(self):
         rng = np.random.RandomState(29)
@@ -239,6 +280,56 @@ class triton_reference_fixture_test(NewOpenCVTests):
                                                 cv.BORDER_TRANSPARENT, initial=initial)
                         np.testing.assert_array_equal(ref, initial)
 
+
+
+def _cvt_separate4_model(src, code):
+    # NumPy ufuncs materialize binary32 results separately; no multiply-add fusion.
+    gray = {cv.COLOR_BGR2GRAY, cv.COLOR_RGB2GRAY, cv.COLOR_BGRA2GRAY, cv.COLOR_RGBA2GRAY}
+    rgb = {cv.COLOR_RGB2GRAY, cv.COLOR_RGBA2GRAY, cv.COLOR_RGB2YCrCb,
+           cv.COLOR_RGB2YUV, cv.COLOR_YCrCb2RGB, cv.COLOR_YUV2RGB}
+    inverse = {cv.COLOR_YCrCb2BGR, cv.COLOR_YCrCb2RGB, cv.COLOR_YUV2BGR, cv.COLOR_YUV2RGB}
+    uv = code in {cv.COLOR_BGR2YUV, cv.COLOR_RGB2YUV, cv.COLOR_YUV2BGR, cv.COLOR_YUV2RGB}
+    blue = 2 if code in rgb else 0
+    f = np.float32
+    if code in inverse:
+        y = src[..., 0]
+        cr = src[..., 2 if uv else 1] - f(.5)
+        cb = src[..., 1 if uv else 2] - f(.5)
+        b = y + cb * f(2.032 if uv else 1.773)
+        g = (y + cb * f(-.395 if uv else -.344)) + cr * f(-.581 if uv else -.714)
+        r = y + cr * f(1.140 if uv else 1.403)
+        return np.stack((b,g,r) if blue == 0 else (r,g,b), axis=2)
+    a = src[..., 0] * f(.114 if blue == 0 else .299)
+    b = src[..., 1] * f(.587)
+    c = src[..., 2] * f(.299 if blue == 0 else .114)
+    y = (a + b) + c
+    if code in gray:
+        return y
+    end = (src.shape[1] // 4) * 4
+    y[:, :end] = (a + (b + c))[:, :end]
+    cr = (src[..., blue ^ 2] - y) * f(.877 if uv else .713) + f(.5)
+    cb = (src[..., blue] - y) * f(.492 if uv else .564) + f(.5)
+    return np.stack((y,cb,cr) if uv else (y,cr,cb), axis=2)
+
+
+def _cvt_cpu_separate4():
+    def state():
+        return (cv.useOptimized(), cv.ipp.useIPP(), cv.ipp.useIPP_NotExact())
+    before = state()
+    for code, scn, _ in _CVT_F32_ARITHMETIC:
+        for width in (1,3,4,5,7,8,9,15,16,17,31,33,65):
+            for roi in (False, True):
+                rng = np.random.RandomState(193 + code * 31 + width)
+                parent = rng.uniform(-2, 2, (5, width+7, scn)).astype(np.float32)
+                src = parent[1:4, 2:width+2]
+                if not roi:
+                    src = src.copy()
+                src[:, 1::3] *= np.float32(32767.5)
+                ref = cv.cvtColor(src, code)
+                model = _cvt_separate4_model(src, code)
+                if ref.shape != model.shape or ref.dtype != model.dtype or not np.isfinite(ref).all() or not np.array_equal(ref, model):
+                    return False
+    return before == state()
 
 
 class triton_cvtcolor_test(_TritonBase):
@@ -308,6 +399,27 @@ class triton_cvtcolor_test(_TritonBase):
                         self.assertTrue(np.all(np.abs(got.astype(np.float64) - ref) <= _cvt_f32_allow(img, ref)),
                                         msg="float32 code " + str(code))
 
+    def test_float_mixed_scale_absolute_cap(self):
+        previous = cv.useOptimized()
+        try:
+            for optimized in (False, True):
+                cv.setUseOptimized(optimized)
+                if not _cvt_cpu_separate4():
+                    self.skipTest("unidentified linked CPU float profile; absolute cap not qualified")
+                for code, scn, _ in _CVT_F32_ARITHMETIC:
+                    for width in (1,3,4,5,7,8,9,15,16,17,31,33,65):
+                        rng = np.random.RandomState(1921 + width)
+                        img = rng.uniform(-2, 2, (5,width,scn)).astype(np.float32)
+                        img[:, 1::3] *= np.float32(65535)
+                        got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
+                        ref = cv.cvtColor(img, code)
+                        error = np.abs(got.astype(np.float64) - ref)
+                        self.assertTrue(np.isfinite(error).all())
+                        self.assertTrue(np.all(error <= _cvt_f32_allow(img, ref)))
+                        self.assertLessEqual(float(error.max()), 1e-4)
+        finally:
+            cv.setUseOptimized(previous)
+
     def test_malformed_video_and_legal_odd_extract(self):
         for code in (cv.COLOR_YUV2BGR_UYVY, cv.COLOR_YUV2RGB_UYVY,
                      cv.COLOR_YUV2BGR_YUY2, cv.COLOR_YUV2RGB_YUY2,
@@ -329,9 +441,9 @@ class triton_cvtcolor_test(_TritonBase):
         for code in (cv.COLOR_HSV2BGR, cv.COLOR_BGR2HLS):
             with self.assertRaises(cv.error):
                 cv.triton.cvtColor(cv.cuda_GpuMat(img), code)
-        # CV_32F is served only where the module has a stated contract: the bit-copy codes and
+        # CV_32F is served only for supported conversion families: the bit-copy codes and
         # the three arithmetic families (colour->gray, YCrCb, YUV). Everything else at 32F is
-        # refused. Supported float arithmetic uses its documented per-pixel bound.
+        # refused. Supported arithmetic uses the documented per-pixel floating-point bound.
         f32 = np.random.RandomState(5).uniform(0.0, 1.0, (32, 32, 3)).astype(np.float32)
         for code in (cv.COLOR_BGR2XYZ, cv.COLOR_BGR2HSV, cv.COLOR_BGR2Lab):
             with self.assertRaises(cv.error):
@@ -361,7 +473,7 @@ class triton_cvtcolor_test(_TritonBase):
                                cv.COLOR_BGR2GRAY)
 
 
-# warpAffine (contract 0.4.3): bindings are checked on any usable build;
+# warpAffine: bindings are checked on any usable build;
 # numeric tests use the selected linked CPU reference. NN/LINEAR/AREA use
 # the padded vector path; CUBIC uses the natural-width call. Fused arithmetic
 # is calibrated from CPU outputs, not hardware feature flags. The unchanged
@@ -380,7 +492,7 @@ _WA_GEOMS = [
 
 
 def _wa_within(got, ref):
-    """The contract's per-element bound. Returns (elements outside, max normalised error)."""
+    """The per-element error bound. Returns (elements outside, max normalised error)."""
     if ref.dtype in (np.uint8, np.uint16):
         d = np.abs(got.astype(np.int64) - ref.astype(np.int64))
         return int((d > (0 if ref.dtype == np.uint8 else 1)).sum()), float(d.max(initial=0))
@@ -502,9 +614,7 @@ class triton_warpaffine_binding_test(_TritonBase):
     def test_rejected_inputs_raise(self):
         u8 = np.zeros((32, 32, 3), np.uint8)
         M = np.eye(3, dtype=np.float64)[:2]
-        # INTER_CUBIC became served in 0.4.0; INTER_AREA followed the CPU's own rewrite to
-        # INTER_LINEAR (cv::warpAffine maps AREA to LINEAR before doing anything else, and the two
-        # produce identical output). Only LANCZOS4 is refused now.
+        # AREA follows the CPU rewrite to LINEAR; LANCZOS4 is unsupported.
         with self.assertRaises(cv.error):
             cv.triton.warpAffine(cv.cuda_GpuMat(u8), M, (32, 32), flags=cv.INTER_LANCZOS4)
         # AREA is served AND equals LINEAR, checked rather than merely not raising.
@@ -526,13 +636,7 @@ class triton_warpaffine_binding_test(_TritonBase):
 
 
 class triton_warpaffine_numeric_test(_TritonBase):
-    """The numbers match the selected CPU reference. Skips on other builds."""
-
-    def setUp(self):
-        super(triton_warpaffine_numeric_test, self).setUp()
-        if not _is_reference_build():
-            self.skipTest("cv.warpAffine of this build is not the reference configuration; "
-                          "the C++ suite checks this build's selected CPU paths separately")
+    """Compare with the linked CPU paths selected by warpAffine."""
 
     def _check(self, img, M, dsize, flags, border, bv=0):
         g = cv.cuda_GpuMat(img)
@@ -541,7 +645,7 @@ class triton_warpaffine_numeric_test(_TritonBase):
         ref = _wa_cpu_reference(img, M, dsize, flags, border, bv)
         self.assertEqual(got.shape, ref.shape)
         nbad, worst = _wa_within(got, ref)
-        self.assertEqual(nbad, 0, msg="%d elements outside the contract, worst %.3f"
+        self.assertEqual(nbad, 0, msg="%d elements outside the error bound, worst %.3f"
                                      % (nbad, worst))
 
     def test_matches_cpu(self):

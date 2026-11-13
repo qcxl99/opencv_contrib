@@ -11,10 +11,8 @@ struct CvtCase
     int code;
     const char* name;
     int scn, dcn;
-    // Source/destination depth. Defaulted to CV_8U so every existing row is unchanged; the
-    // families that also serve 16U (Bayer, gray, YUV/YCrCb and gray -> colour) get their second
-    // depth as extra rows in kCases16U below, and the CPU creates dst at src's depth, so one
-    // field describes both sides.
+    // CPU conversions preserve depth. Additional 16U and 32F combinations are
+    // listed in their respective tables below.
     int depth = CV_8U;
     // 4:2:0 decode takes one CV_8UC1 of (3H/2) x W and produces H x W. The fixture has to build a
     // source of that shape and expect a shorter destination, so the row says so instead of the
@@ -106,15 +104,9 @@ const CvtCase kCases[] = {
     {cv::COLOR_BayerBG2GRAY, "BayerBG2GRAY", 1, 1},
     // XYZ and the Lab/Luv families: 18 codes, every one the module serves.
     //
-    // The forward sRGB Luv codes are in here even though their CPU path is a trilinear LUT
-    // rather than the CIE formula -- reproducing the LUT IS the bit-exact target, and the
-    // comparison below is against this build's cv::cvtColor, so a kernel that computed exact
-    // CIE Luv would not in general match that quantised LUT.
-    //
-    // cv::COLOR_LBGR2Luv (76) and cv::COLOR_LRGB2Luv (77) are absent because the module refuses them:
-    // the CPU's float forward path answers differently in its SIMD body than in its scalar tail
-    // (0.002% of the cube, 1 LSB, switching at width 8), so there is no single result to match.
-    // RejectsWithoutFallback asserts they are refused.
+    // Forward sRGB Luv follows the CPU trilinear lookup table, rather than an
+    // analytic CIE formula. Forward linear-Luv codes are unsupported because
+    // SIMD-body and scalar-tail rounding can differ. Refusal tests cover them.
     {cv::COLOR_BGR2XYZ, "BGR2XYZ", 3, 3},
     {cv::COLOR_RGB2XYZ, "RGB2XYZ", 3, 3},
     {cv::COLOR_XYZ2BGR, "XYZ2BGR", 3, 3},
@@ -135,12 +127,8 @@ const CvtCase kCases[] = {
     {cv::COLOR_Luv2LRGB, "Luv2LRGB", 3, 3},
 };
 
-// Every code the module serves at 16U: the Bayer family plus the three integer families whose
-// CPU path is the same 15-/14-bit table at both depths (colour <-> gray, YUV, YCrCb). Kept
-// separate from kCases so the many tests that iterate kCases keep covering exactly the 8U set
-// they were written for; MatchesCpu16U walks this one. One row per served code — a 16U code
-// missing here is not caught by CoversEverySupportedCode (that compares the 8U table), so the
-// Each row specifies its supported depth explicitly.
+// Supported 16U conversions. Keep depth-specific coverage separate from the
+// 8U code table; depth coverage tests compare against the planner's support.
 const CvtCase kCases16U[] = {
     {cv::COLOR_BayerBG2BGR, "BayerBG2BGR", 1, 3, CV_16U},
     {cv::COLOR_BayerGB2BGR, "BayerGB2BGR", 1, 3, CV_16U},
@@ -179,9 +167,9 @@ const CvtCase kCases32F[] = {
     {cv::COLOR_BGRA2RGBA, "BGRA2RGBA", 4, 4, CV_32F},
     {cv::COLOR_GRAY2BGR, "GRAY2BGR", 1, 3, CV_32F},
     {cv::COLOR_GRAY2BGRA, "GRAY2BGRA", 1, 4, CV_32F},
-    // The 32F ARITHMETIC codes. These are NOT bit-exact and are not compared for equality: the CPU
-    // has several answers (fused body for W>=16, fused tail for W<16, unfused build), so they are
-    // checked against the measured bound |got-ref| <= 8*2^-24*max(1,|ref|,max|input|).
+    // Float arithmetic permits CPU dispatch and fused-operation rounding
+    // differences under the per-pixel bound
+    // |got-ref| <= 8*2^-24*max(1,|ref|,max|input channels|).
     {cv::COLOR_BGR2GRAY, "BGR2GRAY", 3, 1, CV_32F},
     {cv::COLOR_RGB2GRAY, "RGB2GRAY", 3, 1, CV_32F},
     {cv::COLOR_BGRA2GRAY, "BGRA2GRAY", 4, 1, CV_32F},

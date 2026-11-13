@@ -15,21 +15,21 @@
 #include <tuple>
 #include <limits>
 
-namespace kf_warpaffine {
+namespace cv_triton_warp {
 
-using kf_resize_rt::Reason;
-using kf_resize_rt::Status;
+using cv_triton_runtime::Reason;
+using cv_triton_runtime::Status;
 
 namespace {
 Status prepared() {
     Status s;
-    s.code = kf_resize_rt::Code::Prepared;
+    s.code = cv_triton_runtime::Code::Prepared;
     return s;
 }
 
 Status unsupported(Reason r, std::string msg) {
     Status s;
-    s.code = kf_resize_rt::Code::Unsupported;
+    s.code = cv_triton_runtime::Code::Unsupported;
     s.reason = r;
     s.message = std::move(msg);
     return s;
@@ -143,7 +143,7 @@ static Status sampling_matrix(const Request& req, double out[6])
 
 Status validate_source(const Request& req)
 {
-    const kf_resize_rt::DeviceView& s = req.src;
+    const cv_triton_runtime::DeviceView& s = req.src;
 
     // OpenCV's warpAffine rewrites AREA to LINEAR before selecting its kernel.
     const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
@@ -151,7 +151,7 @@ Status validate_source(const Request& req)
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: interpolation " +
                                std::to_string(req.interpolation) +
-                               " is not served by this module (warpaffine/0.4.3 covers "
+                               " is not supported (supported modes are "
                                "INTER_NEAREST, INTER_LINEAR, INTER_CUBIC and INTER_AREA); "
                                "INTER_LANCZOS4 is refused rather than approximated");
     // BORDER_TRANSPARENT is served for NEAREST and LINEAR (including the AREA alias).
@@ -166,8 +166,8 @@ Status validate_source(const Request& req)
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: border mode " + std::to_string(req.border_mode) +
                                " is not one of CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT");
-    if (s.type != kf_resize_rt::ElemType::U8 && s.type != kf_resize_rt::ElemType::U16 &&
-        s.type != kf_resize_rt::ElemType::F32)
+    if (s.type != cv_triton_runtime::ElemType::U8 && s.type != cv_triton_runtime::ElemType::U16 &&
+        s.type != cv_triton_runtime::ElemType::F32)
         return unsupported(Reason::DepthOrChannels,
                            "cv::triton::warpAffine: CV_8U, CV_16U and CV_32F only");
     if (s.channels != 1 && s.channels != 3 && s.channels != 4)
@@ -175,7 +175,7 @@ Status validate_source(const Request& req)
     for (int i = 0; i < 4; ++i) {
         if (!std::isfinite(req.border[i]))
             return unsupported(Reason::IndexRange, "border components must be finite");
-        if (s.type == kf_resize_rt::ElemType::F32 &&
+        if (s.type == cv_triton_runtime::ElemType::F32 &&
             std::abs(req.border[i]) > std::numeric_limits<float>::max())
             return unsupported(Reason::IndexRange, "float32 border components exceed finite float32 range");
     }
@@ -187,8 +187,8 @@ Status validate_output(const Request& req, int dst_h, int dst_w)
 {
     const Status admitted = validate_source(req);
     if (!admitted.ok()) return admitted;
-    if (dst_h <= 0 || dst_w <= 0)
-        return unsupported(Reason::EmptyOrSize, "destination size must be positive");
+    const Status output = cv_triton_runtime::validate_output_shape(dst_h, dst_w, req.src.channels);
+    if (!output.ok()) return output;
     double matrix[6];
     const Status prepared_matrix = sampling_matrix(req, matrix);
     if (!prepared_matrix.ok()) return prepared_matrix;
@@ -210,23 +210,23 @@ Status validate_output(const Request& req, int dst_h, int dst_w)
 
 Status normalize(const Request& req, Normalized& out)
 {
-    const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
+    const cv_triton_runtime::DeviceView &s = req.src, &d = req.dst;
     const Status admitted = validate_output(req, d.rows, d.cols);
     if (!admitted.ok()) return admitted;
     const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
     if (s.type != d.type || s.channels != d.channels)
         return unsupported(Reason::TypeMismatch, "src and dst must have the same depth and channel count");
     if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
-    Status valid = kf_resize_rt::validate_view(s, "src");
+    Status valid = cv_triton_runtime::validate_view(s, "src");
     if (!valid.ok()) return valid;
-    valid = kf_resize_rt::validate_view(d, "dst");
+    valid = cv_triton_runtime::validate_view(d, "dst");
     if (!valid.ok()) return valid;
-    if (s.ptr < d.end() && d.ptr < s.end())
+    if (cv_triton_runtime::views_overlap(s, d))
         return unsupported(Reason::InPlaceOrOverlap, "src and dst overlap (in-place is not supported)");
 
     out.mode = interp == 0 ? Mode::Nearest : (interp == 1 ? Mode::Linear : Mode::Cubic);
-    out.u8 = s.type == kf_resize_rt::ElemType::U8;
-    out.u16 = s.type == kf_resize_rt::ElemType::U16;
+    out.u8 = s.type == cv_triton_runtime::ElemType::U8;
+    out.u16 = s.type == cv_triton_runtime::ElemType::U16;
     out.src_h = s.rows;
     out.src_w = s.cols;
     out.dst_h = d.rows;
@@ -249,8 +249,8 @@ Status normalize(const Request& req, Normalized& out)
             std::max(0.0,std::min(out.u8 ? 255.0 : 65535.0,std::nearbyint(req.border[i]))) : req.border[i];
     }
 
-    // One tile of output pixels per program, the same knob shape resize and cvtColor expose.
-    // Defaults are BLOCK_W 128 and BLOCK_H 1; LaunchConfig may override them.
+    // One tile of output pixels per program. The runtime may select a
+    // backend-specific launch configuration.
     out.block_h = 1;
     out.block_w = 128;
     out.num_warps = 4;
@@ -308,4 +308,4 @@ void grid(const Normalized& n, unsigned out[3])
     out[2] = 1;
 }
 
-}  // namespace kf_warpaffine
+}  // namespace cv_triton_warp

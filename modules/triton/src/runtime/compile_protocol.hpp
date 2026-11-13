@@ -2,7 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Private C++ compile protocol for the module runtime.
+// Private compile-helper protocol, C++ side.
 //
 // The runtime never embeds Python. On a cache miss it writes a structured request, runs the
 // Torch-free compile helper (tools/compile_helper.py) as a separate process
@@ -29,9 +29,9 @@
 
 #include "provider.hpp"
 
-namespace kf_resize_rt {
+namespace cv_triton_runtime {
 
-constexpr const char* COMPILE_PROTOCOL = "kf-resize-compile/1";
+constexpr const char* COMPILE_PROTOCOL = "opencv-triton-compile/1";
 
 // ------------------------------------------------------------------ utilities
 
@@ -86,7 +86,7 @@ struct CompileOutcome {
 CompileOutcome compile_key(const HelperCommand& cmd, const KernelKey& key, const std::string& source_path,
                            const std::string& cache_dir);
 
-// The same for a request already serialised (the runtime builds it with make_request; tests send
+// The same for a request already serialised (the runtime uses make_request; tests send
 // tampered ones).
 CompileOutcome run_request(const HelperCommand& cmd, const std::string& request);
 
@@ -127,4 +127,4 @@ bool verify_response(const std::string& request, const std::string& response, st
 // Rebuilds KernelKey::text() from the protocol's structured key object.
 bool key_text_from_json(const Json& key, std::string& text, std::string& why);
 
-}  // namespace kf_resize_rt
+}  // namespace cv_triton_runtime

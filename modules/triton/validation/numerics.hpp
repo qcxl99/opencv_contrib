@@ -12,8 +12,9 @@ inline double resizeF32Atol(int interp) {
 inline double warpF32Tolerance(double value) {
     return std::min(5.0e-5*std::max(std::abs(value),1.0),1.0e-4);
 }
-inline double cvtF32Tolerance(double reference,double inputScale) {
-    return 8*std::ldexp(1.0,-24)*std::max(1.0,std::max(std::abs(reference),inputScale));
+inline double cvtF32Tolerance(double reference,double inputScale, bool absoluteCap = false) {
+    const double scaled = 8*std::ldexp(1.0,-24)*std::max(1.0,std::max(std::abs(reference),inputScale));
+    return absoluteCap ? std::min(scaled, 1.0e-4) : scaled;
 }
 }}
 #endif

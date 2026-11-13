@@ -13,7 +13,7 @@
 #include "opencv2/triton.hpp"
 #include "../validation/reference.hpp"
 #include "../validation/guards.hpp"
-#include "../src/runtime/reference_cpu.hpp"
+#include "resize_reference.hpp"
 #include "../src/runtime/runtime.hpp"
 
 namespace opencv_test { namespace triton_test {

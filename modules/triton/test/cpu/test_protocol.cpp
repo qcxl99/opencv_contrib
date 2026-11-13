@@ -18,7 +18,7 @@ void require(bool value, const char* what)
 
 int main(int argc, char** argv) try
 {
-    using namespace kf_resize_rt;
+    using namespace cv_triton_runtime;
     require(argc == 3, "expected Python executable and temporary directory");
     require(sha256_hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
             "SHA-256 known-answer vector");

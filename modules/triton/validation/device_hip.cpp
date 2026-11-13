@@ -74,25 +74,28 @@ cv::triton::DeviceImage image(const Image& value) {
     cv::triton::DeviceImage out; out.ptr=value.address();out.rows=value.size().height;
     out.cols=value.size().width;out.type=value.type();out.step=value.step();return out;
 }
-kf_resize_rt::DeviceView view(const Image& value) {
-    kf_resize_rt::DeviceView out;out.ptr=value.address();out.rows=value.size().height;
+cv_triton_runtime::DeviceView view(const Image& value) {
+    cv_triton_runtime::DeviceView out;out.ptr=value.address();out.rows=value.size().height;
     out.cols=value.size().width;out.channels=CV_MAT_CN(value.type());out.step=value.step();
     const int depth=CV_MAT_DEPTH(value.type());
     switch (depth) {
-    case CV_8U:out.type=kf_resize_rt::ElemType::U8;break;
-    case CV_16U:out.type=kf_resize_rt::ElemType::U16;break;
-    case CV_16S:out.type=kf_resize_rt::ElemType::S16;break;
-    case CV_32F:out.type=kf_resize_rt::ElemType::F32;break;
+    case CV_8U:out.type=cv_triton_runtime::ElemType::U8;break;
+    case CV_16U:out.type=cv_triton_runtime::ElemType::U16;break;
+    case CV_16S:out.type=cv_triton_runtime::ElemType::S16;break;
+    case CV_32F:out.type=cv_triton_runtime::ElemType::F32;break;
     default:CV_Error(cv::Error::StsUnsupportedFormat,"unsupported validation image depth");
     }
     return out;
 }
 void rejectAlias(const Image& src,const Image& dst) {
     if (!src.address() || !dst.address()) return;
-    const auto end = [](const Image& image) { return image.address() +
-        (image.size().height-1)*image.step() + image.size().width*CV_ELEM_SIZE(image.type()); };
-    if (src.address()<end(dst) && dst.address()<end(src))
-        CV_Error(cv::Error::StsBadArg,"overlapping images are not supported");
+    const auto source = view(src), destination = view(dst);
+    const auto sourceStatus = cv_triton_runtime::validate_view(source, "src");
+    if (!sourceStatus.ok()) CV_Error(cv::Error::StsBadArg, sourceStatus.message);
+    const auto destinationStatus = cv_triton_runtime::validate_view(destination, "dst");
+    if (!destinationStatus.ok()) CV_Error(cv::Error::StsBadArg, destinationStatus.message);
+    if (cv_triton_runtime::views_overlap(source, destination))
+        CV_Error(cv::Error::StsBadArg, "overlapping images are not supported");
 }
 }
 void resize(const Image& src,Image& dst,cv::Size size,double fx,double fy,int interpolation,Stream& stream) {

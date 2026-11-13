@@ -126,10 +126,10 @@ TEST(Triton_CvtColor, MatchesCpu32F)
             // source float into a destination slot unchanged, so equality holds (including the
             // alpha = 1.0f the inserted channel gets at 32F -- it is 255 at 8U, which is why the
             // kernel derives it). The arithmetic codes have several CPU answers, so they are
-            // checked against the measured bound, not for equality.
+            // checked against the per-pixel bound, not for equality.
             const bool arithmetic = cvt_cases::floatArithmetic(c.code);
             const Mat ref = cpuCvt(host, c.code);
-            EXPECT_TRUE(meetsCvtContract(got, ref, host, arithmetic));
+            EXPECT_TRUE(meetsCvtContract(got, ref, host, arithmetic, arithmetic && cv_triton_color::float_cpu_separate4()));
         }
 }
 
@@ -225,14 +225,9 @@ TEST(Triton_CvtColor, RoutesRoi)
     for (const CvtCase& c : kCases)
     {
         SCOPED_TRACE(c.name);
-        // 67x43 was fine while every served code accepted odd widths. Two of the CPU's own source
-        // rules then arrived: a 4:2:2 CONVERSION needs an even width (color.simd_helpers.hpp:119)
-        // and a 4:2:0 source needs an even width with a height divisible by 3. 72x45 is the old
-        // shape's neighbourhood and satisfies both, so one fixture still covers every code and
-        // the ROI/pitch path this test exists for is unchanged.
-        // A 4:2:0 SOURCE is 3/2 the height of its output, so the two views are not the same
-        // shape for those codes (the module derives dst's size from the code, exactly as the
-        // CPU's CvtHelper does). Every other code keeps src and dst the same size.
+        // Even width satisfies packed 4:2:2 input. A row count divisible by
+        // three also permits packed 4:2:0 input, whose output has 2/3 as many
+        // rows. Other conversions preserve size. Both ROIs retain parent pitch.
         const Size sz(72, 45);
         const Size dsz = (c.yuv420) ? Size(sz.width, sz.height * 2 / 3) : sz;
         const Mat host = randomImage(sz, CV_MAKETYPE(c.depth, c.scn), seed++);
@@ -298,14 +293,13 @@ TEST(Triton_CvtColor, MatchesCpuOnBoundaries)
         {
             SCOPED_TRACE(label(c, sz) + " / " + b.name);
             Mat host(sz, CV_MAKETYPE(c.depth, c.scn), Scalar::all(0));
-            // Use byte addressing at the actual channel count, including 4-channel inputs.
+            // Use the conversion's channel count to address interleaved pixels.
             for (int i = 0; i < (int)b.colours.size(); ++i)
             {
                 const Vec3b& v = b.colours[i];
                 uchar* px = host.ptr(i / sz.width) + (i % sz.width) * c.scn;
-                // Only `scn` bytes belong to this pixel. Writing px[1]/px[2] on a 1-channel image
-                // spills into the next pixel, which is the same class of out-of-bounds the comment
-                // above describes -- and the fixture self-check below is what caught it.
+                // Only `scn` bytes belong to this pixel; guard every additional
+                // channel write to avoid modifying neighboring pixels.
                 px[0] = v[0];
                 if (c.scn > 1) px[1] = v[1];
                 if (c.scn > 2) px[2] = v[2];
@@ -341,7 +335,7 @@ TEST(Triton_CvtColor, MatchesCpuOnBoundaries)
 TEST(Triton_CvtColor, MatchesCpuOnLayouts)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
-    const int block = 256;                      // kf_cvtcolor::block_size: at cols-1, cols, cols+1
+    const int block = 256;                      // cv_triton_color::block_size: at cols-1, cols, cols+1
     const Size sizes[] = {Size(block - 1, 5), Size(block, 5), Size(block + 1, 5),
                           Size(1, 257), Size(3, 1), Size(3, 2), Size(4, 3)};
     uint64 seed = 900;
@@ -395,13 +389,12 @@ TEST(Triton_CvtColor, RejectsWithoutFallback)
     // The float32 conversions: not served, refused by name rather than under a tolerance.
     EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::cvtColor(src, dst, COLOR_HSV2BGR); }));
     EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::cvtColor(src, dst, COLOR_BGR2HLS); }));
-    // The linear-Luv FORWARD codes. Not float32-in-general, and not "hard": the CPU's own answer
-    // depends on the image width (SIMD body vs scalar tail, 0.002% of the 2^24 cube, 1 LSB,
-    // switching at width 8), so the module has nothing single-valued to reproduce. Asserted here
-    // so removing the refusal has to delete an explicit statement rather than slip through.
+    // Forward linear-Luv is unsupported. The CPU SIMD body and scalar tail can
+    // round differently at channel boundaries; this is a distinct restriction
+    // from the unsupported CV_32F conversion families checked below.
     EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::cvtColor(src, dst, COLOR_LBGR2Luv); }));
     EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::cvtColor(src, dst, COLOR_LRGB2Luv); }));
-    // 32F is served only where the module has a stated contract: the bit-copy codes and the
+    // Supported 32F conversions are the bit-copy codes and the
     // three arithmetic families (colour->gray, YCrCb, YUV). Everything else at 32F is refused.
     cuda::GpuMat f32(32, 32, CV_32FC3);
     EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::cvtColor(f32, dst, COLOR_BGR2XYZ); }));
@@ -456,7 +449,7 @@ TEST(Triton_CvtColor, RejectsWithoutFallback)
     // not something it can produce.
     // src/dst depth cannot disagree THROUGH THIS ENTRY: the adapter re-creates dst as
     // CV_MAKETYPE(src.depth(), dcn), so an existing 8U dst handed a 16U source is replaced, not
-    // mixed. normalize()'s matching-depth check is therefore about the planner contract, not
+    // mixed. normalize()'s matching-depth check is therefore an internal invariant, not
     // something a caller can trip here -- and the observable behaviour is the depth following
     // the SOURCE.
     cuda::GpuMat dst8(32, 32, CV_8UC3);
@@ -510,11 +503,9 @@ TEST(Triton_CvtColor, RejectsMalformedVideoBeforeLaunch)
     EXPECT_EQ(0.0, cvtest::norm(got, cpuCvt(host, COLOR_YUV2GRAY_UYVY), NORM_INF));
 }
 
-// Which build is being compared against, and what that does and does not establish.
-//
-// Check build configuration by value, not the absence of a top-level CALL_HAL macro.
-// OpenCV dispatch functions may call HAL one level down. This diagnostic cannot observe
-// runtime dispatch selection and does not claim a particular executed implementation.
+// CPU dispatch may use IPP or HAL substitutions in color dispatch files.
+// Build information identifies configured substitutions but cannot detect a
+// runtime-registered HAL. Numeric tests compare the actual linked cv::cvtColor.
 static std::string buildField(const std::string& key)
 {
     const std::string info = cv::getBuildInformation();
@@ -540,24 +531,17 @@ static std::string buildField(const std::string& key)
 
 TEST(Triton_CvtColor, ReferenceBuildIsCharacterised)
 {
-    // Recorded, not inferred: these are the fields the claim depends on, read by value. A build
-    // that disagrees is reported with the value it had, so a failure says what changed.
+    // Report the configuration values used by the CPU reference diagnostic.
     const std::string ipp = buildField("Intel IPP");
     const std::string hal = buildField("Custom HAL");
     const std::string base = buildField("Baseline");
     if (base.empty())
         throw SkipTestException("cannot read the build configuration");
 
-    // This test RECORDS the configuration; it must not fail a build for being configured
-    // differently. A contrib module is built in whatever configuration the packager chose, and
-    // IPP or a vendor HAL are legitimate there. What those configurations invalidate is the
-    // *claim* that this build's cv::cvtColor is the generic path the module was verified
-    // against -- which is exactly what the numeric tests need to know, so the finding is
-    // published as a skipped diagnostic rather than an assertion failure.
-    //
-    // cvtColor numeric tests compare against this build's own cv::cvtColor, not
-    // the resize portable oracle. A different reference build needs revalidation;
-    // this diagnostic cannot silently confer the previous build's numeric scope.
+    // IPP and custom HAL configurations are legitimate OpenCV builds. Report
+    // them as a skipped diagnostic instead of rejecting the build. Accuracy
+    // tests still use the linked cv::cvtColor; this check cannot establish its
+    // equivalence to a generic CPU implementation.
     const bool isReference = (ipp == "NO" || ipp.empty()) && hal.compare(0, 2, "NO") == 0
                              && !cv::ipp::useIPP();
     std::cout << "cvtColor reference build: Baseline=" << base << " Intel IPP=" << ipp
@@ -566,9 +550,9 @@ TEST(Triton_CvtColor, ReferenceBuildIsCharacterised)
     if (!isReference)
         throw SkipTestException(
             "this build is not the generic reference configuration (Intel IPP: " + ipp +
-            ", Custom HAL: " + hal + "); the module's numeric evidence was gathered on a build "
-            "without them, so a host cv::cvtColor comparison here is of unknown scope. The "
-            "numeric comparisons use this build and do not inherit earlier reference qualification");
+            ", Custom HAL: " + hal + "); generic-path equivalence is not established for this configuration. "
+            "Accuracy tests compare the linked implementation. "
+            "The diagnostic cannot identify runtime-registered HAL substitutions");
 }
 
 // The same kernel reused: no second compile, no second module load, the tables uploaded once.
@@ -601,9 +585,11 @@ TEST(Triton_CvtColor, ReusesCompiledArtifacts)
     EXPECT_EQ(0.0, cvtest::norm(got, cpuCvt(host, COLOR_BGR2YUV), NORM_INF));
 }
 
-// Deterministic keep-alive: remove unrelated entries, prewarm two codes, then block
-// the stream and force table/module eviction without loading a module in that window.
-// Reset counters after setup so deferred releases belong to the resources under test.
+// Check asynchronous resource retention with deterministic eviction. Empty
+// unrelated cache entries, warm two codes, then evict a table with the second
+// code and a module by shrinking the limit. Reset counters after setup so
+// subsequent frees refer to the resources under test. Keeping the required
+// module resident until launch also avoids a context-draining module reload.
 TEST(Triton_CvtColor, HoldsResourcesWhileInFlight)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
@@ -681,9 +667,9 @@ TEST(Triton_CvtColor, HoldsResourcesWhileInFlight)
 // conversion to the planner without a test row would pass silently.
 TEST(Triton_CvtColor, CoversEverySupportedCode)
 {
-    const auto& table = kf_cvtcolor::all();
+    const auto& table = cv_triton_color::all();
     EXPECT_EQ(sizeof(kCases) / sizeof(kCases[0]), table.size());
-    for (const kf_cvtcolor::CodeSpec& spec : table)
+    for (const cv_triton_color::CodeSpec& spec : table)
     {
         bool found = false;
         for (const CvtCase& c : kCases)
@@ -697,20 +683,20 @@ TEST(Triton_CvtColor, CoversEverySupportedCode)
 TEST(Triton_CvtColor, CoversEverySupportedDepth)
 {
     int counts[] = {0, 0, 0};
-    for (const auto& spec : kf_cvtcolor::all())
+    for (const auto& spec : cv_triton_color::all())
         for (int index = 0; index < 3; ++index)
         {
             const int depth = index == 0 ? CV_8U : index == 1 ? CV_16U : CV_32F;
-            kf_resize_rt::DeviceView src;
+            cv_triton_runtime::DeviceView src;
             src.ptr = 4096;
-            src.rows = spec.op == kf_cvtcolor::Op::Yuv420 ? 48 : 32;
+            src.rows = spec.op == cv_triton_color::Op::Yuv420 ? 48 : 32;
             src.cols = 32;
             src.channels = spec.scn;
-            src.type = depth == CV_8U ? kf_resize_rt::ElemType::U8 :
-                       depth == CV_16U ? kf_resize_rt::ElemType::U16 : kf_resize_rt::ElemType::F32;
-            src.step = src.cols * src.channels * kf_resize_rt::elem_size(src.type);
-            kf_cvtcolor::Output output;
-            const bool admitted = kf_cvtcolor::resolve_output(src, spec.code, output).ok();
+            src.type = depth == CV_8U ? cv_triton_runtime::ElemType::U8 :
+                       depth == CV_16U ? cv_triton_runtime::ElemType::U16 : cv_triton_runtime::ElemType::F32;
+            src.step = src.cols * src.channels * cv_triton_runtime::elem_size(src.type);
+            cv_triton_color::Output output;
+            const bool admitted = cv_triton_color::resolve_output(src, spec.code, output).ok();
             const CvtCase* row = cvt_cases::find(spec.code, depth);
             EXPECT_EQ(admitted, row != nullptr) << spec.name << " depth=" << depth;
             if (!admitted) continue;
@@ -731,39 +717,35 @@ TEST(Triton_CvtColor, CoversEverySupportedDepth)
 // Synthetic addresses are never dereferenced; malformed views must be refused here.
 TEST(Triton_CvtColor, ResolvesAndRefusesBeforeOutputAllocation)
 {
-    kf_resize_rt::DeviceView source;
+    cv_triton_runtime::DeviceView source;
     source.ptr = 4096; source.rows = 48; source.cols = 32;
     source.channels = 1; source.step = 32;
-    kf_cvtcolor::Output output;
-    ASSERT_TRUE(kf_cvtcolor::resolve_output(source, COLOR_YUV2BGR_NV12, output).ok());
+    cv_triton_color::Output output;
+    ASSERT_TRUE(cv_triton_color::resolve_output(source, COLOR_YUV2BGR_NV12, output).ok());
     EXPECT_EQ(32, output.rows); EXPECT_EQ(32, output.cols); EXPECT_EQ(3, output.spec->dcn);
-    auto reject = [&](const kf_resize_rt::DeviceView& src)
-    { EXPECT_FALSE(kf_cvtcolor::resolve_output(src, COLOR_YUV2BGR_NV12, output).ok()); };
+    auto reject = [&](const cv_triton_runtime::DeviceView& src)
+    { EXPECT_FALSE(cv_triton_color::resolve_output(src, COLOR_YUV2BGR_NV12, output).ok()); };
     auto bad = source; bad.ptr = 0; reject(bad);
     bad = source; bad.rows = 0; reject(bad);
     bad = source; bad.cols = 31; reject(bad);
     bad = source; bad.rows = 47; reject(bad);
     bad = source; bad.step = 31; reject(bad);
-    bad = source; bad.type = kf_resize_rt::ElemType::F32; reject(bad);
+    bad = source; bad.type = cv_triton_runtime::ElemType::F32; reject(bad);
     bad = source; bad.rows = 2147483646; bad.cols = 2; bad.step = 2; reject(bad);
     bad = source; bad.rows = 6; bad.step = 536870912; reject(bad);
 }
 
-// The Xyz/Lab/Luv rows carry coefficients that cvtcolor.cpp computes (coeffs_for) when the table
-// is built. This proves the two agree for every such code, so a row added with the wrong `op` or
-// a code missing from coeffs_for's lists fails here rather than as a numeric mismatch somewhere
-// in a 640x480 image. It also pins the coefficient layout the kernel indexes by: slot order is
-// (BLUE-side, green, RED-side), so a BGR code's slot 0 must be the BLUE coefficient and an RGB
-// code's slot 0 the RED one.
+// Check coefficient rows against coeffs_for and verify the kernel's slot order:
+// BLUE-side, green, RED-side for BGR; RED-side, green, BLUE-side for RGB.
 TEST(Triton_CvtColor, CoefficientRowsMatchTheConstructor)
 {
-    for (const kf_cvtcolor::CodeSpec& spec : kf_cvtcolor::all())
+    for (const cv_triton_color::CodeSpec& spec : cv_triton_color::all())
     {
-        if (spec.op != kf_cvtcolor::Op::Xyz && spec.op != kf_cvtcolor::Op::Lab &&
-            spec.op != kf_cvtcolor::Op::Luv)
+        if (spec.op != cv_triton_color::Op::Xyz && spec.op != cv_triton_color::Op::Lab &&
+            spec.op != cv_triton_color::Op::Luv)
             continue;
         int k[9];
-        kf_cvtcolor::coeffs_for(spec.code, k);
+        cv_triton_color::coeffs_for(spec.code, k);
         for (int i = 0; i < 9; ++i)
             EXPECT_EQ(k[i], spec.k[i]) << spec.name << " coefficient " << i;
     }
@@ -771,30 +753,30 @@ TEST(Triton_CvtColor, CoefficientRowsMatchTheConstructor)
     // the CPU's BGR column order, i.e. {b,g,r} = {0.180423,0.357580,0.412453}*4096 rounded; the
     // BGR2Lab rows are the white-point-scaled sRGB2XYZ matrix, and their sum is exactly 2^12
     // (the CPU's own constructor asserts it, color_lab.cpp:1583).
-    const kf_cvtcolor::CodeSpec* x = kf_cvtcolor::find(COLOR_BGR2XYZ);
+    const cv_triton_color::CodeSpec* x = cv_triton_color::find(COLOR_BGR2XYZ);
     ASSERT_TRUE(x != nullptr);
     EXPECT_EQ(739, x->k[0]);
     EXPECT_EQ(1465, x->k[1]);
     EXPECT_EQ(1689, x->k[2]);
-    const kf_cvtcolor::CodeSpec* lab = kf_cvtcolor::find(COLOR_BGR2Lab);
+    const cv_triton_color::CodeSpec* lab = cv_triton_color::find(COLOR_BGR2Lab);
     ASSERT_TRUE(lab != nullptr);
     EXPECT_EQ(778, lab->k[0]);
     EXPECT_EQ(1777, lab->k[2]);
     for (int r = 0; r < 3; ++r)
         EXPECT_EQ(4096, lab->k[3 * r] + lab->k[3 * r + 1] + lab->k[3 * r + 2])
             << "RGB2Lab_b row " << r << " must sum to 1 << lab_shift";
-    // The reverse matrices are in DESTINATION-SLOT order, so the BGR and RGB variants of one
-    // family carry the same rows in the opposite order; the checks below pin that ordering.
-    const kf_cvtcolor::CodeSpec* labr = kf_cvtcolor::find(COLOR_Lab2BGR);
+    // Reverse matrix rows follow destination-slot order. BGR and RGB variants
+    // carry the same rows in opposite order.
+    const cv_triton_color::CodeSpec* labr = cv_triton_color::find(COLOR_Lab2BGR);
     ASSERT_TRUE(labr != nullptr);
     EXPECT_EQ(217, labr->k[0]);      // row 2 of the untransposed matrix: B from the lab triple
     EXPECT_EQ(12615, labr->k[6]);    // row 0: R
-    const kf_cvtcolor::CodeSpec* labrrgb = kf_cvtcolor::find(COLOR_Lab2RGB);
+    const cv_triton_color::CodeSpec* labrrgb = cv_triton_color::find(COLOR_Lab2RGB);
     ASSERT_TRUE(labrrgb != nullptr);
     EXPECT_EQ(12615, labrrgb->k[0]); // the RGB destination wants R first, so the rows swap
     EXPECT_EQ(217, labrrgb->k[6]);
     // Luv's reverse matrix is the same XYZ2sRGB matrix without the white-point factor.
-    const kf_cvtcolor::CodeSpec* luvr = kf_cvtcolor::find(COLOR_Luv2BGR);
+    const cv_triton_color::CodeSpec* luvr = cv_triton_color::find(COLOR_Luv2BGR);
     ASSERT_TRUE(luvr != nullptr);
     EXPECT_EQ(228, luvr->k[0]);
     EXPECT_EQ(13273, luvr->k[6]);

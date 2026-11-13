@@ -2,11 +2,10 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// cv::triton::resize through its real public entry (GpuMat + C++ launcher + binaries from the
-// runtime JIT) against the portable CPU oracle: copy, nearest, linear, cubic and AREA routes x
-// CV_8U/CV_32F x C1/C3/C4 x whole images and ROI views, with output reuse and guard bands. The
-// reference is deliberately not this build's cv::resize, whose result depends on the build, and
-// not cv::cuda::resize, which computes something else.
+// Public GpuMat resize tests against the portable CPU reference, including
+// copy and all four interpolation modes, CV_8U/CV_32F, C1/C3/C4, pitched ROIs,
+// output reuse and guard bands. The linked cv::resize may select different
+// optimized paths; cv::cuda::resize also has different numerical behavior.
 
 #include "test_helpers.hpp"
 #include "../validation/resize_cases.hpp"
@@ -128,7 +127,7 @@ TEST(Triton_Resize, RejectsWithoutFallback)
     const td::RuntimeStats b = td::runtimeStats();
     EXPECT_EQ(a.launches, b.launches);
     EXPECT_EQ(a.copies, b.copies);
-    // Outside the contract.
+    // Unsupported input formats.
     cuda::GpuMat out;
     EXPECT_EQ(Error::StsUnsupportedFormat, code([&] { cv::triton::resize(u8, out, Size(16, 16), 0, 0, INTER_LANCZOS4); }));
     cuda::GpuMat u16(8, 8, CV_16UC1);

@@ -2,18 +2,12 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Device-pointer entries of the triton module, for builds without cv::cuda.
-//
-// On a HIP build (TRITON_BACKEND=hip, e.g. Hygon BW1000 / gfx936) OpenCV has no CUDA, so
-// cv::cuda::GpuMat exists only as a type whose methods throw, and cv::cuda::Stream carries no
-// device stream. The GpuMat entries in opencv2/triton.hpp therefore cannot run there and
-// raise StsNotImplemented. These functions are the same three operations with the device
-// buffers and the stream named directly: the caller owns the allocations (a framework tensor,
-// hipMalloc, ...) and the stream; nothing here allocates, synchronises or falls back to CPU.
-//
-// They validate exactly what the GpuMat entries validate and go through the same runtime,
-// so a result is the one the contract defines (CPU-aligned; see the module description).
-// Including this header needs no CUDA or HIP toolkit header.
+// Caller-owned GPU images and native streams. Output is preallocated; calls are
+// asynchronous and do not fall back to CPU. Retain all storage until completion.
+// Source, destination and stream must belong to the selected device/context.
+// device is the backend device index. stream is hipStream_t/CUstream encoded as
+// an integer, or 0 for the default stream. Source and destination must not overlap.
+
 #ifndef OPENCV_TRITON_DEVICE_HPP
 #define OPENCV_TRITON_DEVICE_HPP
 
@@ -37,27 +31,58 @@ struct CV_EXPORTS DeviceImage
     std::size_t step = 0;     //!< row pitch in bytes
 };
 
-/** @brief Is a usable device present for `device` on the backend this module was built for?
- * Pure query: no allocation, no submission, no compilation. */
+/** @brief Return whether device is usable on the configured backend.
+ * @param device Backend device index.
+ */
 CV_EXPORTS bool haveDevice(int device);
 
-/** @brief cv::triton::resize on device buffers. `dst` must already be sized to dsize; dsize
- * must be explicit. `stream` is the backend's stream handle (hipStream_t / CUstream), 0 for
- * the default stream. Asynchronous: the call returns once the work is submitted. */
+/** @brief Resize a device image to an explicit size.
+ * @param src Source image; supported types match cv::triton::resize.
+ * @param dst Preallocated output of size dsize and src.type; must not overlap src.
+ * @param dsize Positive output size.
+ * @param interpolation INTER_NEAREST, INTER_LINEAR, INTER_CUBIC or INTER_AREA.
+ * @param device Backend device index owning both images and stream.
+ * @param stream Native hipStream_t/CUstream encoded as an integer; 0 selects the default.
+ * Retain image storage until stream completion.
+ */
 CV_EXPORTS void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
                              int interpolation, int device, std::uintptr_t stream);
 
-/** @brief Scale-aware form. Empty dsize resolves fx/fy with CPU resize precedence;
- * dst must already have the resolved size. Original scales are preserved. */
+/** @brief Resize using explicit size or scale factors.
+ * @param src Source image; supported types match cv::triton::resize.
+ * @param dst Preallocated output of the resolved size and src.type; must not overlap src.
+ * @param dsize Output size; if empty, derive it from fx/fy. Explicit size takes precedence.
+ * @param fx Horizontal scale; finite and positive when dsize is empty, otherwise ignored.
+ * @param fy Vertical scale; finite and positive when dsize is empty, otherwise ignored.
+ * @param interpolation INTER_NEAREST, INTER_LINEAR, INTER_CUBIC or INTER_AREA.
+ * @param device Backend device index owning both images and stream.
+ * @param stream Native stream handle; 0 selects the default. Retain storage until completion.
+ */
 CV_EXPORTS void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
                              double fx, double fy, int interpolation, int device, std::uintptr_t stream);
 
-/** @brief cv::triton::cvtColor on device buffers. dst's channel count is the code's. */
+/** @brief Convert a device image between colour spaces.
+ * @param src Source image with the code's required depth and channels.
+ * @param dst Preallocated code-specific output; must not overlap src. NV12/NV21
+ *            output has 2/3 of src.rows; other conversions preserve size.
+ * @param code Supported cv::COLOR_* value; see @ref tutorial_triton_cvtcolor.
+ * @param device Backend device index owning both images and stream.
+ * @param stream Native stream handle; 0 selects the default. Retain storage until completion.
+ */
 CV_EXPORTS void cvtColorDevice(const DeviceImage& src, const DeviceImage& dst, int code,
                                int device, std::uintptr_t stream);
 
-/** @brief cv::triton::warpAffine on device buffers. `M` is the 2x3 matrix, row-major, as
- * cv::warpAffine takes it; `flags`, `borderMode` and `borderValue` mean what they mean there. */
+/** @brief Apply an affine transformation to a device image.
+ * @param src Source image; supported types match cv::triton::warpAffine.
+ * @param dst Preallocated output; determines output size and must have src.type.
+ *            Must not overlap src. BORDER_TRANSPARENT requires initialized contents.
+ * @param M Six row-major coefficients of the 2x3 transformation matrix.
+ * @param flags Supported interpolation, optionally combined with WARP_INVERSE_MAP.
+ * @param borderMode Supported border mode; see cv::triton::warpAffine.
+ * @param borderValue Per-channel value used by BORDER_CONSTANT.
+ * @param device Backend device index owning both images and stream.
+ * @param stream Native stream handle; 0 selects the default. Retain storage until completion.
+ */
 CV_EXPORTS void warpAffineDevice(const DeviceImage& src, const DeviceImage& dst, const double M[6],
                                  int flags, int borderMode, const Scalar& borderValue,
                                  int device, std::uintptr_t stream);

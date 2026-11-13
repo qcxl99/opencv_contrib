@@ -5,9 +5,9 @@
 // Platform-agnostic core of cv::triton::resize. Both entries -- resizeCore() (device pointers)
 // and the GpuMat adapter (cuda_resize_adapter.cpp) -- reduce to detail::resizeDevice(), which
 // hands the request to the runtime JIT (src/runtime/runtime.hpp) and maps its status to an
-// OpenCV error. Numerics: OpenCV CPU cv::resize as the pinned reference configuration
-// as described in the public API, not cv::cuda::resize. There is no fallback to CPU or
-// to cv::cuda: a call that returns has submitted the computation (or the identity copy).
+// OpenCV error. Numerical behavior follows the CPU cv::resize formulas. There is
+// no CPU or cv::cuda fallback: a successful call has submitted the requested
+// computation or the identity copy.
 
 #include "precomp.hpp"
 #include "runtime/cvtcolor.hpp"
@@ -19,9 +19,9 @@ namespace cv { namespace triton {
 
 namespace detail {
 
-kf_resize_rt::DeviceView toDeviceView(const ImageView& v, int device, std::uintptr_t alloc_base, std::size_t alloc_bytes)
+cv_triton_runtime::DeviceView toDeviceView(const ImageView& v, int device, std::uintptr_t alloc_base, std::size_t alloc_bytes)
 {
-    kf_resize_rt::DeviceView d;
+    cv_triton_runtime::DeviceView d;
     d.ctx.device = device;            // the runtime identifies the context itself (cuCtxGetId)
     d.ptr = v.ptr;                    // the first element of the view: the ROI offset is already applied
     d.rows = v.rows;
@@ -31,18 +31,18 @@ kf_resize_rt::DeviceView toDeviceView(const ImageView& v, int device, std::uintp
     if (depth != CV_8U && depth != CV_32F && depth != CV_16U)
         CV_Error(Error::StsUnsupportedFormat,
                  "cv::triton: only CV_8U, CV_16U and CV_32F are supported");
-    d.type = depth == CV_8U ? kf_resize_rt::ElemType::U8
-             : (depth == CV_16U ? kf_resize_rt::ElemType::U16 : kf_resize_rt::ElemType::F32);
+    d.type = depth == CV_8U ? cv_triton_runtime::ElemType::U8
+             : (depth == CV_16U ? cv_triton_runtime::ElemType::U16 : cv_triton_runtime::ElemType::F32);
     d.step = v.step;
     d.alloc_base = alloc_base;
     d.alloc_bytes = alloc_bytes;
     return d;
 }
 
-void resizeDevice(const kf_resize_rt::DeviceView& src, const kf_resize_rt::DeviceView& dst, Size dsize,
+void resizeDevice(const cv_triton_runtime::DeviceView& src, const cv_triton_runtime::DeviceView& dst, Size dsize,
                   double fx, double fy, int interpolation, int device, std::uintptr_t stream)
 {
-    kf_resize_rt::ResizeRequest req;
+    cv_triton_runtime::ResizeRequest req;
     req.src = src;
     req.dst = dst;
     req.dsize_w = dsize.width;
@@ -50,33 +50,33 @@ void resizeDevice(const kf_resize_rt::DeviceView& src, const kf_resize_rt::Devic
     req.fx = fx;
     req.fy = fy;
     req.interpolation = interpolation;
-    kf_resize_rt::ExecContext ex;
+    cv_triton_runtime::ExecContext ex;
     ex.ctx = req.src.ctx;
     ex.ctx.device = device;
     ex.stream = stream;
-    const kf_resize_rt::Status s = runtime::resize(req, ex);
+    const cv_triton_runtime::Status s = runtime::resize(req, ex);
     requireStatus(s, "resize", true);
     // Asynchronous: everything is on `stream`. No implicit synchronisation.
 }
 
-void warpAffineDevice(const kf_warpaffine::Request& req, int device, std::uintptr_t stream)
+void warpAffineDevice(const cv_triton_warp::Request& req, int device, std::uintptr_t stream)
 {
-    kf_resize_rt::ExecContext ex;
+    cv_triton_runtime::ExecContext ex;
     ex.ctx = req.src.ctx;
     ex.ctx.device = device;
     ex.stream = stream;
-    const kf_resize_rt::Status s = runtime::warpAffine(req, ex);
+    const cv_triton_runtime::Status s = runtime::warpAffine(req, ex);
     requireStatus(s, "warpAffine", true);
     // Asynchronous: same contract as resizeDevice().
 }
 
-void cvtColorDevice(const kf_cvtcolor::Request& req, int device, std::uintptr_t stream)
+void cvtColorDevice(const cv_triton_color::Request& req, int device, std::uintptr_t stream)
 {
-    kf_resize_rt::ExecContext ex;
+    cv_triton_runtime::ExecContext ex;
     ex.ctx = req.src.ctx;
     ex.ctx.device = device;
     ex.stream = stream;
-    const kf_resize_rt::Status s = runtime::cvtColor(req, ex);
+    const cv_triton_runtime::Status s = runtime::cvtColor(req, ex);
     requireStatus(s, "cvtColor", true);
     // Asynchronous: same contract as resizeDevice().
 }

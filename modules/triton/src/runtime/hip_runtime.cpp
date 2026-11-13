@@ -2,7 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Runtime JIT, HIP driver side (Hygon BW1000 / gfx936, DTK). See runtime.hpp for the contract.
+// Runtime JIT, HIP driver side (Hygon BW1000 / gfx936, DTK). See runtime.hpp for execution and ownership rules.
 //
 // GENERATED from cuda_runtime.cpp by tools/port_hip_runtime.py -- do not edit; edit the CUDA
 // file and re-run the port. Exactly one of the two is compiled into a build (CMakeLists.txt).
@@ -12,8 +12,8 @@
 //     -> 936; an arch with a letter suffix such as gfx90a has no integer form in the key and is
 //     refused); warp_size from the device (64 on gfx936, not 32).
 //   * Kernels: kernels/<op>_cpu_hip.py where the CUDA source calls a libdevice primitive
-//     flagtree's hip build lacks (resize, warpAffine; tools/make_kernels_cpu_hip.py derives
-//     them and refuses a stale copy); cvtColor also uses the derived source for explicit rounded float operations.
+//     the HIP compiler lacks; tools/make_kernels_cpu_hip.py derives resize, cvtColor
+//     and warpAffine sources and rejects stale copies.
 //   * Binary: manifest format "hsaco", loaded with hipModuleLoadData.
 //   * Compile helper environment: ROCM_PATH is forwarded (the hip compiler finds clang and its
 //     device libraries through it), and the GPU is hidden from the helper with the HIP and ROCR
@@ -27,7 +27,7 @@
 #include "runtime.hpp"
 #include "compile_protocol.hpp"
 #include "cvtcolor.hpp"
-#include "reference_cpu.hpp"
+#include "resize_plan.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -53,8 +53,8 @@ namespace cv { namespace triton {
 
 namespace {
 
-using namespace kf_resize_rt;
-namespace ref = kf_resize_ref;
+using namespace cv_triton_runtime;
+namespace ref = cv_triton_resize;
 
 // ----------------------------------------------------------------- configuration
 
@@ -101,13 +101,18 @@ const Config& config()
 {
     static const Config c = []() {
         Config k;
-        // Resources: explicit override, then the install layout relative to this library,
-        // then the module source tree (an uninstalled build).
+        // Prefer an explicit resource directory, then the relocatable library layout.
+        // Static consumers use the configured install prefix; builds can use the source tree.
         std::string r = envStr("OPENCV_TRITON_RESOURCES");
         if (r.empty() || !hasResources(r))
         {
             const std::string rel = libraryDir() + "/" + OPENCV_TRITON_REL_RESOURCES;
-            r = hasResources(rel) ? rel : std::string(OPENCV_TRITON_SOURCE_RESOURCES);
+            if (hasResources(rel)) r = rel;
+#ifdef OPENCV_TRITON_STATIC_BUILD
+            else if (hasResources(OPENCV_TRITON_INSTALL_RESOURCES))
+                r = OPENCV_TRITON_INSTALL_RESOURCES;
+#endif
+            else r = OPENCV_TRITON_SOURCE_RESOURCES;
         }
         k.resources = r;
         k.kernels = r + "/kernels/resize_cpu_hip.py";
@@ -397,7 +402,7 @@ bool capturing(hipStream_t stream)
 //  * capturing -- the work is not executing, it is being recorded, so there is no completion to
 //    wait for. Creating an event here would also put a capture-scoped event into `pending`, and
 //    the NEXT capture that waits on it fails with CUDA_ERROR_STREAM_CAPTURE_ISOLATION
-//    . The graph produced by
+//    during a later capture. The graph produced by
 //    this capture may be launched much later, after the LRU has evicted everything it read, so
 //    the module and tables are PINNED instead of being left to the cache. Without this, a
 //    replay after an eviction would reference an unloaded module or a freed table buffer.
@@ -601,7 +606,8 @@ void pack(std::vector<unsigned char>& host, std::map<std::string, std::size_t>& 
     off[name] = at;
 }
 
-// Coordinate/coefficient tables built by the portable resize reference's plan half.
+// Coordinate and coefficient tables shared by the runtime and test reference, matching
+// the formulas used by the generic OpenCV resize implementation.
 void buildTables(const Normalized& n, TableRes& t)
 {
     const ref::Route k = n.route.kind;
@@ -744,7 +750,7 @@ Status launch(const ModuleRes& m, const std::map<std::string, Arg>& args, const 
 
 // The div tables RGB2HSV_b reads. Keyed by the code, because the hue range (180 or 256)
 // changes hdiv while sdiv stays the same; two codes with the same range share one upload.
-std::shared_ptr<TableRes> cvtTablesFor(const kf_cvtcolor::HsvTables& hv, int code, hipCtx_t ctx,
+std::shared_ptr<TableRes> cvtTablesFor(const cv_triton_color::HsvTables& hv, int code, hipCtx_t ctx,
                                        std::uint64_t gen, hipStream_t stream, Status& st)
 {
     State& s = S();
@@ -801,7 +807,7 @@ std::shared_ptr<TableRes> cvtTablesFor(const kf_cvtcolor::HsvTables& hv, int cod
     return t;
 }
 
-bool p1Route(ref::Route r)
+bool supportedResizeRoute(ref::Route r)
 {
     return r == ref::ROUTE_COPY || r == ref::ROUTE_NEAREST || r == ref::ROUTE_LINEAR || r == ref::ROUTE_CUBIC ||
            r == ref::ROUTE_AREA_FAST || r == ref::ROUTE_AREA;
@@ -813,21 +819,21 @@ bool p1Route(ref::Route r)
 // the same 1.7 MB twice for BGR2Luv and RGB2Luv.
 //
 // The packing order is the contract with the kernel (kernels/cvtcolor_cpu.py: T_GAMMA, T_CBRT,
-// ...) and with kf_cvtcolor::LabLuvLayout. Both sides are checked by the numeric tests; a
+// ...) and with cv_triton_color::LabLuvLayout. Both sides are checked by the numeric tests; a
 // mismatch shows up as every pixel being wrong, not as a subtle drift.
 std::shared_ptr<TableRes> labluvTablesFor(int code, hipCtx_t ctx, std::uint64_t gen,
                                           hipStream_t stream, Status& st)
 {
     // family: 0 = XYZ (no tables), 1 = Lab/Luv reverse + Lab forward (the small tables),
     // 2 = Luv forward (the big grid). 2 implies 1, so Luv forward gets both.
-    const kf_cvtcolor::CodeSpec* spec = kf_cvtcolor::find(code);
+    const cv_triton_color::CodeSpec* spec = cv_triton_color::find(code);
     // Only Op::Lab and Op::Luv read these tables. Every other op -- and XYZ, whose coefficients
     // are constexprs -- gets NO table set at all, which matters: this cache is shared with the
     // per-code sdiv/hdiv sets and is small (256), so uploading a 2.3 MB set for a code that never
     // reads it would evict live entries and turn a table hit into a load on every call.
-    if (!spec || (spec->op != kf_cvtcolor::Op::Lab && spec->op != kf_cvtcolor::Op::Luv))
+    if (!spec || (spec->op != cv_triton_color::Op::Lab && spec->op != cv_triton_color::Op::Luv))
         return nullptr;
-    const bool isLuvFwd = spec->op == kf_cvtcolor::Op::Luv && !spec->inverse;
+    const bool isLuvFwd = spec->op == cv_triton_color::Op::Luv && !spec->inverse;
     const std::string key = std::to_string(gen) + "|labluv|" + (isLuvFwd ? "2" : "1");
 
     State& s = S();
@@ -848,7 +854,7 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, hipCtx_t ctx, std::uint64_t 
         poison = s.poison;
     }
 
-    const kf_cvtcolor::LabLuvTables& tab = kf_cvtcolor::labluv_tables();
+    const cv_triton_color::LabLuvTables& tab = cv_triton_color::labluv_tables();
     auto t = std::make_shared<TableRes>();
     t->ctx = ctx;
     t->gen = gen;
@@ -856,8 +862,8 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, hipCtx_t ctx, std::uint64_t 
     // to 256 bytes, which happens to match these offsets (they are all multiples of 256 entries
     // x 4 bytes) -- if an offset is ever added that is not, this needs a manual layout instead.
     {
-        std::vector<int> t32(static_cast<std::size_t>(kf_cvtcolor::LabLuvLayout::t32_entries), 0);
-        using L = kf_cvtcolor::LabLuvLayout;
+        std::vector<int> t32(static_cast<std::size_t>(cv_triton_color::LabLuvLayout::t32_entries), 0);
+        using L = cv_triton_color::LabLuvLayout;
         std::copy(tab.gamma.begin(), tab.gamma.end(), t32.begin() + L::gamma);
         std::copy(tab.cbrt.begin(), tab.cbrt.end(), t32.begin() + L::cbrt);
         std::copy(tab.yf.begin(), tab.yf.end(), t32.begin() + L::yf);
@@ -922,7 +928,7 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
     Status st = normalize(req, n);
     if (!st.ok()) return st;
     if (routeName) *routeName = ref::route_name(n.route.kind);
-    if (!p1Route(n.route.kind))
+    if (!supportedResizeRoute(n.route.kind))
     {
         Status u;
         u.code = Code::Unsupported;
@@ -1032,12 +1038,15 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
 // One flat pass over output pixels. Everything that decides what is computed lives in
 // cvtcolor.cpp (the code table, the validation, the compile key); this only publishes the
 // two div tables and launches.
-Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::string* opName)
+Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std::string* opName)
 {
-    kf_cvtcolor::Normalized n;
-    Status st = kf_cvtcolor::normalize(req, n);
+    cv_triton_color::Normalized n;
+    Status st = cv_triton_color::normalize(req, n);
     if (!st.ok()) return st;
-    const kf_cvtcolor::CodeSpec& spec = *n.spec;
+    const cv_triton_color::CodeSpec& spec = *n.spec;
+    n.f32_cpu_separate4 = n.f32 &&
+        (spec.op == cv_triton_color::Op::Gray || spec.op == cv_triton_color::Op::Yuv ||
+         spec.op == cv_triton_color::Op::YCrCb) && cv_triton_color::float_cpu_separate4();
     if (opName) *opName = spec.name;
 
     const Config& c = config();
@@ -1068,10 +1077,10 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
     // spelled out here because KernelKey stores it as name/value pairs.
     KernelKey key;
     key.kernel = "_cvtcolor_cpu_kernel";
-    key.signature = kf_cvtcolor::signature(n);
+    key.signature = cv_triton_color::signature(n);
     key.cfg.block_h = 1;
-    key.cfg.block_w = kf_cvtcolor::block_size(n);
-    key.cfg.num_warps = kf_cvtcolor::num_warps(n);
+    key.cfg.block_w = cv_triton_color::block_size(n);
+    key.cfg.num_warps = cv_triton_color::num_warps(n);
     key.cfg.num_stages = 3;
     key.cfg.ry = 1;
     key.target.backend = "hip";
@@ -1092,6 +1101,7 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
                       // (tools/compile_helper.py: `constexprs != the kernel's`).
                       {"U16", n.u16 ? 1 : 0},
                       {"F32", n.f32 ? 1 : 0},
+                      {"F32_CPU_SEPARATE4", n.f32_cpu_separate4 ? 1 : 0},
                       {"I0", spec.perm[0]},
                       {"I1", spec.perm[1]},
                       {"I2", spec.perm[2]},
@@ -1116,8 +1126,8 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
     // The two int[256] tables RGB2HSV_b divides by. They are uploaded through the same
     // stream-ordered table cache the resize plans use, so a launch can never read one before
     // its upload completed.
-    kf_cvtcolor::HsvTables hv =
-        (spec.code == 66 || spec.code == 67) ? kf_cvtcolor::hsv_tables_full() : kf_cvtcolor::hsv_tables();
+    cv_triton_color::HsvTables hv =
+        (spec.code == 66 || spec.code == 67) ? cv_triton_color::hsv_tables_full() : cv_triton_color::hsv_tables();
     std::shared_ptr<TableRes> tab = cvtTablesFor(hv, spec.code, ctx, gen, stream, st);
     if (!tab) return st;
 
@@ -1125,7 +1135,7 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
     // constexprs); the others get the family's tables, and the pointers that family does not use
     // still resolve to something valid inside the same allocation.
     std::shared_ptr<TableRes> ltab = labluvTablesFor(spec.code, ctx, gen, stream, st);
-    if (st.code == kf_resize_rt::Code::Error) return st;
+    if (st.code == cv_triton_runtime::Code::Error) return st;
 
     std::map<std::string, Arg> a;
     auto ptr = [&](const char* k, std::uintptr_t v) { Arg x; x.kind = 'p'; x.p = v; a[k] = x; };
@@ -1149,17 +1159,17 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
     // checked that step is a multiple of the element size, so the division is exact.
     i32("cols", n.cols);
     i32("rows", n.rows);
-    i32("src_rs", static_cast<long long>(req.src.step / kf_resize_rt::elem_size(req.src.type)));
-    i32("dst_rs", static_cast<long long>(req.dst.step / kf_resize_rt::elem_size(req.dst.type)));
+    i32("src_rs", static_cast<long long>(req.src.step / cv_triton_runtime::elem_size(req.src.type)));
+    i32("dst_rs", static_cast<long long>(req.dst.step / cv_triton_runtime::elem_size(req.dst.type)));
     // Where the chroma plane starts, in elements from `src`: the Y plane is `n.rows` tall. For a
     // code with no chroma plane the value is unused. It uses the DESTINATION height, which for a
     // 4:2:0 decode is the source height * 2/3 -- using src.rows would read 1.5x too far into the
     // buffer, and that is a silent wrong image rather than a crash.
     i32("uv_rs", static_cast<long long>(n.rows) *
-                 static_cast<long long>(req.src.step / kf_resize_rt::elem_size(req.src.type)));
+                 static_cast<long long>(req.src.step / cv_triton_runtime::elem_size(req.src.type)));
 
     unsigned grid[3];
-    kf_cvtcolor::grid(n, key.cfg.block_w, grid);
+    cv_triton_color::grid(n, key.cfg.block_w, grid);
     st = launch(*mod, a, grid, stream);
     if (!st.ok()) return st;
 
@@ -1172,10 +1182,10 @@ Status cvtColor(const kf_cvtcolor::Request& req, const ExecContext& ex, std::str
 
 // Same shape as cvtColor: the plan half (validation, the sampling matrix, the key) lives in
 // warpaffine.cpp and this publishes the key and launches.
-Status warpAffine(const kf_warpaffine::Request& req, const ExecContext& ex)
+Status warpAffine(const cv_triton_warp::Request& req, const ExecContext& ex)
 {
-    kf_warpaffine::Normalized n;
-    Status st = kf_warpaffine::normalize(req, n);
+    cv_triton_warp::Normalized n;
+    Status st = cv_triton_warp::normalize(req, n);
     if (!st.ok()) return st;
 
     const Config& c = config();
@@ -1205,27 +1215,27 @@ Status warpAffine(const kf_warpaffine::Request& req, const ExecContext& ex)
     // CUDA uses the upstream per-mode tiles: interpolation benefits from a
     // shorter source-row span, while single-tap nearest keeps contiguous rows.
     if (std::string(name()) == "cuda-jit") {
-        n.block_h = n.mode == kf_warpaffine::Mode::Nearest ? 1 : 2;
-        n.block_w = n.mode == kf_warpaffine::Mode::Nearest ? 256 : 64;
+        n.block_h = n.mode == cv_triton_warp::Mode::Nearest ? 1 : 2;
+        n.block_w = n.mode == cv_triton_warp::Mode::Nearest ? 256 : 64;
     }
     // HIP keeps its independently measured defaults.
     if (std::string(name()) == "hip-jit" && n.dst_h >= 64 && n.dst_w >= 256 &&
         static_cast<long long>(n.dst_h)*n.dst_w >= 65536 &&
-        !(n.channels == 3 && n.mode == kf_warpaffine::Mode::Nearest &&
+        !(n.channels == 3 && n.mode == cv_triton_warp::Mode::Nearest &&
           static_cast<long long>(n.dst_h)*n.dst_w < (1<<22))) {
-        n.block_h = n.channels == 1 && n.mode != kf_warpaffine::Mode::Cubic ? 2 : 1;
+        n.block_h = n.channels == 1 && n.mode != cv_triton_warp::Mode::Cubic ? 2 : 1;
         n.block_w = n.block_h == 2 ? 128 : 256;
         n.num_warps = 4;
     }
-    const kf_warpaffine::Mode wmode = n.mode;
-    const char* wkernel = wmode == kf_warpaffine::Mode::Nearest ? "_warp_nearest"
-                        : (wmode == kf_warpaffine::Mode::Linear ? "_warp_linear" : "_warp_cubic");
-    const char* wroute = wmode == kf_warpaffine::Mode::Nearest ? "nearest"
-                       : (wmode == kf_warpaffine::Mode::Linear ? "linear" : "cubic");
+    const cv_triton_warp::Mode wmode = n.mode;
+    const char* wkernel = wmode == cv_triton_warp::Mode::Nearest ? "_warp_nearest"
+                        : (wmode == cv_triton_warp::Mode::Linear ? "_warp_linear" : "_warp_cubic");
+    const char* wroute = wmode == cv_triton_warp::Mode::Nearest ? "nearest"
+                       : (wmode == cv_triton_warp::Mode::Linear ? "linear" : "cubic");
 
     KernelKey key;
     key.kernel = wkernel;
-    key.signature = kf_warpaffine::signature(n);
+    key.signature = cv_triton_warp::signature(n);
     key.cfg.block_h = n.block_h;
     key.cfg.block_w = n.block_w;
     key.cfg.num_warps = n.num_warps;
@@ -1248,7 +1258,7 @@ Status warpAffine(const kf_warpaffine::Request& req, const ExecContext& ex)
                       {"FUSED", n.fused ? 1 : 0},
                       {"TRANSPARENT", n.border_mode_code == 5 ? 1 : 0},
                       {"cn", n.channels}};
-    if (n.mode != kf_warpaffine::Mode::Nearest) {
+    if (n.mode != cv_triton_warp::Mode::Nearest) {
         key.constexprs.push_back({"U8", n.u8 ? 1 : 0});
         key.constexprs.push_back({"U16", n.u16 ? 1 : 0});
     }
@@ -1272,8 +1282,8 @@ Status warpAffine(const kf_warpaffine::Request& req, const ExecContext& ex)
     // Row pitch in ELEMENTS. A GpuMat's step is padded for alignment, so the kernel cannot
     // recompute the pitch from the width: doing that reads the wrong row on every row but the
     // first, which is the kind of bug that looks like a wrong matrix.
-    i32("src_rs", static_cast<long long>(req.src.step / kf_resize_rt::elem_size(req.src.type)));
-    i32("dst_rs", static_cast<long long>(req.dst.step / kf_resize_rt::elem_size(req.dst.type)));
+    i32("src_rs", static_cast<long long>(req.src.step / cv_triton_runtime::elem_size(req.src.type)));
+    i32("dst_rs", static_cast<long long>(req.dst.step / cv_triton_runtime::elem_size(req.dst.type)));
     // The Scalar, in the source dtype. A runtime argument rather than a constexpr: a CV_32F
     // border of 0.5 must survive exactly, and as a constexpr it would be truncated. For CV_8U
     // the value is what saturate_cast<uchar> makes of it, which is what the CPU fills.
@@ -1283,7 +1293,7 @@ Status warpAffine(const kf_warpaffine::Request& req, const ExecContext& ex)
     }
 
     unsigned g[3];
-    kf_warpaffine::grid(n, g);
+    cv_triton_warp::grid(n, g);
     st = launch(*mod, a, g, stream);
     if (!st.ok()) return st;
 

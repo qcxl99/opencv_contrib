@@ -373,10 +373,10 @@ TEST(Triton_Runtime, ArtifactIntegrity)
     td::RuntimeStats st = td::runtimeStats();
     const std::string dir = st.last_artifact, key = st.last_key;
     ASSERT_FALSE(dir.empty());
-    kf_resize_rt::Manifest m;
+    cv_triton_runtime::Manifest m;
     std::string why;
-    ASSERT_TRUE(kf_resize_rt::verify_artifact(dir, key, m, why)) << why;
-    EXPECT_TRUE(kf_resize_rt::launch_abi_ok(m, why)) << why;
+    ASSERT_TRUE(cv_triton_runtime::verify_artifact(dir, key, m, why)) << why;
+    EXPECT_TRUE(cv_triton_runtime::launch_abi_ok(m, why)) << why;
     EXPECT_EQ("_resize_cpu_nearest_kernel", m.function);
     EXPECT_EQ(0, m.global_scratch_bytes);
     EXPECT_EQ(0, m.profile_scratch_bytes);
@@ -398,16 +398,16 @@ TEST(Triton_Runtime, ArtifactIntegrity)
         f.seekp(static_cast<std::streamoff>(m.binary_bytes / 2));
         f.write(&c, 1);
     }
-    kf_resize_rt::Manifest bad;
-    EXPECT_FALSE(kf_resize_rt::verify_artifact(dir, key, bad, why));
+    cv_triton_runtime::Manifest bad;
+    EXPECT_FALSE(cv_triton_runtime::verify_artifact(dir, key, bad, why));
     td::resetRuntimeStats();
     cuda::GpuMat d2;
     runOne(host, dsz, INTER_NEAREST, s, d2);
     st = td::runtimeStats();
     EXPECT_EQ(1, st.disk_rejected);
     EXPECT_EQ(1, st.helper_compiles);
-    kf_resize_rt::Manifest again;
-    EXPECT_TRUE(kf_resize_rt::verify_artifact(dir, key, again, why)) << why;
+    cv_triton_runtime::Manifest again;
+    EXPECT_TRUE(cv_triton_runtime::verify_artifact(dir, key, again, why)) << why;
     Mat got;
     d2.download(got);
     EXPECT_TRUE(meetsContract(got, oracle(host, dsz, 0, 0, INTER_NEAREST), INTER_NEAREST));
@@ -436,11 +436,9 @@ TEST(Triton_Runtime, ArtifactIntegrity)
 //           -> replay twice with DIFFERENT inputs and check both answers
 //           -> destroy the graph -> release the pins -> confirm the resources are freed
 //
-// Change inputs and overwrite dst between replays so an empty/nonexecuting graph fails.
-// The public entry, not the internal one. A module user has no access to
-// detail::releaseCapturePins(), so the pin must be releasable through cv::triton:: with the
-// same effect; otherwise the header would promise graph support while leaving the resources
-// permanently held.
+// Change input and overwrite output between replays so an empty or inactive
+// graph cannot pass by retaining the warmup result. Release through the public
+// API, since applications cannot access private runtime resource functions.
 TEST(Triton_Runtime, PublicGraphResourceRelease)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
@@ -605,7 +603,7 @@ TEST(Triton_Runtime, CaptureSurvivesEviction)
 // The two scratch arguments are null only under a validated compiler ABI and zero scratch bytes.
 TEST(Triton_Runtime, ScratchArgumentsAreConditional)
 {
-    using kf_resize_rt::Manifest;
+    using cv_triton_runtime::Manifest;
     Manifest ok;
     ok.compiler = "triton-3.6.0";
     // The ABI check is keyed by (compiler, binary format): a HIP build can report the same
@@ -617,34 +615,34 @@ TEST(Triton_Runtime, ScratchArgumentsAreConditional)
     ok.abi = {{"src", "*u8", "u64", false}, {"W", "i32", "u32", false},
               {"global_scratch", "*i8", "u64", true}, {"profile_scratch", "*i8", "u64", true}};
     std::string why;
-    EXPECT_TRUE(kf_resize_rt::launch_abi_ok(ok, why)) << why;
+    EXPECT_TRUE(cv_triton_runtime::launch_abi_ok(ok, why)) << why;
     Manifest m = ok;
     m.compiler = "triton-9.9.9";
-    EXPECT_FALSE(kf_resize_rt::launch_abi_ok(m, why)) << "a compiler whose ABI was not validated";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "a compiler whose ABI was not validated";
     // The format is a key PART, not a decoration: "hsaco" is a legitimately validated ABI for
     // the same version string (flagtree's HIP build), while an empty or unknown format is not
     // validated at all -- and must not pass by falling back to the compiler string alone.
     m = ok;
     m.format.clear();
-    EXPECT_FALSE(kf_resize_rt::launch_abi_ok(m, why)) << "no binary format cannot be validated";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "no binary format cannot be validated";
     m = ok;
     m.format = "exe";
-    EXPECT_FALSE(kf_resize_rt::launch_abi_ok(m, why)) << "an unknown binary format is not validated";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "an unknown binary format is not validated";
     m = ok;
     m.format = "hsaco";
-    EXPECT_TRUE(kf_resize_rt::launch_abi_ok(m, why)) << "the HIP format is validated for the same ABI";
+    EXPECT_TRUE(cv_triton_runtime::launch_abi_ok(m, why)) << "the HIP format is validated for the same ABI";
     m = ok;
     m.global_scratch_bytes = 1024;
-    EXPECT_FALSE(kf_resize_rt::launch_abi_ok(m, why)) << "the kernel needs scratch memory";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "the kernel needs scratch memory";
     m = ok;
     m.profile_scratch_bytes = -1;
-    EXPECT_FALSE(kf_resize_rt::launch_abi_ok(m, why)) << "scratch size unknown";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "scratch size unknown";
     m = ok;
     m.abi.pop_back();
-    EXPECT_FALSE(kf_resize_rt::launch_abi_ok(m, why)) << "only one trailing pointer";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "only one trailing pointer";
     m = ok;
     m.abi[2].name = "something_else";
-    EXPECT_FALSE(kf_resize_rt::launch_abi_ok(m, why)) << "not the expected trailing pointers";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "not the expected trailing pointers";
 }
 
 }}  // namespace

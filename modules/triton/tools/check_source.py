@@ -38,7 +38,7 @@ def main():
                    '-Wall', '-Wextra', '-Werror', '-I' + str(runtime),
                    str(module / 'test' / 'cpu' / 'test_protocol.cpp')]
         command += [str(runtime / name) for name in
-                    ('reference_cpu.cpp', 'provider.cpp', 'compile_protocol.cpp')]
+                    ('resize_plan.cpp', 'provider.cpp', 'compile_protocol.cpp')]
         subprocess.run(command + ['-o', str(binary)], check=True)
         subprocess.run([str(binary), sys.executable, temporary], check=True)
     print('PASS: source notices, Python syntax, HIP derivations and CPU protocol controls')

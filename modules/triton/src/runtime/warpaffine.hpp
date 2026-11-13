@@ -5,20 +5,17 @@
 // Pure part of the warpAffine provider: validation and the explicit compile key. No device
 // access, so it is testable without a GPU.
 //
-// Semantics are CPU cv::warpAffine as described in the public API, NOT
-// cv::cuda::warpAffine. The two differ: this OpenCV's CPU warpAffine evaluates float
-// coordinates with float weights (warp_kernels.simd.hpp), while the GPU kernel still runs the
-// older fixed-point remap pipeline. cv::cuda::warpAffine is a timing baseline only.
+// Sampling follows the floating-point CPU cv::warpAffine paths in
+// modules/imgproc/src/warp_kernels.simd.hpp. cv::cuda::warpAffine uses a different
+// fixed-point sampling pipeline and is not a numerical reference for these kernels.
 //
 // Supported: INTER_NEAREST, INTER_LINEAR and INTER_CUBIC; INTER_AREA aliases LINEAR;
 // CV_8U/CV_16U/CV_32F, 1/3/4 channels; five standard borders plus TRANSPARENT for
 // NEAREST/LINEAR/AREA; WARP_INVERSE_MAP both ways. CUBIC+TRANSPARENT is refused, as is
-// INTER_LANCZOS4, whose 8x8 table is outside the supported algorithm subset.
+// INTER_LANCZOS4, whose 8x8 interpolation is not implemented.
 //
-// CUBIC is a different CPU code path (genericWarp -> bicubicVec), not another member of the
-// invoker family, and it is the one place the "selected vector path" rule does not apply:
-// that path computes each column from the absolute x with no fma, so it has no width
-// body/tail boundary of that invoker. Its reference is the NATURAL-WIDTH call.
+// CUBIC follows genericWarp -> bicubicVec. This path computes columns from
+// absolute x without FMA; tests use the natural-width CPU destination as reference.
 #pragma once
 
 #include <cstddef>
@@ -29,13 +26,13 @@
 #include "opencv2/core/cvdef.h"   // CV_EXPORTS
 #include "provider.hpp"
 
-namespace kf_warpaffine {
+namespace cv_triton_warp {
 
 // Interpolation ids, matching cv::InterpolationFlags.
 enum class Mode : int { Nearest = 0, Linear = 1, Cubic = 2 };
 
 struct Request {
-    kf_resize_rt::DeviceView src, dst;
+    cv_triton_runtime::DeviceView src, dst;
     // The 2x3 matrix as cv::warpAffine takes it (row-major, 6 doubles).
     double M[6] = {1, 0, 0, 0, 1, 0};
     int interpolation = 1;     // cv::INTER_LINEAR; cv::INTER_AREA normalizes to Linear
@@ -70,14 +67,14 @@ struct Normalized {
 };
 
 // Source/options admission before dst allocation; no device work or reference calibration.
-kf_resize_rt::Status validate_source(const Request& req);
+cv_triton_runtime::Status validate_source(const Request& req);
 
 // Pure output-dependent admission before allocation. Dimensions are rows then columns.
 // Reuses source rules and rejects unrepresentable sampling expressions; no CPU calibration.
-kf_resize_rt::Status validate_output(const Request& req, int dst_h, int dst_w);
+cv_triton_runtime::Status validate_output(const Request& req, int dst_h, int dst_w);
 
 // Validation, then a cached linked-CPU arithmetic probe (no GPU). Fills every field of out.
-kf_resize_rt::Status normalize(const Request& req, Normalized& out);
+cv_triton_runtime::Status normalize(const Request& req, Normalized& out);
 
 // The closed-form 2x3 inverse cv::warpAffine uses (D = m0*m4 - m1*m3; D = D != 0 ? 1/D : 0).
 void invert(const double M[6], double out[6]);
@@ -94,4 +91,4 @@ std::string constexprs_text(const Normalized& n);
 // Grid: one program per (BLOCK_H rows, BLOCK_W pixels) tile.
 void grid(const Normalized& n, unsigned out[3]);
 
-}  // namespace kf_warpaffine
+}  // namespace cv_triton_warp

@@ -13,8 +13,8 @@
 // Compile and first-load costs are excluded by warming up before the measured cycle, and the
 // destination is preallocated so allocation is not in the timed region.
 //
-// Small workloads can be dominated by host submission. These synchronized-call
-// timings must not be reported as pure device execution or graph-replay timings.
+// Host submission overhead can dominate short operations. These public-call
+// timings do not isolate device execution time.
 
 #include "perf_precomp.hpp"
 #include "../validation/cvtcolor_cases.hpp"
@@ -68,7 +68,8 @@ PERF_TEST_P(Sz_Code, TritonCvtColor, testing::Combine(
 
     const cv::Mat result = dst.download();
     ASSERT_TRUE(triton_test::meetsCvtContract(result, triton_test::cpuCvt(host, row->code), host,
-                                             triton_test::cvt_cases::floatArithmetic(row->code)));
+                                             triton_test::cvt_cases::floatArithmetic(row->code),
+                                             triton_test::cvt_cases::floatArithmetic(row->code) && cv_triton_color::float_cpu_separate4()));
     SANITY_CHECK(result, 1e-10);
 }
 
@@ -122,7 +123,8 @@ PERF_TEST_P(Sz_ExtendedCvt, TritonCvtColorExtended, testing::Combine(
     }
     const cv::Mat result = dst.download();
     ASSERT_TRUE(triton_test::meetsCvtContract(result, triton_test::cpuCvt(host, row->code), host,
-                                             triton_test::cvt_cases::floatArithmetic(row->code)));
+                                             triton_test::cvt_cases::floatArithmetic(row->code),
+                                             triton_test::cvt_cases::floatArithmetic(row->code) && cv_triton_color::float_cpu_separate4()));
     SANITY_CHECK(result, 1e-10);
 }
 

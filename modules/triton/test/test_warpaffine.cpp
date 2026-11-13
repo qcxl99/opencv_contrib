@@ -2,26 +2,15 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// cv::triton::warpAffine through its real public entry (GpuMat + C++ planner + binaries from
-// the runtime JIT) against this build's own cv::warpAffine.
-//
-// The selected reference uses this linked CPU build's padded VECTOR path
-// for NEAREST/LINEAR/AREA and its natural-width call for CUBIC. These are named
-// reference routes, not a portable oracle or a promise about arbitrary CPU
-// builds/natural destination widths. Fused versus separate arithmetic is
-// calibrated from actual CPU outputs per dtype/channel/useOptimized state;
-// hardware FMA support alone does not identify the compiled dispatch path.
-// uint8 must be exact, uint16 allows one level, and the float32 bound is per
-// element. See cpuWarp below for the width-dependent body/tail distinction.
-//
-// Coverage: all three depths and every channel count, both of the invoker-family
-// interpolations and CUBIC, against the CPU (MatchesCpu); CUBIC's width invariance and its
-// natural-width agreement (CpuCubicIsWidthInvariant, CubicMatchesNaturalWidth); the Scalar
-// border in all its forms (BorderValueIsAScalar -- the multi-channel and CV_32F cases are
-// separate tests because each was a real defect), sub-pixel tie coordinates
-// (SubPixelCoordinates), inverse and singular matrices, negative scale and strong shear,
-// extreme coordinates, 1-pixel axes, ROI and padded layouts, output reuse with guard bands,
-// and the rejection surface.
+// Public GpuMat accuracy tests against the linked CPU implementation.
+// NEAREST/LINEAR/AREA use its padded vector-path reference; CUBIC uses a natural-
+// width call. Fused versus separate arithmetic is identified from CPU outputs
+// per depth, channel count and cv::useOptimized() state. Hardware FMA support
+// alone does not identify the compiled path. These tests do not promise matching
+// output from arbitrary CPU builds or natural destination widths.
+// CV_8U is exact, CV_16U permits one level, and CV_32F uses a per-element bound.
+// Coverage includes interpolation/borders, affine geometry, degenerate axes,
+// pitched ROIs, output reuse, guard bands and unsupported requests.
 
 #include "test_helpers.hpp"
 
@@ -35,7 +24,7 @@ namespace opencv_test { namespace {
 
 using namespace triton_test;
 
-namespace wa = kf_warpaffine;
+namespace wa = cv_triton_warp;
 
 // ---------------------------------------------------------------- helpers
 
@@ -69,20 +58,15 @@ static Mat gpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int bord
     return out;
 }
 
-/** Mode-specific reference: padded VECTOR for NN/LINEAR/AREA, natural width for CUBIC.
+/** Padded vector-path reference for NEAREST/LINEAR/AREA; natural width for CUBIC.
  *
- * The CPU is not one function of (src, M, dsize). Its SIMD body computes the column term as
- * v_fma(M0, x, float(y*M1 + M2)) while its scalar tail -- the remainder past the vector width --
- * computes x*M0 + y*M1 + M2. They differ by an ulp, and at a 0.5 tie an ulp picks the adjacent
- * pixel. On this build, M=[[1,1.9,-20],[0.4,1,-10]] over a 37x53 source, pixel (14,37):
- * destination width 40 -> 193, widths 48/64/128 -> 65.
- *
- * The reference helper pads/crops NN/LINEAR/AREA to select the linked build's vector
- * path. This removes the identified body/tail boundary from compared columns but is not
- * a cross-ISA guarantee. NEAREST may select an adjacent source pixel at ties, so bounds
- * against this reference do not imply a small difference from natural-width CPU calls.
- * CUBIC uses its separate genericWarp/bicubic path at natural width; the width-invariance
- * control checks that behavior on the actual linked CPU build.
+ * The CPU SIMD body uses v_fma(M0, x, float(y*M1 + M2)); the scalar tail may
+ * use separate operations. A rounding difference at a half-pixel tie can
+ * select an adjacent pixel for NEAREST. Padding the reference width to a
+ * multiple of 128 and cropping keeps compared columns in the vector body.
+ * The width-sensitivity and padding-stability tests below check this assumption
+ * against the linked implementation. CUBIC instead computes coordinates from
+ * absolute x in genericWarp/bicubicVec without this body/tail distinction.
  */
 static Mat cpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int border,
                    const Scalar& bv = Scalar())
@@ -99,31 +83,20 @@ static Mat cpuWarpNatural(const Mat& src, const Mat& M, Size dsize, int flags, i
     return out;
 }
 
-/** The contract's float32 bound: min(5e-5 * max(|ref|, 1.0), 1e-4).
- *
- * RELATIVE to that element's reference value, never normalised by the image maximum -- an image
- * maximum hides a small element's error behind a large one's. The bound exists because float32
- * interpolation cannot be exact; how far a run actually lands from it is a SEPARATE measurement,
- * reported by RecordsAccuracy as max |diff|, max normalised error and max ULP (ULP computed from
- * the reference's own nextafterf spacing, not inferred from a relative error). Do not restate
- * those numbers here: they come from the run, and a comment cannot stay in step with them.
+/** Per-element float bound with a hard absolute cap of 1e-4.
+ * RecordsAccuracy also reports absolute error, error/bound and reference ULP
+ * spacing; a tolerance pass alone does not imply identical outputs.
  */
 static double f32Tol(double ref_value)
 {
     return warpF32Tolerance(ref_value);
 }
 
-/** What one accuracy comparison observed -- the contract's reporting_rule, in one struct.
- *
- * A passing tolerance is not evidence of bit-identity, so these are counted separately and a
- * run that passes still has to be able to say how many elements were not identical, how far
- * the worst one was, and what that is in ULP of the reference. `outside` is the pass/fail
- * number; the rest are the record.
- */
+/** Comparison statistics, including exact differences within the allowed bound. */
 struct WarpStats
 {
     long long elements = 0;
-    long long outside = 0;        // fails the contract bound
+    long long outside = 0;        // exceeds the accuracy bound
     long long not_identical = 0;  // bitwise different, inside or outside
     double max_abs = 0;
     double max_norm = 0;          // |diff| / bound, per element
@@ -137,7 +110,7 @@ struct WarpStats
     }
 };
 
-/** One float's spacing at `v` -- the ULP size the contract's ULP figure is measured in. */
+/** Reference float spacing at `v`, used to express error in ULPs. */
 static double spacing_at(float v)
 {
     const float a = std::fabs(v);
@@ -146,7 +119,7 @@ static double spacing_at(float v)
     return sp > 0 ? sp : double(std::numeric_limits<float>::denorm_min());
 }
 
-/** Compare against the selected reference: CV_8U exact, CV_16U at most 1 LSB, CV_32F
+/** Compare CV_8U exactly, CV_16U within 1 LSB, and CV_32F within
  *  min(5e-5*max(|ref|,1), 1e-4). */
 static ::testing::AssertionResult meetsWarpContract(const Mat& got, const Mat& ref_,
                                                     WarpStats* stats = nullptr)
@@ -206,7 +179,7 @@ static ::testing::AssertionResult meetsWarpContract(const Mat& got, const Mat& r
     if (stats) stats->merge(st);
     if (st.outside)
         return ::testing::AssertionFailure() << st.outside << " of " << st.elements
-                                             << " elements outside the contract; max |diff| "
+                                             << " elements outside the accuracy bound; max |diff| "
                                              << st.max_abs << ", max normalised " << st.max_norm
                                              << ", max " << st.max_ulp << " ULP";
     return ::testing::AssertionSuccess();
@@ -259,17 +232,10 @@ static const double kCubicGeoms[3][6] = {
     {1, 0.35, -0.75, 0, 1, 2.25},
 };
 
-// The CPU is deterministic for fixed (src, M, dsize, flags), but its OVERLAPPING OUTPUT REGION
-// is not invariant to the destination width: the SIMD body's coordinate expression and the
-// scalar tail's differ by an ulp, and the tail's length depends on the width.
-//
-// This test states the finding as a measurement rather than leaving it implied, and it separates
-// the two interpolations, because their magnitudes are not the same:
-//   * NEAREST can select the ADJACENT SOURCE PIXEL at a .5 tie, so the difference is that
-//     pixel's value and is unbounded;
-//   * LINEAR only perturbs the weights by an ulp, which survives uint8 rounding as at most 1.
-// If a future CPU revision makes the widths agree, the NEAREST expectation fails and the
-// contract's reference_path note is due for revision -- which is the point.
+// The linked CPU can produce different samples in the shared region of two
+// destination widths because its SIMD body and scalar tail round differently.
+// This fixture checks an adjacent-pixel change for NEAREST and a one-level
+// LINEAR difference. Changes to CPU dispatch require revisiting the reference.
 TEST(Triton_WarpAffine, CpuRegionIsNotWidthInvariant)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
@@ -298,11 +264,11 @@ TEST(Triton_WarpAffine, CpuRegionIsNotWidthInvariant)
                             worst_nearest, worst_linear));
     // NEAREST: an adjacent-pixel selection, so no small-error bound is available.
     EXPECT_GT(worst_nearest, 1.0)
-        << "NEAREST agreed across destination widths; the contract's reference_path note says an "
+        << "NEAREST agreed across destination widths; the reference assumes an "
            "ulp can select an adjacent source pixel, and the reference choice should be revisited";
-    // LINEAR: the measured bound, which the contract states as a measurement and not a guarantee.
+    // One-level LINEAR difference for this fixture, rather than a general bound.
     EXPECT_LE(worst_linear, 1.0)
-        << "LINEAR differed across widths by more than the contract's stated 1 level";
+        << "LINEAR differed across widths by more than the one-level fixture bound";
 
     // The reference is stable: widening the destination does not change the crop.
     const Mat host = randomImage(sz, CV_8UC1, 101);
@@ -312,7 +278,7 @@ TEST(Triton_WarpAffine, CpuRegionIsNotWidthInvariant)
     EXPECT_EQ(0.0, cvtest::norm(v128, v256, NORM_INF))
         << "the vector-path reference depends on how far the destination is padded";
 
-    // And the module follows the vector path, which is the contract.
+    // The module follows the selected vector-path reference.
     EXPECT_TRUE(meetsWarpContract(gpuWarp(host, M, Size(40, 37), INTER_LINEAR, BORDER_CONSTANT),
                                   v128));
     EXPECT_TRUE(meetsWarpContract(gpuWarp(host, M, Size(40, 37), INTER_NEAREST, BORDER_CONSTANT),
@@ -320,11 +286,8 @@ TEST(Triton_WarpAffine, CpuRegionIsNotWidthInvariant)
 }
 
 
-// CUBIC is the one path where the contract's reference is the NATURAL-WIDTH call, because
-// genericWarp computes each column's coordinate from the absolute x with no fma and therefore
-// has no body/tail split. This test pins that measured property: if a future CPU introduces a
-// width dependence into bicubicVec, this fails and the contract's CUBIC rule is due for
-// revision -- which is the point of measuring it rather than asserting it.
+// CUBIC uses the natural-width CPU reference. Its absolute-x coordinates have
+// no SIMD-body/scalar-tail split. Detect width dependence if that path changes.
 TEST(Triton_WarpAffine, CpuCubicIsWidthInvariant)
 {
     const Mat M = M6(1, 1.9, -20, 0.4, 1, -10);
@@ -355,7 +318,8 @@ TEST(Triton_WarpAffine, CpuCubicIsWidthInvariant)
         }
     EXPECT_EQ(0, differing)
         << "INTER_CUBIC differed across destination widths (worst " << worst
-        << "); the selected natural-width CUBIC reference needs revalidation on this build";
+        << "); the natural-width call is used as the CUBIC "
+           "reference, so this needs the reference rule revisited";
 }
 
 // CUBIC through the module against the natural-width CPU call, at widths that are NOT
@@ -407,11 +371,8 @@ TEST(Triton_WarpAffine, MatchesCpu)
                 }
 }
 
-// The contract's reporting_rule: a passing tolerance is NOT evidence of bit-identity, so the
-// run states, per dtype, how many elements were compared, how many were not identical, the
-// largest absolute difference, the largest normalised error (difference over the bound) and
-// the largest ULP distance from the reference. Printed so the run log carries the numbers
-// rather than only "PASS" -- and asserted so a regression in any of them is visible.
+// Record identical-element counts separately from tolerance checks, alongside
+// absolute error, normalized error and reference ULP distance for each depth.
 TEST(Triton_WarpAffine, RecordsAccuracy)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
@@ -436,7 +397,7 @@ TEST(Triton_WarpAffine, RecordsAccuracy)
                     (depth == CV_8U ? cu : (depth == CV_16U ? cu16 : cf)).merge(st);
                 }
     std::cout << cv::format(
-        "kernel vs the selected reference "
+        "warpAffine kernel vs the selected CPU reference "
         "(vector path for NEAREST/LINEAR, natural width for CUBIC):\n"
         "  CV_8U  elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
         "  CV_16U elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
@@ -447,7 +408,7 @@ TEST(Triton_WarpAffine, RecordsAccuracy)
         cu16.max_abs, cu16.max_norm,
         cf.elements, cf.not_identical, cf.elements ? 100.0 * cf.not_identical / double(cf.elements) : 0.0,
         cf.max_abs, cf.max_norm, cf.max_ulp);
-    // The contract's bounds, and the stronger fact actually observed against this reference.
+    // Check both the allowed bounds and exact integer results for this fixture.
     EXPECT_EQ(0, cu.outside);
     EXPECT_EQ(0, cu16.outside);
     EXPECT_EQ(0, cf.outside);
@@ -455,8 +416,7 @@ TEST(Triton_WarpAffine, RecordsAccuracy)
     EXPECT_EQ(0, cu16.not_identical) << "uint16 was expected to match the selected reference exactly";
 }
 
-// The two border defects this test exists for: a multi-channel Scalar was collapsed to
-// borderValue[0], and a CV_32F border was truncated to an integer in the compile key.
+// Check per-channel Scalar values and fractional CV_32F border components.
 TEST(Triton_WarpAffine, BorderValueIsAScalar)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
@@ -758,28 +718,28 @@ TEST(Triton_WarpAffine, PureOutputAdmission)
     // Source/options resolution must need neither a destination allocation nor
     // a readable source pointer or CPU fusion calibration.
     wa::Request request;
-    request.src.type = kf_resize_rt::ElemType::F32;
+    request.src.type = cv_triton_runtime::ElemType::F32;
     request.src.channels = 3;
     request.inverse_map = true;
     EXPECT_TRUE(wa::validate_source(request).ok());
     EXPECT_TRUE(wa::validate_output(request, 37, 53).ok());
-    EXPECT_EQ(kf_resize_rt::Reason::EmptyOrSize, wa::validate_output(request, 0, 53).reason);
+    EXPECT_EQ(cv_triton_runtime::Reason::EmptyOrSize, wa::validate_output(request, 0, 53).reason);
     request.border[0] = 1e100;
-    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::validate_source(request).reason);
+    EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::validate_source(request).reason);
     request.border[0] = 0;
     request.M[2] = 2147483648.0;
     EXPECT_TRUE(wa::validate_source(request).ok());
-    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::validate_output(request, 37, 53).reason);
+    EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::validate_output(request, 37, 53).reason);
     request.interpolation = INTER_CUBIC;
     EXPECT_TRUE(wa::validate_output(request, 37, 53).ok());
     request.M[0] = 1e38; request.M[2] = 0;
-    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::validate_output(request, 37, 53).reason);
+    EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::validate_output(request, 37, 53).reason);
     request.M[0] = 1;
     request.interpolation = INTER_AREA;
     request.border_mode = BORDER_TRANSPARENT;
     EXPECT_TRUE(wa::validate_output(request, 1, 1).ok());
     request.interpolation = INTER_CUBIC;
-    EXPECT_EQ(kf_resize_rt::Reason::Interpolation, wa::validate_source(request).reason);
+    EXPECT_EQ(cv_triton_runtime::Reason::Interpolation, wa::validate_source(request).reason);
 }
 
 TEST(Triton_WarpAffine, HostSamplingBoundaries)
@@ -795,25 +755,25 @@ TEST(Triton_WarpAffine, HostSamplingBoundaries)
     for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_AREA}) {
         request.interpolation = interp;
         request.M[2] = 2147483648.0;
-        EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+        EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::normalize(request, normalized).reason);
     }
     request.interpolation = INTER_CUBIC;
     EXPECT_TRUE(wa::normalize(request, normalized).ok()); // CUBIC clamps before int32 conversion
     request.M[0] = 1e38; request.M[2] = 0;
-    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+    EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::normalize(request, normalized).reason);
     request.M[0] = 1;
     for (double invalid : {std::numeric_limits<double>::quiet_NaN(),
                            std::numeric_limits<double>::infinity()}) {
         request.M[2] = invalid;
-        EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+        EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::normalize(request, normalized).reason);
         request.M[2] = 0;
         request.border[0] = invalid;
-        EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+        EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::normalize(request, normalized).reason);
     }
     request.border[0] = 1e100;
-    request.src.type = request.dst.type = kf_resize_rt::ElemType::F32;
+    request.src.type = request.dst.type = cv_triton_runtime::ElemType::F32;
     request.src.step = request.dst.step = 53 * sizeof(float);
-    EXPECT_EQ(kf_resize_rt::Reason::IndexRange, wa::normalize(request, normalized).reason);
+    EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::normalize(request, normalized).reason);
 }
 
 TEST(Triton_WarpAffine, HostAreaTransparentNormalization)
@@ -835,7 +795,7 @@ TEST(Triton_WarpAffine, HostAreaTransparentNormalization)
     EXPECT_EQ(BORDER_TRANSPARENT, area.border_y);
     EXPECT_NE(std::string::npos, wa::constexprs_text(area).find("TRANSPARENT=1"));
     request.interpolation = INTER_CUBIC;
-    EXPECT_EQ(kf_resize_rt::Reason::Interpolation, wa::normalize(request, area).reason);
+    EXPECT_EQ(cv_triton_runtime::Reason::Interpolation, wa::normalize(request, area).reason);
 }
 
 TEST(Triton_WarpAffine, RejectsWithoutFallback)
@@ -845,9 +805,7 @@ TEST(Triton_WarpAffine, RejectsWithoutFallback)
     const Mat M = M6(1, 0, 0, 0, 1, 0);
     const double before = double(td::runtimeStats().launches);
 
-    // Unsupported interpolation: refused by name, nothing submitted. INTER_CUBIC became served
-    // in 0.4.0 and INTER_AREA followed the CPU's own rewrite to INTER_LINEAR (see
-    // AreaIsLinear), so only INTER_LANCZOS4 remains refused.
+    // AREA aliases LINEAR; unsupported LANCZOS4 must be refused before submission.
     for (int interp : {INTER_LANCZOS4})
     {
         SCOPED_TRACE(cv::format("interp=%d", interp));

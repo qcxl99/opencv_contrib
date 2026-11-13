@@ -3,7 +3,7 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 
-"""Compile helper for the module runtime JIT (protocol kf-resize-compile/1).
+"""Compile helper for the Triton module runtime JIT (protocol opencv-triton-compile/1).
 
 The module never embeds Python. On a cache miss its C++ runtime (compile_protocol.cpp) runs
 this file as a separate process:
@@ -29,7 +29,7 @@ Publication is crash-safe:
 So a reader that only trusts <cache>/<digest> with a verifying manifest never sees a half
 artifact.
 
-KF_COMPILE_HELPER_TEST_FAULT is a TEST-ONLY fault-injection hook:
+OPENCV_TRITON_HELPER_TEST_FAULT is a test-only fault-injection hook:
   hang, slow (sleep after taking the lock), crash_mid_publish (exit 3 after the binary,
   before the manifest), kill_before_rename (SIGKILL after the manifest, before the rename).
 """
@@ -51,7 +51,7 @@ import signal         # noqa: E402
 import tempfile       # noqa: E402
 import time           # noqa: E402
 
-PROTOCOL = "kf-resize-compile/1"
+PROTOCOL = "opencv-triton-compile/1"
 BINARY = "kernel.cubin"
 HIP_BINARY = "kernel.hsaco"
 T0 = time.time()
@@ -68,7 +68,7 @@ def sha(data: bytes) -> str:
 
 
 def fault(point: str) -> None:
-    f = os.environ.get("KF_COMPILE_HELPER_TEST_FAULT", "")
+    f = os.environ.get("OPENCV_TRITON_HELPER_TEST_FAULT", "")
     if not f:
         return
     if point == "after_lock" and f == "hang":
@@ -241,7 +241,7 @@ def build(key: dict, src_path: str):
     backend_name = key["target"]["backend"]
     if backend_name not in ("cuda", "hip"):
         raise HelperError("invalid_request", f"backend {backend_name!r}: this helper builds cuda and hip only")
-    spec = importlib.util.spec_from_file_location(f"kf_resize_kernels_{key['source_sha256'][:12]}", src_path)
+    spec = importlib.util.spec_from_file_location(f"opencv_triton_kernels_{key['source_sha256'][:12]}", src_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     fn = getattr(mod, key["kernel"], None)

@@ -5,9 +5,11 @@
 #include "../validation/device.hpp"
 #include "../validation/guards.hpp"
 #include <limits>
+#include <cfenv>
 #include "../validation/reference.hpp"
 #include "../validation/resize_cases.hpp"
 #include "../validation/cvtcolor_cases.hpp"
+#include "../src/runtime/provider.hpp"
 
 namespace opencv_test { namespace {
 namespace device = triton_validation;
@@ -40,6 +42,89 @@ TEST(Triton_Validation, GuardBandsBytewise)
             const Mat otherType(after.size(), CV_MAKETYPE(depth, channels == 1 ? 3 : 1));
             EXPECT_FALSE(guardsEqual(before, otherType, changed));
         }
+}
+
+TEST(Triton_Common, OutputIndexAdmissionNeedsNoAllocation)
+{
+    using namespace cv_triton_runtime;
+    const int limit = std::numeric_limits<int>::max();
+    EXPECT_TRUE(validate_output_shape(1, limit, 1).ok());
+    EXPECT_TRUE(validate_output_shape(1, limit / 4, 4).ok());
+    EXPECT_EQ(Reason::IndexRange, validate_output_shape(2, limit / 4, 4).reason);
+    EXPECT_EQ(Reason::IndexRange, validate_output_shape(limit, limit, 4).reason);
+    EXPECT_EQ(Reason::EmptyOrSize, validate_output_shape(0, 1, 1).reason);
+    ResizeRequest request;
+    request.src.rows = request.src.cols = 1;
+    request.src.channels = 3;
+    request.dsize_h = 2;
+    request.dsize_w = limit / 3;
+    cv_triton_resize::Size2 resolved;
+    EXPECT_EQ(Reason::IndexRange, resolve_output(request, resolved).reason);
+}
+
+TEST(Triton_Common, RowOverlapExcludesPadding)
+{
+    using namespace cv_triton_runtime;
+    DeviceView first;
+    first.ptr = 4096;
+    first.rows = 5;
+    first.cols = 8;
+    first.channels = 3;
+    first.step = 128;
+    DeviceView second = first;
+    second.ptr += first.row_bytes();
+    ASSERT_TRUE(validate_view(first, "first").ok());
+    ASSERT_TRUE(validate_view(second, "second").ok());
+    EXPECT_FALSE(views_overlap(first, second));
+    EXPECT_FALSE(views_overlap(second, first));
+    --second.ptr;
+    EXPECT_TRUE(views_overlap(first, second));
+    EXPECT_TRUE(views_overlap(second, first));
+    EXPECT_TRUE(views_overlap(first, first));
+    second = first;
+    second.ptr += first.step * first.rows;
+    EXPECT_FALSE(views_overlap(first, second));
+}
+
+TEST(Triton_Common, DisjointHorizontalRoisShareAllocation)
+{
+    requireDevice();
+    device::Stream stream;
+    const Size size(17, 13);
+    const Rect sourceRect(1, 2, size.width, size.height);
+    const Rect destinationRect(23, 2, size.width, size.height);
+    const Mat matrix = Mat::eye(2, 3, CV_64F);
+    for (int operation = 0; operation < 3; ++operation)
+    {
+        SCOPED_TRACE(operation);
+        Mat parent(19, 47, CV_8UC3, Scalar::all(37));
+        const Mat source = randomImage(size, CV_8UC3, 78001 + operation);
+        source.copyTo(parent(sourceRect));
+        device::Image storage;
+        storage.upload(parent);
+        device::Image src(storage, sourceRect), dst(storage, destinationRect);
+        const auto address = dst.address();
+        Mat reference;
+        if (operation == 0)
+        {
+            reference = oracle(source, size, 0, 0, INTER_NEAREST);
+            device::resize(src, dst, size, 0, 0, INTER_NEAREST, stream);
+        }
+        else if (operation == 1)
+        {
+            reference = cpuCvt(source, COLOR_BGR2RGB);
+            device::cvtColor(src, dst, COLOR_BGR2RGB, stream);
+        }
+        else
+        {
+            reference = warpReference(source, matrix, size, INTER_NEAREST, BORDER_REPLICATE, Scalar());
+            device::warpAffine(src, dst, matrix, size, INTER_NEAREST, BORDER_REPLICATE, Scalar(), stream);
+        }
+        stream.wait();
+        EXPECT_EQ(address, dst.address());
+        EXPECT_EQ(0, cv::norm(reference, dst.download(), NORM_INF));
+        EXPECT_TRUE(guardsEqual(parent, storage.download(), destinationRect));
+    }
 }
 
 TEST(Triton_Common, ResizeRoutesLayoutsAndStreams)
@@ -99,7 +184,7 @@ static void checkCvt(const cvt_cases::CvtCase& c, uint64 seed, device::Stream& s
     ASSERT_EQ(address, dst.address());
     const Mat got = dst.download();
     ASSERT_EQ(reference.size(), got.size()); ASSERT_EQ(reference.type(), got.type());
-    EXPECT_TRUE(meetsCvtContract(got, reference, host, cvt_cases::floatArithmetic(c.code)));
+    EXPECT_TRUE(meetsCvtContract(got, reference, host, cvt_cases::floatArithmetic(c.code), cvt_cases::floatArithmetic(c.code) && cv_triton_color::float_cpu_separate4()));
     EXPECT_TRUE(guardsEqual(initial, target.download(), outputRect));
 }
 
@@ -111,6 +196,7 @@ TEST(Triton_Common, CvtColorCriterionUsesLocalPixelScale)
     Mat got = reference.clone();
     got.at<float>(0, 1) = 0.02f;
     EXPECT_TRUE(meetsCvtContract(got, reference, input, true));
+    EXPECT_FALSE(meetsCvtContract(got, reference, input, true, true));
     // The neighbouring large pixel must not lend its tolerance to this one.
     got.at<float>(0, 0) = 0.001f;
     EXPECT_FALSE(meetsCvtContract(got, reference, input, true));
@@ -120,6 +206,60 @@ TEST(Triton_Common, CvtColorCriterionUsesLocalPixelScale)
     Mat exact(1, 2, CV_16UC1, Scalar::all(65535));
     Mat changed = exact.clone(); changed.at<ushort>(0, 0) = 65534;
     EXPECT_FALSE(meetsCvtContract(changed, exact, exact, false));
+}
+
+// Host controls distinguish the original scaled criterion from the conditional cap.
+TEST(Triton_Validation, CvtColorConditionalAbsoluteCap) {
+    const double scale = 65535.;
+    EXPECT_GT(triton_validation::numeric::cvtF32Tolerance(0., scale), .015625);
+    EXPECT_EQ(1.e-4, triton_validation::numeric::cvtF32Tolerance(0., scale, true));
+    const int oldRound = std::fegetround();
+    if (std::fesetround(FE_DOWNWARD) == 0) {
+        EXPECT_FALSE(cv_triton_color::float_cpu_separate4());
+        std::fesetround(oldRound);
+    }
+}
+
+TEST(Triton_Common, CvtColorMixedScaleAbsoluteCap) {
+    requireDevice();
+    struct Restore { bool value = cv::useOptimized(); ~Restore() { cv::setUseOptimized(value); } } restore;
+    long long elements = 0;
+    double worst = 0.;
+    for (bool optimized : {false, true}) {
+        cv::setUseOptimized(optimized);
+        if (!cv_triton_color::float_cpu_separate4())
+            throw SkipTestException("linked CPU arithmetic is not identified separate4; absolute qualification unavailable");
+        device::Stream stream;
+        for (const auto& c : cvt_cases::kCases32F)
+            for (int width : {1,2,3,4,5,7,8,9,15,16,17,19,31,32,33,63,65})
+                for (bool roi : {false, true})
+                    for (float scale : {1.f, 255.f, 65535.f}) {
+                        SCOPED_TRACE(cv::format("%s width=%d roi=%d optimized=%d scale=%g", c.name, width, roi, optimized, scale));
+                        Mat parent(7, width+7, CV_MAKETYPE(CV_32F,c.scn));
+                        RNG rng(12345+width); rng.fill(parent,RNG::UNIFORM,-2.,2.);
+                        Mat host = parent(Rect(2,1,width,5));
+                        if (!roi) host = host.clone();
+                        for (int y=0;y<host.rows;++y)
+                            for (int x=0;x<width;++x)
+                                for (int k=0;k<c.scn;++k)
+                                    host.ptr<float>(y)[x*c.scn+k] *= (x+y)%3 ? scale : 1.f;
+                        device::Image sourceParent; sourceParent.upload(roi ? parent : host);
+                        device::Image source = roi ? device::Image(sourceParent,Rect(2,1,width,5)) : sourceParent;
+                        const Mat initial(9,width+9,CV_MAKETYPE(CV_32F,c.dcn),Scalar::all(17));
+                        device::Image target; target.upload(initial);
+                        const Rect region(2,2,width,5);
+                        device::Image output = roi ? device::Image(target,region) : device::Image(Size(width,5),initial.type());
+                        const auto address = output.address();
+                        device::cvtColor(source,output,c.code,stream); stream.wait();
+                        const Mat got=output.download(), ref=cpuCvt(host,c.code);
+                        ASSERT_EQ(address,output.address());
+                        ASSERT_TRUE(meetsCvtContract(got,ref,host,cvt_cases::floatArithmetic(c.code),true));
+                        const double err=cv::norm(got,ref,NORM_INF);
+                        ASSERT_LE(err,1.e-4); worst=std::max(worst,err); elements+=got.total()*got.channels();
+                        if (roi) { EXPECT_TRUE(guardsEqual(initial,target.download(),region)); }
+                    }
+    }
+    std::cout << "cvtColor strict mixed-scale elements=" << elements << " maxabs=" << worst << std::endl;
 }
 
 TEST(Triton_Common, CvtColorAllDeclaredCodesAndDepths)

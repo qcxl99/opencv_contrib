@@ -1,4 +1,4 @@
-# Optional module: image operations through a runtime JIT of Triton kernels.
+# Optional module: GPU image operations through runtime-compiled Triton kernels.
 #
 # Off by default, like any module that needs an external toolchain (precedent: cnn_3dobj):
 # enable it with -DBUILD_opencv_triton=ON. An ordinary OpenCV build needs no Python, Triton or
@@ -15,8 +15,8 @@
 #         kernels/*_cpu_hip.py where the CUDA source needs a derivation (tools/
 #         make_kernels_cpu_hip.py; a stale copy fails the configure), else the CUDA source as
 #         written. The entries are opencv2/triton/device.hpp (device buffers + a hip stream);
-#         the GpuMat entries exist and raise, since OpenCV has no cv::cuda here. Accuracy is
-#         common test/ fixtures plus supplemental test/hip/. Needs HIP-capable Triton and ROCM_PATH.
+#         the GpuMat entries exist and raise, since OpenCV has no cv::cuda here. Common
+#         accuracy/perf and HIP lifecycle tests use HIP-capable Triton and ROCM_PATH.
 #   auto  cuda where the OpenCV build has CUDA (unchanged), else hip if a HIP toolkit is found,
 #         else the module is disabled. A tree whose CUDA is a compatibility layer (WITH_CUDA=ON
 #         on a BW1000 box) must say -DTRITON_BACKEND=hip.
@@ -103,7 +103,7 @@ set(_triton_srcs
     "${CMAKE_CURRENT_LIST_DIR}/src/entry.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/device_entries.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/python_entries.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/src/runtime/reference_cpu.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/runtime/resize_plan.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/provider.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cvtcolor.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/warpaffine.cpp"
@@ -121,7 +121,7 @@ else()
        "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cuda_runtime.cpp")
   set(_triton_kernel_files resize_cpu.py cvtcolor_cpu.py warpaffine_cpu.py)
 endif()
-# Installed headers: the public umbrella and device-buffer API. src/core.hpp is NOT here -- it is a
+# Installed headers: only the public umbrella. src/core.hpp is deliberately NOT here -- it is a
 # raw device-pointer layer the plan code shares with the GpuMat adapter, not an API for callers.
 file(GLOB _triton_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton.hpp"
                        "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton/device.hpp")
@@ -155,7 +155,7 @@ if(_triton_backend STREQUAL "cuda")
   else()
     set(_triton_cuda_lib cuda)
   endif()
-  ocv_target_include_directories(${the_module} PRIVATE ${_triton_cuda_inc})
+  ocv_target_include_directories(${the_module} ${_triton_cuda_inc})
   ocv_target_link_libraries(${the_module} LINK_PRIVATE ${_triton_cuda_lib} ${CMAKE_DL_LIBS})
   ocv_target_compile_definitions(${the_module} PRIVATE OPENCV_TRITON_HAVE_CUDA_ADAPTER=1)
 else()
@@ -166,7 +166,7 @@ else()
   if(NOT _triton_rocm)
     get_filename_component(_triton_rocm "${TRITON_HIP_INCLUDE_DIR}" DIRECTORY)
   endif()
-  target_include_directories(${the_module} SYSTEM PRIVATE "${TRITON_HIP_INCLUDE_DIR}")
+  ocv_target_include_directories(${the_module} SYSTEM "${TRITON_HIP_INCLUDE_DIR}")
   ocv_target_link_libraries(${the_module} LINK_PRIVATE "${TRITON_HIP_LIBRARY}" ${CMAKE_DL_LIBS})
   ocv_target_compile_definitions(${the_module} PRIVATE
     __HIP_PLATFORM_AMD__=1 OPENCV_TRITON_HAVE_HIP_ADAPTER=1
@@ -194,7 +194,12 @@ else()
 endif()
 
 # The plan tables are float32 arithmetic that must round op by op, as the reference does.
-target_compile_options(${the_module} PRIVATE -ffp-contract=off)
+# Source properties also apply when these files are collected into opencv_world.
+set_property(SOURCE ${_triton_srcs} APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+
+if(NOT BUILD_SHARED_LIBS)
+  ocv_target_compile_definitions(${the_module} PRIVATE OPENCV_TRITON_STATIC_BUILD=1)
+endif()
 
 # --- resources: kernels source + compile helper -----------------------------------------
 # Installed under <share>/triton and found at run time relative to the library, so an install
@@ -203,6 +208,7 @@ set(_triton_res_install "${OPENCV_OTHER_INSTALL_PATH}/triton")
 file(RELATIVE_PATH _triton_rel "${CMAKE_INSTALL_PREFIX}/${OPENCV_LIB_INSTALL_PATH}" "${CMAKE_INSTALL_PREFIX}/${_triton_res_install}")
 ocv_target_compile_definitions(${the_module} PRIVATE
   OPENCV_TRITON_REL_RESOURCES="${_triton_rel}"
+  OPENCV_TRITON_INSTALL_RESOURCES="${CMAKE_INSTALL_PREFIX}/${_triton_res_install}"
   OPENCV_TRITON_SOURCE_RESOURCES="${CMAKE_CURRENT_LIST_DIR}"
   OPENCV_TRITON_PYTHON_DEFAULT="${TRITON_PYTHON_EXECUTABLE}"
   OPENCV_TRITON_PYTHONPATH_DEFAULT="${TRITON_PYTHONPATH}"
@@ -215,28 +221,41 @@ install(FILES ${_triton_kernel_paths} DESTINATION "${_triton_res_install}/kernel
 install(FILES "${CMAKE_CURRENT_LIST_DIR}/tools/compile_helper.py" DESTINATION "${_triton_res_install}/tools" COMPONENT libs)
 
 # --- tests / perf / samples -------------------------------------------------------------
+set(_triton_reference_sources
+    "${CMAKE_CURRENT_LIST_DIR}/src/runtime/resize_plan.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/test/resize_reference.cpp")
 if(_triton_backend STREQUAL "cuda")
   # OpenCV recursively globs test/ by default; HIP's standalone main/toolkit
   # sources must not be compiled into the CUDA gtest executable.
   file(GLOB _triton_cuda_test_sources "${CMAKE_CURRENT_LIST_DIR}/test/*.cpp"
                                      "${CMAKE_CURRENT_LIST_DIR}/test/*.hpp")
+  # The evaluator and table builder are compiled explicitly below.
+  list(REMOVE_ITEM _triton_cuda_test_sources "${CMAKE_CURRENT_LIST_DIR}/test/resize_reference.cpp")
   ocv_add_accuracy_tests(FILES "Src" ${_triton_cuda_test_sources})
   if(TARGET opencv_test_triton)
-    # Pure admission/normalisation controls call private plan functions. Compile
-    # those into the tests rather than exporting implementation symbols as API.
     target_sources(opencv_test_triton PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cvtcolor.cpp"
-        "${CMAKE_CURRENT_LIST_DIR}/src/runtime/warpaffine.cpp")
+      "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cvtcolor.cpp"
+      "${CMAKE_CURRENT_LIST_DIR}/src/runtime/warpaffine.cpp")
   endif()
   # Select top-level perf sources only; future backend support is selected here.
   file(GLOB _triton_common_perf_sources "${CMAKE_CURRENT_LIST_DIR}/perf/*.cpp"
                                        "${CMAKE_CURRENT_LIST_DIR}/perf/*.hpp")
   ocv_add_perf_tests(FILES "Src" ${_triton_common_perf_sources})
   ocv_add_samples()
-  # Native CUDA libraries are optional perf baselines, not implementation dependencies.
+  # perf/ only: cv::cuda::resize as a labelled timing baseline. The implementation, the accuracy
+  # tests and the sample never use it, so cudawarping is an OPTIONAL dependency -- and it MUST be
+  # checked before being linked. Linking it unconditionally meant a build with triton but without
+  # cudawarping (a legal configuration: the module does not depend on it) failed at configure or
+  # link time instead of simply omitting the baseline test.
   if(TARGET opencv_perf_triton)
-    # Module discovery precedes target creation. Query configure-time dependencies;
-    # each missing baseline omits only its own perf rows.
+    # `TARGET opencv_cudawarping` is NOT a usable test here: a module's CMakeLists runs in the
+    # first pass, before other modules' targets exist, so the target check was false even in a
+    # build that had cudawarping enabled. HAVE_opencv_cudawarping is the configure-time answer,
+    # and ocv_check_dependencies is the standard way to ask it.
+    #
+    # Two separate baselines, two separate guards: cv::cuda::resize is in cudawarping and
+    # cv::cuda::cvtColor in cudaimgproc, and a build may have either, both or neither. Each
+    # missing one omits its own perf test and nothing else.
     ocv_check_dependencies(opencv_cudawarping)
     if(OCV_DEPENDENCIES_FOUND)
       ocv_target_include_modules(opencv_perf_triton opencv_cudawarping)
@@ -258,10 +277,10 @@ if(_triton_backend STREQUAL "cuda")
   endif()
   foreach(_t opencv_test_triton opencv_perf_triton)
     if(TARGET ${_t})
-      target_sources(${_t} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/validation/device_cuda.cpp")
-      # the tests compile the portable CPU oracle themselves (test/test_oracle.cpp)
+      target_sources(${_t} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/validation/device_cuda.cpp" ${_triton_reference_sources})
+      # Compile the CPU reference independently for the test and perf executables.
       target_compile_options(${_t} PRIVATE -ffp-contract=off)
-      ocv_target_include_directories(${_t} PRIVATE ${_triton_cuda_inc})
+      ocv_target_include_directories(${_t} ${_triton_cuda_inc})
       ocv_target_link_libraries(${_t} LINK_PRIVATE ${_triton_cuda_lib})
     endif()
   endforeach()
@@ -271,14 +290,15 @@ else()
   ocv_add_accuracy_tests(FILES "Src"
       "${CMAKE_CURRENT_LIST_DIR}/test/test_main.cpp"
       "${CMAKE_CURRENT_LIST_DIR}/test/test_common.cpp"
+      "${CMAKE_CURRENT_LIST_DIR}/test/test_resize_reference.cpp"
       "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp")
   file(GLOB _triton_common_perf_sources "${CMAKE_CURRENT_LIST_DIR}/perf/*.cpp"
                                       "${CMAKE_CURRENT_LIST_DIR}/perf/*.hpp")
   ocv_add_perf_tests(FILES "Src" ${_triton_common_perf_sources})
   foreach(_target opencv_test_triton opencv_perf_triton)
     if(TARGET ${_target})
-      target_sources(${_target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/validation/device_hip.cpp")
-      # Perf also compares against the independently compiled portable oracle.
+      target_sources(${_target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/validation/device_hip.cpp" ${_triton_reference_sources})
+      # Perf also compares against the test-only CPU reference.
       if(_target STREQUAL "opencv_perf_triton")
         target_sources(${_target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp")
       endif()
@@ -288,25 +308,70 @@ else()
       target_link_libraries(${_target} PRIVATE "${TRITON_HIP_LIBRARY}")
     endif()
   endforeach()
-  # HIP sample and backend-specific lifecycle/refusal groups supplement the common tests.
+  # The device-buffer sample has no GUI or video dependencies.
+  set(_triton_sample "${CMAKE_CURRENT_LIST_DIR}/samples/hip/device.cpp")
   if(BUILD_EXAMPLES)
-    add_executable(example_triton_device "${CMAKE_CURRENT_LIST_DIR}/samples/hip/device.cpp")
-    ocv_target_include_modules(example_triton_device opencv_core opencv_imgproc ${the_module})
-    target_include_directories(example_triton_device SYSTEM PRIVATE "${TRITON_HIP_INCLUDE_DIR}")
-    target_compile_definitions(example_triton_device PRIVATE __HIP_PLATFORM_AMD__=1)
-    target_link_libraries(example_triton_device PRIVATE opencv_core opencv_imgproc ${the_module} "${TRITON_HIP_LIBRARY}")
-    set_target_properties(example_triton_device PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
+    set(_sample_target example_triton_device)
+    ocv_add_executable(${_sample_target} "${_triton_sample}")
+    ocv_target_include_modules(${_sample_target} opencv_core opencv_imgproc ${the_module})
+    ocv_target_include_directories(${_sample_target} SYSTEM "${TRITON_HIP_INCLUDE_DIR}")
+    target_compile_definitions(${_sample_target} PRIVATE __HIP_PLATFORM_AMD__=1)
+    ocv_target_link_libraries(${_sample_target} PRIVATE opencv_core opencv_imgproc ${the_module} "${TRITON_HIP_LIBRARY}")
+    set_target_properties(${_sample_target} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}"
+      PROJECT_LABEL "(sample) device"
+      LABELS "${OPENCV_MODULE_${the_module}_LABEL};Sample")
+    set_source_files_properties("${_triton_sample}" PROPERTIES
+      LABELS "${OPENCV_MODULE_${the_module}_LABEL};Sample")
+    if(ENABLE_SOLUTION_FOLDERS)
+      set_target_properties(${_sample_target} PROPERTIES FOLDER "samples/triton")
+    endif()
+    if(NOT TARGET opencv_samples_triton)
+      add_custom_target(opencv_samples_triton)
+      add_dependencies(opencv_samples opencv_samples_triton)
+    endif()
+    add_dependencies(opencv_samples_triton ${_sample_target})
+    if(INSTALL_BIN_EXAMPLES)
+      install(TARGETS ${_sample_target} RUNTIME
+        DESTINATION "${OPENCV_SAMPLES_BIN_INSTALL_PATH}/triton" COMPONENT samples)
+    endif()
   endif()
+  # Source installation is independent of whether example binaries are built.
+  if(INSTALL_C_EXAMPLES)
+    install(FILES "${_triton_sample}"
+      DESTINATION "${OPENCV_SAMPLES_SRC_INSTALL_PATH}/triton/hip" COMPONENT samples)
+  endif()
+
   option(TRITON_BUILD_HIP_TEST "Build backend-specific HIP lifecycle tests" ${BUILD_TESTS})
-  if(BUILD_TESTS AND TRITON_BUILD_HIP_TEST)
+  if(BUILD_TESTS AND TRITON_BUILD_HIP_TEST
+      AND (NOT DEFINED OPENCV_BUILD_TEST_MODULES_LIST
+          OR OPENCV_BUILD_TEST_MODULES_LIST STREQUAL "all"
+          OR ";${OPENCV_BUILD_TEST_MODULES_LIST};" MATCHES ";triton;"))
     set(_t opencv_test_triton_hip)
-    add_executable(${_t} "${CMAKE_CURRENT_LIST_DIR}/test/hip/test_hip.cpp" "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp")
+    set(_triton_hip_test_sources
+      "${CMAKE_CURRENT_LIST_DIR}/test/hip/test_hip.cpp"
+      "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp"
+      ${_triton_reference_sources})
+    ocv_add_executable(${_t} ${_triton_hip_test_sources})
     ocv_target_include_modules(${_t} opencv_core opencv_imgproc ${the_module})
-    target_include_directories(${_t} SYSTEM PRIVATE "${TRITON_HIP_INCLUDE_DIR}")
-    target_compile_definitions(${_t} PRIVATE __HIP_PLATFORM_AMD__=1)
-    # as the other tests: the oracle must not be contracted into FMAs
+    ocv_target_include_directories(${_t} SYSTEM "${TRITON_HIP_INCLUDE_DIR}")
+    target_compile_definitions(${_t} PRIVATE __HIP_PLATFORM_AMD__=1 __OPENCV_TESTS=1)
+    # The oracle rounds each operation independently.
     target_compile_options(${_t} PRIVATE -ffp-contract=off)
-    target_link_libraries(${_t} PRIVATE opencv_core opencv_imgproc ${the_module} "${TRITON_HIP_LIBRARY}" ${CMAKE_DL_LIBS})
-    set_target_properties(${_t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}" FOLDER "tests accuracy")
+    ocv_target_link_libraries(${_t} PRIVATE opencv_core opencv_imgproc ${the_module} "${TRITON_HIP_LIBRARY}" ${CMAKE_DL_LIBS})
+    set_target_properties(${_t} PROPERTIES
+      DEBUG_POSTFIX "${OPENCV_DEBUG_POSTFIX}"
+      RUNTIME_OUTPUT_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}"
+      LABELS "${OPENCV_MODULE_${the_module}_LABEL};AccuracyTest")
+    set_source_files_properties(${_triton_hip_test_sources} PROPERTIES
+      LABELS "${OPENCV_MODULE_${the_module}_LABEL};AccuracyTest")
+    if(ENABLE_SOLUTION_FOLDERS)
+      set_target_properties(${_t} PROPERTIES FOLDER "tests accuracy")
+    endif()
+    add_dependencies(opencv_tests ${_t})
+    ocv_add_test_from_target("${_t}" "Accuracy" "${_t}")
+    if(INSTALL_TESTS)
+      install(TARGETS ${_t} RUNTIME DESTINATION "${OPENCV_TEST_INSTALL_PATH}" COMPONENT tests)
+    endif()
   endif()
 endif()

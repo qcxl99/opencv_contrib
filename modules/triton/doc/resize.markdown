@@ -1,122 +1,96 @@
 Triton resize {#tutorial_triton_resize}
 =============
 
-@note PROPOSED optional module. The module name, public API and build switches
-are part of a proposal under review and may change. For a quick start see the
-module's `README.md`; this page is the full usage guide.
-
 @see @ref triton "Triton API reference".
-@see @ref tutorial_triton_h20_first_use "H20 build, install and first-use walkthrough".
+@see @ref tutorial_triton_h20_first_use "CUDA build and first use".
+@see @ref tutorial_triton_bw1000_first_use "HIP build and first use".
 
-What it computes
+Supported inputs
 ----------------
 
-OpenCV CPU `cv::resize` as computed by a pinned reference configuration: the
-generic `resize.cpp` path of OpenCV 5.0.0, 128-bit SIMD, no FMA, no IPP, no
-HAL. `CV_8U` matches it bit-exactly; `CV_32F` within a bound derived from that
-configuration's own float32 rounding. Actual error is reported by the tests.
-"CPU `cv::resize`" without the configuration is not one function: an IPP-HAL
-build of the same version differs on about a quarter of test cases, so the tests
-compare against a portable C++ oracle compiled into the test binary, not against
-the host build's `cv::resize`.
+`cv::triton::resize` supports `CV_8U` and `CV_32F`, with 1, 3 or 4 channels.
+Interpolation modes are `INTER_NEAREST`, `INTER_LINEAR`, `INTER_CUBIC` and
+`INTER_AREA`. AREA supports integer and fractional ratios and upscaled axes.
+Same-size requests copy the image without interpolation. Source and destination
+may be pitched ROIs with contiguous pixels and channels; their pixel storage must
+not overlap. Separate ROIs may share a parent allocation.
+Correctly sized output storage is reused.
 
-`cv::cuda::resize` computes a different result (coordinate mapping, exact-2x
-`INTER_LINEAR` routed to the AREA path, AREA upscale, uint8 fixed-point
-rounding). It is a performance baseline only (`perf/`), with different semantics.
-This module is **not a drop-in replacement for `cv::cuda::resize`**.
+An explicit positive `dsize` takes precedence over `fx` and `fy`. If `dsize` is
+empty, both scales must be finite and positive and the rounded dimensions must
+fit positive int32 values. The original scales are retained for coordinate
+mapping. Sizing and interpolation are checked before output allocation.
+`INTER_NEAREST_EXACT`, `INTER_LINEAR_EXACT`, warp flags, other depths and other
+channel counts are unsupported. There is no CPU or `cv::cuda` fallback.
 
-Supported subset
----------------------------------
+Numerical behavior
+------------------
 
-| dimension | supported |
-|---|---|
-| depth | `CV_8U`, `CV_32F` |
-| channels | 1, 3, 4 |
-| sizing | explicit `dsize`, or `fx`/`fy` when `dsize` is empty (the caller's values are used, as in `cv::resize`) |
-| routes | same size (a device copy, not a kernel launch); `INTER_NEAREST`; `INTER_LINEAR` (exact 2x down takes the AREA fast path, as on the CPU); `INTER_CUBIC`; `INTER_AREA` at integer and fractional ratios, and with an upscaled axis |
-| layout | ROI source/destination, row-contiguous pixels and channels; the output is reused when it already has the right size and type |
-| platform | Linux; CUDA (driver API, `sm_90` tested) or HIP (`TRITON_BACKEND=hip`, gfx936 tested; device-buffer entries) |
+The reference is the generic OpenCV 5.0.0 CPU resize algorithm with 128-bit SIMD,
+without FMA, IPP or HAL substitutions. `CV_8U` output is bit-exact against this
+reference. `CV_32F` comparisons allow float32 rounding error according to the
+operation-specific bounds in the accuracy tests. Tests use a portable CPU
+implementation in the test sources so that host-library dispatch choices do
+not change their expected output.
 
-Unsupported depths, channels and interpolation modes raise
-`cv::Error::StsUnsupportedFormat`. All four declared interpolations execute the
-CPU-aligned kernels; there is no implicit fallback to CPU or to `cv::cuda`.
-Windows is not supported. HIP uses the device-buffer entries described below.
+`INTER_LINEAR` at exact 2× downsampling uses the CPU AREA route. Other CPU
+configurations and `cv::cuda::resize` may differ in coordinate mapping,
+fixed-point rounding or route selection. Native CUDA timings therefore do not
+establish numerical equivalence.
 
-Sizing and interpolation are validated before an adapter allocates the output.
-Scale-derived dimensions require finite positive `fx`/`fy` and must fit positive
-int32 dimensions; explicit `dsize` takes precedence and ignores `fx`/`fy`, including
-nonfinite values. Interpolation is a single declared mode: warp flags and
-`INTER_NEAREST_EXACT`/`INTER_LINEAR_EXACT` are refused.
-
-How a call runs
----------------
-
-1. Parameters are resolved as `cv::resize` does and the request is validated
-   (sizes, steps, int32 index ranges, overlap).
-2. The compiled kernel for the request's compile key (kernel, signature dtypes,
-   channel count and the other constexprs, launch options, target, Triton
-   version, kernel source hash) is taken from an in-process cache, else from the
-   on-disk cache (`$OPENCV_TRITON_CACHE_DIR`, default `~/.cache/opencv/triton`)
-   after verifying its manifest and binary hash, else compiled by
-   `tools/compile_helper.py` in a **separate, Torch-free process** and then
-   verified the same way. Compilation does not embed a Python interpreter in the C++ call path.
-3. Coordinate and coefficient tables are built in C++ by the same code as the
-   test oracle, uploaded on the caller's stream, and reused; a call on another
-   stream waits for the upload through an event.
-4. The kernel is launched with the parameter list recorded in the manifest. The
-   two trailing scratch pointers Triton appends are passed as null only for a
-   compiler whose entry ABI has been validated and a kernel that needs no
-   scratch memory; otherwise the module refuses to launch.
-5. Modules and tables are kept alive until the launches that use them complete;
-   evicting them from the caches frees nothing early.
-
-The first call with a new key costs a compile (about 0.1-0.6 s, plus interpreter
-start); a known key with a new image size needs no Python at all. Loading a
-module into a context waits for that context's in-flight work to drain (a CUDA
-driver property).
-
-Build
------
-
-Use the standard out-of-source build described in the module README. For the
-complete Ubuntu/H20 source, Python, installation and public-entry test sequence,
-see @ref tutorial_triton_h20_first_use "H20 first use".
-
-The module is off by default and adds no Python/Triton/PyTorch dependency when
-disabled. Enabled builds do not require PyTorch. Triton kernels are compiled on
-first use, not during the OpenCV build. `cmake --install <build>` installs the
-kernel sources and `tools/compile_helper.py` under `share/opencv5/triton`, located
-relative to the library at runtime so that the prefix can be moved.
-`OPENCV_TRITON_RESOURCES`, `OPENCV_TRITON_PYTHON`, `OPENCV_TRITON_PYTHONPATH` and
-`OPENCV_TRITON_CACHE_DIR` override the defaults. Without an interpreter, cached
-keys still run; a cache miss raises a toolchain error.
-
-Calling
--------
+Calling the function
+--------------------
 
 ```cpp
 #include <opencv2/triton.hpp>
 
-cv::cuda::GpuMat src(host), dst(h / 2, w / 2, host.type());
+cv::cuda::GpuMat src(host), dst;
 cv::cuda::Stream stream;
-cv::triton::resize(src, dst, dst.size(), 0, 0, cv::INTER_LINEAR, stream);
+cv::triton::resize(src, dst, cv::Size(host.cols / 2, host.rows / 2),
+                   0, 0, cv::INTER_LINEAR, stream);
 stream.waitForCompletion();
 ```
 
-The call is asynchronous: work is submitted to the given stream and the inputs
-and output must stay alive until it completes.
+The function submits work asynchronously. Retain input and output allocations
+until the stream completes. HIP applications use `resizeDevice` from
+`opencv2/triton/device.hpp` with preallocated output and a native stream handle.
+The overload with `fx`/`fy` supports scale-derived sizing; the six-argument
+form requires explicit `dsize`.
 
-Build-time compilation
-----------------------
+Runtime compilation and cache
+-----------------------------
 
-Only Triton 3.6.0 (CUDA 12.8, sm_90) is verified. The compile key carries the
-compiler version, so an artifact from another Triton is never reused; a build
-with a different version is untested and should not be expected to work.
+The module is disabled by default and requires no PyTorch dependency when
+enabled. Nothing is compiled by Triton during the OpenCV build. On first use,
+`tools/compile_helper.py` runs in a separate Python process using the configured
+Triton 3.6.0 compiler. The C++ execution path does not embed an interpreter.
+CUDA 12.8/sm_90 and the HIP flagtree 3.6.0 toolchain are described in the
+platform guides linked above.
 
-Nothing is compiled at OpenCV build time. On a cache miss the module runs
-`tools/compile_helper.py` in a separate, Torch-free process and stores the
-result in a verified on-disk cache; that process needs Python and Triton, the
-call path does not.
+The compile key includes source identity, kernel signature, compile-time
+parameters, launch options, target and compiler version. The runtime checks
+manifest and binary hashes before loading disk artifacts. An unsupported
+compiler launch ABI is rejected. Size-dependent coordinate and coefficient
+tables are built in C++, uploaded on the caller's stream and cached. Cross-stream
+use waits on the upload event. In-flight work retains modules and tables even
+after cache eviction.
 
-An install-time cache prefill for deployments that cannot have Python at run
-time is a planned item, not something this submission provides.
+The writable cache defaults to `~/.cache/opencv/triton`. The following runtime
+settings override configured defaults:
+
+| Setting | Purpose |
+|---|---|
+| `OPENCV_TRITON_CACHE_DIR` | Artifact cache directory |
+| `OPENCV_TRITON_RESOURCES` | Kernel and helper resource directory |
+| `OPENCV_TRITON_PYTHON` | Compiler interpreter |
+| `OPENCV_TRITON_PYTHONPATH` | Compiler Python import path |
+
+Installation places resources under `share/opencv5/triton`, resolved relative
+to the module library. A disk-cache hit runs without Python; a cache miss with
+no usable compiler raises a toolchain error. An empty module artifact cache
+does not imply that the compiler's own cache is empty.
+
+Warm operations can be captured into device graphs. After graphs using module
+resources are destroyed or can no longer be replayed, call
+cv::triton::releaseGraphResources(). Do not release those resources while a
+graph can still use them.

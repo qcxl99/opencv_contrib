@@ -24,7 +24,7 @@ namespace cv { namespace triton {
 
 namespace {
 
-kf_resize_rt::DeviceView view(const DeviceImage& m, int device)
+cv_triton_runtime::DeviceView view(const DeviceImage& m, int device)
 {
     if (m.ptr == 0 || m.rows <= 0 || m.cols <= 0)
         CV_Error(Error::StsBadArg, "cv::triton: a device image needs a non-null pointer and a positive size");
@@ -36,45 +36,50 @@ kf_resize_rt::DeviceView view(const DeviceImage& m, int device)
     v.step = m.step;
     v.whole_rows = m.rows;
     v.whole_cols = m.cols;
-    // The owning allocation is unknown here (0, 0): the runtime's overlap check then uses the
-    // two views' own byte ranges, which is what a caller-owned buffer pair can promise.
+    // Native queries below fill the allocation bounds and current context identity.
     auto out = detail::toDeviceView(v, device, 0, 0);
 #ifdef OPENCV_TRITON_HAVE_HIP_ADAPTER
     hipCtx_t current = nullptr;
-    hipDevice_t actual = 0; unsigned long long generation = 0;
-    void* base = nullptr; std::size_t bytes = 0;
+    hipDevice_t actual = 0;
+    unsigned long long generation = 0;
+    void* base = nullptr;
+    std::size_t bytes = 0;
     hipPointerAttribute_t attributes{};
     // DTK does not implement HIP_POINTER_ATTRIBUTE_CONTEXT. Query allocation
     // device/range, and obtain the active context's real lifetime identity.
     if (hipCtxGetCurrent(&current) != hipSuccess)
-        CV_Error(Error::StsBadArg,"cannot query current HIP context");
+        CV_Error(Error::StsBadArg, "cannot query current HIP context");
     if (!current)
     {
-        if (hipDevicePrimaryCtxRetain(&current,device) != hipSuccess || hipCtxSetCurrent(current) != hipSuccess)
-            CV_Error(Error::StsBadArg,"cannot initialize selected HIP context");
+        if (hipDevicePrimaryCtxRetain(&current, device) != hipSuccess || hipCtxSetCurrent(current) != hipSuccess)
+            CV_Error(Error::StsBadArg, "cannot initialize selected HIP context");
     }
     if (hipCtxGetDevice(&actual) != hipSuccess || actual != device ||
-        hipPointerGetAttributes(&attributes,reinterpret_cast<void*>(m.ptr)) != hipSuccess ||
+        hipPointerGetAttributes(&attributes, reinterpret_cast<void*>(m.ptr)) != hipSuccess ||
         attributes.device != device || attributes.memoryType != hipMemoryTypeDevice ||
-        hipCtxGetId(current,&generation) != hipSuccess ||
-        hipMemGetAddressRange(&base,&bytes,reinterpret_cast<void*>(m.ptr)) != hipSuccess)
-        CV_Error(Error::StsBadArg,"device image must be a device allocation on the current HIP device");
-    out.ctx.backend=kf_resize_rt::Backend::HIP;
+        hipCtxGetId(current, &generation) != hipSuccess ||
+        hipMemGetAddressRange(&base, &bytes, reinterpret_cast<void*>(m.ptr)) != hipSuccess)
+        CV_Error(Error::StsBadArg, "device image must be a device allocation on the current HIP device");
+    out.ctx.backend = cv_triton_runtime::Backend::HIP;
 #else
     CUcontext current = nullptr, owner = nullptr;
-    CUdevice actual = 0; unsigned long long generation = 0;
-    CUdeviceptr base = 0; std::size_t bytes = 0;
+    CUdevice actual = 0;
+    unsigned long long generation = 0;
+    CUdeviceptr base = 0;
+    std::size_t bytes = 0;
     if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || !current ||
         cuCtxGetDevice(&actual) != CUDA_SUCCESS || actual != device ||
-        cuPointerGetAttribute(&owner,CU_POINTER_ATTRIBUTE_CONTEXT,m.ptr) != CUDA_SUCCESS || owner != current ||
-        cuCtxGetId(current,&generation) != CUDA_SUCCESS ||
-        cuMemGetAddressRange(&base,&bytes,m.ptr) != CUDA_SUCCESS)
-        CV_Error(Error::StsBadArg,"device image must belong to the current CUDA context/device");
-    out.ctx.backend=kf_resize_rt::Backend::CUDA;
+        cuPointerGetAttribute(&owner, CU_POINTER_ATTRIBUTE_CONTEXT, m.ptr) != CUDA_SUCCESS || owner != current ||
+        cuCtxGetId(current, &generation) != CUDA_SUCCESS ||
+        cuMemGetAddressRange(&base, &bytes, m.ptr) != CUDA_SUCCESS)
+        CV_Error(Error::StsBadArg, "device image must belong to the current CUDA context/device");
+    out.ctx.backend = cv_triton_runtime::Backend::CUDA;
 #endif
-    out.ctx.native=reinterpret_cast<std::uintptr_t>(current);out.ctx.generation=generation;
-    out.alloc_base=(std::uintptr_t)base;out.alloc_bytes=bytes;
-    detail::requireStatus(kf_resize_rt::validate_view(out,"device image"),"device view");
+    out.ctx.native = reinterpret_cast<std::uintptr_t>(current);
+    out.ctx.generation = generation;
+    out.alloc_base = (std::uintptr_t)base;
+    out.alloc_bytes = bytes;
+    detail::requireStatus(cv_triton_runtime::validate_view(out, "device image"), "device view");
     return out;
 }
 
@@ -90,13 +95,13 @@ void validateStream(std::uintptr_t stream)
 {
     if (!stream) return;
 #ifdef OPENCV_TRITON_HAVE_HIP_ADAPTER
-    hipCtx_t current=nullptr,owner=nullptr;
-    if (hipCtxGetCurrent(&current)!=hipSuccess || hipStreamGetCtx(reinterpret_cast<hipStream_t>(stream),&owner)!=hipSuccess || owner!=current)
+    hipCtx_t current = nullptr, owner = nullptr;
+    if (hipCtxGetCurrent(&current) != hipSuccess || hipStreamGetCtx(reinterpret_cast<hipStream_t>(stream), &owner) != hipSuccess || owner != current)
 #else
-    CUcontext current=nullptr,owner=nullptr;
-    if (cuCtxGetCurrent(&current)!=CUDA_SUCCESS || cuStreamGetCtx(reinterpret_cast<CUstream>(stream),&owner)!=CUDA_SUCCESS || owner!=current)
+    CUcontext current = nullptr, owner = nullptr;
+    if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &owner) != CUDA_SUCCESS || owner != current)
 #endif
-        CV_Error(Error::StsBadArg,"stream must belong to the current device context");
+        CV_Error(Error::StsBadArg, "stream must belong to the current device context");
 }
 
 }  // namespace
@@ -111,34 +116,34 @@ void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
 {
     if (dsize.width <= 0 || dsize.height <= 0)
         CV_Error(Error::StsBadArg, "cv::triton::resize: dsize must be explicit and non-empty");
-    resizeDevice(src,dst,dsize,0.0,0.0,interpolation,device,stream);
+    resizeDevice(src, dst, dsize, 0.0, 0.0, interpolation, device, stream);
 }
 
 void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
                   double fx, double fy, int interpolation, int device, std::uintptr_t stream)
 {
     const auto source = view(src, device);
-    const auto output = detail::resizeOutput(source,dsize,fx,fy,interpolation);
+    const auto output = detail::resizeOutput(source, dsize, fx, fy, interpolation);
     if (dst.rows != output.size.height || dst.cols != output.size.width || dst.type != output.type)
         CV_Error(Error::StsBadArg, "cv::triton::resize: dst must have resolved size and type");
     if (src.ptr == dst.ptr) CV_Error(Error::StsBadArg, "cv::triton::resize: in-place operation is not supported");
     requireDevice(device, "resize");
     validateStream(stream);
-    detail::resizeDevice(source,view(dst,device),dsize,fx,fy,interpolation,device,stream);
+    detail::resizeDevice(source, view(dst, device), dsize, fx, fy, interpolation, device, stream);
 }
 
 void cvtColorDevice(const DeviceImage& src, const DeviceImage& dst, int code,
                     int device, std::uintptr_t stream)
 {
-    const auto source = view(src,device);
-    const auto output = detail::cvtColorOutput(source,code);
+    const auto source = view(src, device);
+    const auto output = detail::cvtColorOutput(source, code);
     if (dst.rows != output.size.height || dst.cols != output.size.width || dst.type != output.type)
         CV_Error(Error::StsBadArg, "cv::triton::cvtColor: dst must have the code's output size and type");
     if (src.ptr == dst.ptr)
         CV_Error(Error::StsBadArg, "cv::triton::cvtColor: in-place conversion is not supported");
     requireDevice(device, "cvtColor");
     validateStream(stream);
-    kf_cvtcolor::Request req;
+    cv_triton_color::Request req;
     req.src = view(src, device);
     req.dst = view(dst, device);
     req.code = code;
@@ -150,8 +155,8 @@ void warpAffineDevice(const DeviceImage& src, const DeviceImage& dst, const doub
                       int device, std::uintptr_t stream)
 {
     if (flags & ~(INTER_MAX | WARP_INVERSE_MAP))
-        CV_Error(Error::StsUnsupportedFormat,"cv::triton::warpAffine: unsupported flags");
-    if (!M) CV_Error(Error::StsBadArg,"cv::triton::warpAffine: matrix pointer must not be null");
+        CV_Error(Error::StsUnsupportedFormat, "cv::triton::warpAffine: unsupported flags");
+    if (!M) CV_Error(Error::StsBadArg, "cv::triton::warpAffine: matrix pointer must not be null");
     const int interpolation = flags & INTER_MAX;
     if (interpolation != INTER_NEAREST && interpolation != INTER_LINEAR &&
         interpolation != INTER_CUBIC && interpolation != INTER_AREA)
@@ -172,7 +177,7 @@ void warpAffineDevice(const DeviceImage& src, const DeviceImage& dst, const doub
     if (src.ptr == dst.ptr)
         CV_Error(Error::StsBadArg, "cv::triton::warpAffine: in-place operation is not supported");
     requireDevice(device, "warpAffine");
-    kf_warpaffine::Request req;
+    cv_triton_warp::Request req;
     req.src = view(src, device);
     validateStream(stream);
     req.dst = view(dst, device);

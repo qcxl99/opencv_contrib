@@ -53,7 +53,7 @@ PERF_TEST_P(Sz_Dsize_Cn_Interp, TritonResize, testing::Combine(
 #ifdef OPENCV_TRITON_PERF_HAVE_CUDAWARPING
 // Same geometry through the native implementation, so the comparison is on
 // one card under one harness rather than across tools. Absent when the build
-// has no cudawarping: this is a baseline, not part of the module's contract.
+// has no cudawarping: this is a baseline, not part of the production implementation.
 PERF_TEST_P(Sz_Dsize_Cn_Interp, NativeCudaResize_Reference, testing::Combine(
     testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
     testing::Values(cv::Size(640, 360), cv::Size(1280, 720), cv::Size(2560, 1440)),

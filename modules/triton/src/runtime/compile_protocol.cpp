@@ -2,8 +2,8 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Compile protocol, C++ side. See compile_protocol.hpp. POSIX only (fork/exec, flock is on
-// the helper's side); the module's Windows story is out of scope until a Windows backend exists.
+// Compile protocol, C++ side. See compile_protocol.hpp. Requires POSIX process
+// support (fork/exec); file locking is handled by the compile helper.
 #include "compile_protocol.hpp"
 
 #include <algorithm>
@@ -25,7 +25,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace kf_resize_rt {
+namespace cv_triton_runtime {
 
 // ------------------------------------------------------------------ sha256
 
@@ -397,7 +397,7 @@ bool verify_artifact(const std::string& dir, const std::string& expected_key_tex
 }
 
 bool compiler_abi_validated(const std::string& compiler, const std::string& format) {
-    // Extend only after checking the new compiler's entry parameters against the compiled entry metadata.
+    // Extend only after checking the new compiler's entry parameters (tests/test_compile_protocol.py).
     //   cubin: the PTX .entry parameters of upstream triton 3.6.0.
     //   hsaco: the AMDHSA kernel-argument metadata of flagtree's triton on gfx936, read by
     //          compile_helper.py's hip_abi(). flagtree reports the same version string "3.6.0",
@@ -580,76 +580,6 @@ CompileOutcome run_request(const HelperCommand& cmd, const std::string& request)
     return o;
 }
 
-}  // namespace kf_resize_rt
+}  // namespace cv_triton_runtime
 
 // ---------------------------------------------------------------- C ABI (tests)
-
-namespace {
-int put(const std::string& s, char* out, int len) {
-    if (!out || static_cast<int>(s.size()) + 1 > len) return -1;
-    std::memcpy(out, s.c_str(), s.size() + 1);
-    return static_cast<int>(s.size());
-}
-}  // namespace
-
-// The request for the key of one resize call (normalize + launch_shape), with an explicit
-// launch config, compiler identity and target. Returns its length, 0 for the copy route, -1 on error.
-//
-// The target is a parameter, not a default: a key names which backend the binary is for, and a
-// process compiles exactly one -- the one its profile selects. Leaving target_backend null (or
-// arch/warp_size zero) keeps provider.hpp's Target, the cuda default, which on a HIP box names a
-// different compiler distribution than the one that will run the artifact.
-extern "C" int kf_cp_make_request(int src_h, int src_w, int dst_w, int dst_h, double fx, double fy, int cn, int is_f32,
-                                  int interp, int block_h, int block_w, int num_warps, const char* compiler,
-                                  const char* source_path, const char* cache_dir, const char* target_backend,
-                                  int target_arch, int target_warp_size, char* out, int out_len) {
-    using namespace kf_resize_rt;
-    const std::size_t es = is_f32 ? 4 : 1;
-    kf_resize_ref::Size2 z{0, 0, 0, 0};
-    try { z = kf_resize_ref::resolve_size(src_h, src_w, dst_w, dst_h, fx, fy); } catch (...) { return -1; }
-    ResizeRequest q;
-    auto view = [&](std::uintptr_t ptr, int rows, int cols) {
-        DeviceView v; v.ctx.native = 1; v.ctx.device = 0; v.ptr = ptr; v.rows = rows; v.cols = cols; v.channels = cn;
-        v.type = is_f32 ? ElemType::F32 : ElemType::U8; v.step = static_cast<std::size_t>(cols) * cn * es; return v;
-    };
-    q.src = view(0x10000, src_h, src_w);
-    q.dst = view(0x10000 + static_cast<std::size_t>(src_h) * src_w * cn * es + 4096, z.dst_h, z.dst_w);
-    q.dsize_w = dst_w; q.dsize_h = dst_h; q.fx = fx; q.fy = fy; q.interpolation = interp;
-    Normalized n;
-    if (!normalize(q, n).ok()) return -1;
-    LaunchConfig cfg; cfg.block_h = block_h; cfg.block_w = block_w; cfg.num_warps = num_warps;
-    Toolchain tc; tc.compiler = compiler;
-    if (!sha256_file(source_path, tc.source_sha256)) return -1;
-    Target target;                                    // provider.hpp's default: cuda/sm_90/32
-    if (target_backend && *target_backend) target.backend = target_backend;
-    if (target_arch > 0) target.arch = target_arch;
-    if (target_warp_size > 0) target.warp_size = target_warp_size;
-    LaunchShape ls = launch_shape(n, cfg, target, tc);
-    if (ls.is_copy) return 0;
-    return put(make_request(ls.key, source_path, cache_dir), out, out_len);
-}
-
-// Runs the helper on a request. env is newline-separated K=V. Returns the Status code
-// (1 = Prepared, 3 = Error); kind / artifact_dir / response are written out.
-extern "C" int kf_cp_run(const char* request, const char* python, const char* helper, const char* env, double timeout_s,
-                         char* kind, int kind_len, char* dir, int dir_len, char* response, int response_len, int* exit_code) {
-    kf_resize_rt::HelperCommand c;
-    c.python = python; c.helper = helper; c.timeout_s = timeout_s;
-    std::istringstream e(env ? env : "");
-    for (std::string l; std::getline(e, l);) if (!l.empty()) c.env.push_back(l);
-    kf_resize_rt::CompileOutcome o = kf_resize_rt::run_request(c, request);
-    put(o.kind, kind, kind_len);
-    put(o.artifact_dir, dir, dir_len);
-    put(o.response, response, response_len);
-    if (exit_code) *exit_code = o.exit_code;
-    return static_cast<int>(o.status.code);
-}
-
-extern "C" int kf_cp_key_digest_of_request(const char* request, char* out, int out_len) {
-    kf_resize_rt::Json q;
-    std::string err;
-    if (!kf_resize_rt::json_parse(request, q, err)) return -1;
-    const kf_resize_rt::Json* kt = q.get("key_text");
-    if (!kt || kt->kind != kf_resize_rt::Json::String) return -1;
-    return put(kf_resize_rt::sha256_hex(kt->str), out, out_len);
-}

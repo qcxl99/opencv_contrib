@@ -20,9 +20,9 @@
 //
 // Unsupported depths/codes (reverse HSV, HLS, forward linear Luv, Bayer VNG/EA,
 // YUV encoding) are refused; no nearby conversion or CPU fallback is selected.
-// test/test_cvtcolor.cpp exercises this module's actual public GPU entry
-// against that build's own cv::cvtColor; changed IPP/HAL/toolchains need their
-// own evidence. The module README owns the public scope and limitations.
+// test/test_cvtcolor.cpp compares the public GPU entry with the linked
+// cv::cvtColor implementation. CPU dispatch, IPP/HAL and compiler options can
+// affect the reference arithmetic. See the module documentation for limitations.
 #pragma once
 
 #include <cstddef>
@@ -33,7 +33,7 @@
 #include "opencv2/core/cvdef.h"   // CV_EXPORTS
 #include "provider.hpp"
 
-namespace kf_cvtcolor {
+namespace cv_triton_color {
 
 // Operation ids. These are the OP constexprs of kernels/cvtcolor_cpu.py.
 enum class Op : int {
@@ -68,15 +68,13 @@ struct CodeSpec {
     // difference (the CPU's linearGammaTab_b[i] is just i << 3); for Luv it decides which
     // reverse gamma applies, and the forward linear direction is refused entirely.
     bool srgb = true;
-    // Xyz/Lab/Luv only: the CPU's nine integer coefficients, in ITS order. They are filled from
-    // the code by cvtcolor.cpp's coeffs_for() (which replicates the constructors in color_lab.cpp,
-    // including the blueIdx swap and the white-point scaling) rather than written out per row:
-    // nine numbers x 18 codes is a table nobody can check by eye, while the constructor is four
-    // lines. Zero for every other op.
+    // Xyz/Lab/Luv only: nine integer coefficients, derived by coeffs_for() from
+    // the constructors in color_lab.cpp, including channel swaps and white-point
+    // scaling. Zero for every other operation.
     int k[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     // Yuv422 only: which byte slot holds chroma U within the 4-byte macropixel -- 0 for UYVY,
-    // 1 for YUY2, 2 for YVYU (color_yuv.simd.hpp:1722-1730). Appended at the END of the struct
-    // to preserve the positional initialisers of the coefficient rows.
+    // 1 for YUY2, 2 for YVYU (color_yuv.simd.hpp:1722-1730). Keep this field
+    // last to preserve the positional initializers of preceding fields.
     int ord = 0;
 };
 
@@ -86,11 +84,11 @@ struct CodeSpec {
 // accuracy test checks the coefficient rows against coeffs_for.
 CV_EXPORTS const CodeSpec* find(int code);
 // CV_EXPORTS because OpenCV builds with hidden visibility and the accuracy test reads this
-// table to prove the test's own coverage (tests/test_cvtcolor.cpp, CoversEverySupportedCode).
+// table to prove the test's own coverage (test/test_cvtcolor.cpp, CoversEverySupportedCode).
 CV_EXPORTS const std::vector<CodeSpec>& all();
 
 struct Request {
-    kf_resize_rt::DeviceView src, dst;
+    cv_triton_runtime::DeviceView src, dst;
     int code = 0;
 };
 
@@ -101,15 +99,19 @@ struct Normalized {
     // Both views have matching depth; normalize owns the family-specific admission.
     bool u16 = false;
     bool f32 = false;
+    bool f32_cpu_separate4 = false;
 };
+
+// Private linked-CPU arithmetic identification; never receives user image data.
+CV_EXPORTS bool float_cpu_separate4();
 
 // Source admission used by every adapter before output allocation. A real source
 // view (pointer, shape, byte step and optional allocation span) is required; no device access.
 struct Output { const CodeSpec* spec = nullptr; int rows = 0, cols = 0; };
-kf_resize_rt::Status resolve_output(const kf_resize_rt::DeviceView& src, int code, Output& out);
+cv_triton_runtime::Status resolve_output(const cv_triton_runtime::DeviceView& src, int code, Output& out);
 
 // Pure checks. On success `out.spec` points into the static table.
-kf_resize_rt::Status normalize(const Request& req, Normalized& out);
+cv_triton_runtime::Status normalize(const Request& req, Normalized& out);
 
 // The two int[256] tables RGB2HSV_b divides by, built exactly as the CPU builds them
 // (color_hsv.simd.hpp: hsv_shift = 12, round-to-nearest on a double division).
@@ -121,21 +123,11 @@ HsvTables hsv_tables();
 // (180 << 12), i.e. a hue range of 0..255.
 HsvTables hsv_tables_full();
 
-// The tables XYZ/Lab/Luv read, built EXACTLY as color_lab.cpp's createLabTabs() and
-// initLUTforLABLUVs16() build them -- softfloat/softdouble evaluation and cvRound(), not a
-// double approximation. That is not pedantry: these tables are cvRound() of a softfloat
-// evaluation and the values are then compared for exact equality against a CPU that computed
-// them the same way, so a table built with std::pow and lrint differs in a handful of entries
-// and every pixel that reads one is off by one. (Anchors that a wrong build gets right anyway,
-// which is why they are recorded: sRGBGammaTab_b = 0,1,1,2,2 at 0..4 and 2040 at 255;
-// LabCbrtTab_b = 4520,4645,4770,4895 at 0..3 and 37555 at 3071; LabToYF_b at L=0 (0,2260) and
-// L=255 (16384,16384).)
-//
-// The three arrays are kept in the element type the kernel loads them as. `cbrt` is int32 and
-// NOT int16 even though the CPU stores ushort: its entries reach 37555, so a signed 16-bit load
-// would come back negative. `luv` is int64 for the same reason at the other end -- LvToVpl_b
-// can reach 6.2e13 over the (L,v) domain, which is why the CPU declares it
-// `long long`.
+// Lookup tables reproduce color_lab.cpp's createLabTabs() and
+// initLUTforLABLUVs16(), using softfloat/softdouble evaluation and cvRound().
+// Replacing those operations with host libm functions can change rounded entries.
+// The element types match kernel loads: cbrt requires int32 for values up to 37555;
+// luv uses int64 because LvToVpl_b exceeds the signed 32-bit range.
 struct LabLuvTables {
     std::vector<int> gamma;       // 256:     sRGBGammaTab_b (or linearGammaTab_b, identical scale)
     std::vector<int> cbrt;        // 3072:    LabCbrtTab_b
@@ -187,4 +179,4 @@ int block_size(const Normalized& n);
 int num_warps(const Normalized& n);
 void grid(const Normalized& n, int block, unsigned out[3]);   // {rows, ceil(cols/BLOCK), 1}
 
-}  // namespace kf_cvtcolor
+}  // namespace cv_triton_color

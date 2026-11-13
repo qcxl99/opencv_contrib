@@ -2,7 +2,21 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# CPU-aligned cvtColor kernels; see the public API for supported depths and numerical criteria.
+# Color conversion kernels for runtime compilation.
+#
+# Integer conversions preserve OpenCV CPU arithmetic. Constants and operation order
+# follow modules/imgproc/src/color*.simd_helpers.hpp, color_*.simd.hpp and color_lab.cpp.
+# Floating-point conversions use the operation groupings described at each branch.
+#
+# DELIBERATELY ABSENT: HSV2BGR and the HLS pair. Those are float32 in OpenCV, and the same
+# build rounds differently in its SIMD body than in its scalar tail (SIMD truncates the
+# final *255, the tail rounds). The answer for one pixel therefore depends on where it sits
+# in the row, so "bit-exact with the CPU" is not a well-defined target for them. They are
+# refused by name rather than given a tolerance that would hide that.
+#
+# Specialisation policy is the same as the resize kernels: channel counts and the operation
+# are constexprs, every other runtime argument is do_not_specialize, so the compile key is
+# something C++ can compute exactly.
 
 import triton
 import triton.language as tl
@@ -152,6 +166,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
                          I0: tl.constexpr, I1: tl.constexpr, I2: tl.constexpr,
                          I3: tl.constexpr, INV: tl.constexpr, HR: tl.constexpr,
                          GB: tl.constexpr, U16: tl.constexpr, F32: tl.constexpr,
+                         F32_CPU_SEPARATE4: tl.constexpr,
                          SWG: tl.constexpr,
                          ORD: tl.constexpr,
                          E0: tl.constexpr, E1: tl.constexpr, E2: tl.constexpr,
@@ -206,12 +221,34 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
         # The CPU's fixmul<<1 correction (:843-899) is NOT reproduced, and does not have to be:
         # it exists because that SIMD body packs an int32 result into int16, where a channel
         # >= 32768 has already gone negative. This kernel keeps the intermediate in int32 until
-        # the store, evaluating the scalar expression without an intermediate int16 pack.
+        # the store, so it evaluates the scalar formula without the SIMD packing correction.
         if F32:
+            # CV_32F. The CPU does NOT have one expression here: its fused body (W >= 16) is
+            # fma(r, cr, fma(g, cg, b*cb)) and its fused tail (W < 16) is
+            # fma(r, cr, fma(b, cb, g*cg)) -- different groupings, 1 ULP apart -- and its non-FMA
+            # build is the unfused (b*cb + g*cg) + r*cr. There is consequently no bit-exact
+            # target across all CPU configurations. The unidentified-profile fallback uses
+            # the body expression; identified separate4 uses source-order operations below.
+            # Tests bound the absolute error by
+            # 8 * 2^-24 * max(1, |reference|, max|input|).
             b = tl.load(src + sp + BLUE, mask=m, other=0).to(tl.float32)
             g = tl.load(src + sp + 1, mask=m, other=0).to(tl.float32)
             r = tl.load(src + sp + (BLUE ^ 2), mask=m, other=0).to(tl.float32)
-            y = libdevice.fma(r, 0.299, libdevice.fma(g, 0.587, b * 0.114))
+            # No coefficient swap between BGR and RGB order: `b` was loaded through
+            # `sp + BLUE`, so it holds the BLUE channel in both orders and `r` holds red. Swapping
+            # the literals here (as the CPU's own blueIdx does when it swaps pointers instead of
+            # indices) would apply the blue/red permutation twice.
+            if F32_CPU_SEPARATE4:
+                # Source-channel order matters even without fusion (RGB vs BGR).
+                a = tl.load(src + sp, mask=m, other=0).to(tl.float32)
+                e = tl.load(src + sp + 2, mask=m, other=0).to(tl.float32)
+                if BLUE == 0:
+                    p0, p2 = libdevice.mul_rn(a, 0.114), libdevice.mul_rn(e, 0.299)
+                else:
+                    p0, p2 = libdevice.mul_rn(a, 0.299), libdevice.mul_rn(e, 0.114)
+                y = libdevice.add_rn(libdevice.add_rn(p0, libdevice.mul_rn(g, 0.587)), p2)
+            else:
+                y = libdevice.fma(r, 0.299, libdevice.fma(g, 0.587, b * 0.114))
             tl.store(dst + dp, y, mask=m)
             if DCN == 4:
                 tl.store(dst + dp + 3, tl.full((BLOCK,), 1.0, tl.float32), mask=m)
@@ -268,16 +305,37 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
         #     numerator (r-Y)*C3 + sdelta peaks near 1.3e9 before the shift -- while at 8U the
         #     same expression cannot leave the byte range.
         if not INV and F32:
+            # CV_32F forward. Same coefficient literals as the CPU (color_yuv.simd.hpp:180-186),
+            # same fused grouping as its W>=16 body. Compute y first and derive chroma from
+            # the floating-point y, rather than the rounded value used by the integer path.
             b = tl.load(src + sp + BLUE, mask=m, other=0).to(tl.float32)
             g = tl.load(src + sp + 1, mask=m, other=0).to(tl.float32)
             r = tl.load(src + sp + (BLUE ^ 2), mask=m, other=0).to(tl.float32)
-            y = libdevice.fma(b, 0.114, libdevice.fma(g, 0.587, r * 0.299))
-            if OP == OP_YUV:
-                c0 = libdevice.fma(r - y, 0.877, 0.5)
-                c1 = libdevice.fma(b - y, 0.492, 0.5)
+            if F32_CPU_SEPARATE4:
+                a = tl.load(src + sp, mask=m, other=0).to(tl.float32)
+                e = tl.load(src + sp + 2, mask=m, other=0).to(tl.float32)
+                if BLUE == 0:
+                    p0, p2 = libdevice.mul_rn(a, 0.114), libdevice.mul_rn(e, 0.299)
+                else:
+                    p0, p2 = libdevice.mul_rn(a, 0.299), libdevice.mul_rn(e, 0.114)
+                p1 = libdevice.mul_rn(g, 0.587)
+                body = libdevice.add_rn(p0, libdevice.add_rn(p1, p2))
+                tail = libdevice.add_rn(libdevice.add_rn(p0, p1), p2)
+                y = tl.where(col < (cols // 4) * 4, body, tail)
+                if OP == OP_YUV:
+                    c0 = libdevice.add_rn(libdevice.mul_rn(libdevice.sub_rn(r, y), 0.877), 0.5)
+                    c1 = libdevice.add_rn(libdevice.mul_rn(libdevice.sub_rn(b, y), 0.492), 0.5)
+                else:
+                    c0 = libdevice.add_rn(libdevice.mul_rn(libdevice.sub_rn(r, y), 0.713), 0.5)
+                    c1 = libdevice.add_rn(libdevice.mul_rn(libdevice.sub_rn(b, y), 0.564), 0.5)
             else:
-                c0 = libdevice.fma(r - y, 0.713, 0.5)
-                c1 = libdevice.fma(b - y, 0.564, 0.5)
+                y = libdevice.fma(b, 0.114, libdevice.fma(g, 0.587, r * 0.299))
+                if OP == OP_YUV:
+                    c0 = libdevice.fma(r - y, 0.877, 0.5)
+                    c1 = libdevice.fma(b - y, 0.492, 0.5)
+                else:
+                    c0 = libdevice.fma(r - y, 0.713, 0.5)
+                    c1 = libdevice.fma(b - y, 0.564, 0.5)
             tl.store(dst + dp, y, mask=m)
             if OP == OP_YUV:
                 tl.store(dst + dp + 1, c1, mask=m)   # [Y, U, V]
@@ -289,18 +347,32 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             # CV_32F inverse. y is added outside the chroma term, exactly as the CPU does
             # (color_yuv.simd.hpp:671-673); 0.5 is ColorChannel<float>::half() exactly.
             y = tl.load(src + sp + 0, mask=m, other=0).to(tl.float32)
-            if OP == OP_YUV:
-                cb = tl.load(src + sp + 1, mask=m, other=0).to(tl.float32) - 0.5
-                cr = tl.load(src + sp + 2, mask=m, other=0).to(tl.float32) - 0.5
-                bb = libdevice.fma(cb, 2.032, y)
-                gg = libdevice.fma(cr, -0.581, libdevice.fma(cb, -0.395, y))
-                rr = libdevice.fma(cr, 1.140, y)
+            if F32_CPU_SEPARATE4:
+                if OP == OP_YUV:
+                    cb = libdevice.sub_rn(tl.load(src + sp + 1, mask=m, other=0).to(tl.float32), 0.5)
+                    cr = libdevice.sub_rn(tl.load(src + sp + 2, mask=m, other=0).to(tl.float32), 0.5)
+                    bb = libdevice.add_rn(y, libdevice.mul_rn(cb, 2.032))
+                    gg = libdevice.add_rn(libdevice.add_rn(y, libdevice.mul_rn(cb, -0.395)), libdevice.mul_rn(cr, -0.581))
+                    rr = libdevice.add_rn(y, libdevice.mul_rn(cr, 1.140))
+                else:
+                    cr = libdevice.sub_rn(tl.load(src + sp + 1, mask=m, other=0).to(tl.float32), 0.5)
+                    cb = libdevice.sub_rn(tl.load(src + sp + 2, mask=m, other=0).to(tl.float32), 0.5)
+                    bb = libdevice.add_rn(y, libdevice.mul_rn(cb, 1.773))
+                    gg = libdevice.add_rn(libdevice.add_rn(y, libdevice.mul_rn(cb, -0.344)), libdevice.mul_rn(cr, -0.714))
+                    rr = libdevice.add_rn(y, libdevice.mul_rn(cr, 1.403))
             else:
-                cr = tl.load(src + sp + 1, mask=m, other=0).to(tl.float32) - 0.5
-                cb = tl.load(src + sp + 2, mask=m, other=0).to(tl.float32) - 0.5
-                bb = libdevice.fma(cb, 1.773, y)
-                gg = libdevice.fma(cr, -0.714, libdevice.fma(cb, -0.344, y))
-                rr = libdevice.fma(cr, 1.403, y)
+                if OP == OP_YUV:
+                    cb = tl.load(src + sp + 1, mask=m, other=0).to(tl.float32) - 0.5
+                    cr = tl.load(src + sp + 2, mask=m, other=0).to(tl.float32) - 0.5
+                    bb = libdevice.fma(cb, 2.032, y)
+                    gg = libdevice.fma(cr, -0.581, libdevice.fma(cb, -0.395, y))
+                    rr = libdevice.fma(cr, 1.140, y)
+                else:
+                    cr = tl.load(src + sp + 1, mask=m, other=0).to(tl.float32) - 0.5
+                    cb = tl.load(src + sp + 2, mask=m, other=0).to(tl.float32) - 0.5
+                    bb = libdevice.fma(cb, 1.773, y)
+                    gg = libdevice.fma(cr, -0.714, libdevice.fma(cb, -0.344, y))
+                    rr = libdevice.fma(cr, 1.403, y)
             tl.store(dst + dp + BLUE, bb, mask=m)
             tl.store(dst + dp + 1, gg, mask=m)
             tl.store(dst + dp + (BLUE ^ 2), rr, mask=m)
@@ -330,7 +402,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             # c0 is the Cr slot (V for YUV, Cr for YCrCb) and c1 the Cb slot (U, Cb).
             # The CPU writes dst[1 + yuvOrder] = Cr and dst[2 - yuvOrder] = Cb, where
             # yuvOrder is 1 for YUV and 0 for YCrCb -- so YUV is [Y, U, V] and YCrCb is
-            # [Y, Cr, Cb]. Select destination slots according to that channel order.
+            # [Y, Cr, Cb]. The slot order must therefore depend on the conversion.
             if OP == OP_YUV:
                 tl.store(dst + dp + 1, c1.to(dst.dtype.element_ty), mask=m)
                 tl.store(dst + dp + 2, c0.to(dst.dtype.element_ty), mask=m)
@@ -396,7 +468,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             r = ((v >> 8) & 0xF8) if GB == 6 else ((v >> 7) & 0xF8)
             if DCN == 1:
                 # Same BT.601 triple as BGR2GRAY, applied to the EXPANDED fields; the CPU runs
-                # RGB5x52Gray (color_rgb.simd.hpp:520-621) applies the same integer formula.
+                # RGB5x52Gray (color_rgb.simd.hpp:520-621), using the same coefficients.
                 y = (b * BY15 + g * GY15 + r * RY15 + (1 << (GRAY_SHIFT - 1))) >> GRAY_SHIFT
                 tl.store(dst + dp, y.to(tl.uint8), mask=m)
             else:
@@ -466,7 +538,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
         ruv = BT_HALF + BT_CVR * vv
         guv = BT_HALF + BT_CVG * vv + BT_CUG * uu
         buv = BT_HALF + BT_CUB * uu
-        # `max(0, Y-16)` is a CLAMP, not a wrap: Y below 16 is treated as 16.
+        # `max(0, Y-16)` clamps rather than wraps: Y below 16 is treated as 16.
         # Y0/Y1 are runtime loads (int32); force both to int32 before the select so the ternary
         # has one type -- Triton rejects `tl.where(cond, int32, constexpr-int)`.
         yysel = tl.where((col & 1) != 0, Y1.to(tl.int32), Y0.to(tl.int32))
@@ -534,6 +606,33 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
                      tl.full((BLOCK,), 255, tl.int32).to(tl.uint8), mask=m420)
 
     elif OP == OP_BAYER:
+        # Bilinear Bayer demosaic, transcribed from Bayer2RGB_Invoker::operator()
+        # (modules/imgproc/src/demosaicing.cpp:823-1021) and Bayer2Gray_Invoker (:669-767).
+        #
+        # THE ADDRESSING IS THE WHOLE PROBLEM. The invoker starts at
+        #     dst + (range.start + 1) * dst_step + dcn + 1      (:845)
+        # ELEMENTS -- one element past the first interior pixel -- and every write is expressed
+        # relative to that: dst[-1], dst[0], dst[1] for the pixel at column 1, then
+        # dst[2..4] for column 2, and so on; at the end of the row dst[0] has walked to the
+        # column one PAST the last interior pixel, which is why dst[-4] (:1007) lands on the
+        # row's first pixel.
+        #
+        # Interior pixel (r,c) is centred on source (r,c) and its neighbours are the eight
+        # surrounding source samples. The two edge columns copy the adjacent interior column
+        # (:1007-1018), and the two edge rows copy the adjacent interior row (:1065-1071).
+        #
+        # The row phase comes from the SOURCE row index r-1 (:846-850): an odd one flips both
+        # Blue and Start_with_green. SWG and BLUE are constexprs because the CPU derives them
+        # from the code and never revisits them.
+        #
+        # Depth: the CPU runs the same algorithm for uchar and ushort (:1796-1803); the 16U path
+        # is the SIMD stub, i.e. the plain scalar loop. U16 only changes the element type the
+        # pointer is dereferenced as, so the arithmetic is identical in int32 and the store
+        # narrows once, exactly like the CPU's `dst[..] = (T)value`.
+        # src_rs/dst_rs arrive in ELEMENTS (the launch divides the byte step by the element
+        # size, cuda_runtime.cpp). That is the addressing unit of the typed pointer, so the same
+        # arithmetic below serves both depths -- the only depth-dependent thing is the store's
+        # narrowing and the alpha constant.
         srs = src_rs
         drs = dst_rs
         # Explicit runtime height keeps the module ABI identical on CUDA and HIP.
@@ -588,8 +687,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
 
         dp = row * drs + col * DCN
         if DCN == 1:
-            # Bayer2GRAY, its own coefficients (:775-776). The 16U path has no SIMD body, but
-            # both depths use the scalar fixed-point formula here.
+            # Bayer2GRAY uses its own coefficients (:775-776) at both depths.
             # CV_DESCALE(x, n) is `(x + (1 << (n-1))) >> n`.
             # The two sites use different shifts: SHIFT+1 (2-neighbour) and SHIFT+2
             # (4-neighbour). R2Y/B2Y start as (B2Y,R2Y) for BG/GB and swapped for RG/GR
@@ -621,7 +719,6 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             # Green site: the CPU writes `dst[-blue] = t0 (vertical), dst[0] = centre,
             # dst[blue] = t1 (horizontal)` (:882-884 and the pair loop's u0/u1 form at :921-925),
             # so blue > 0 puts the VERTICAL pair on channel 0 and the horizontal on channel 2.
-            # Preserve that orientation for each Bayer pattern.
             c0 = tl.where(green, tl.where(blue > 0, tv, th), tl.where(blue > 0, td, mm))
             c2 = tl.where(green, tl.where(blue > 0, th, tv), tl.where(blue > 0, mm, td))
             c1 = tl.where(green, mm, to)
@@ -646,6 +743,18 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             if DCN == 4:
                 tl.store(dst + dp + 3, alpha.to(dst.dtype.element_ty), mask=m)
     elif OP == OP_XYZ:
+        # color_lab.cpp:291-400 (RGB2XYZ_i<uchar>) and :671-785 (XYZ2RGB_i<uchar>).
+        #
+        # The 8-bit path never touches the float matrices: it uses sRGB2XYZ_D65_i /
+        # XYZ2sRGB_D65_i, already scaled by 2^shift, and CV_DESCALE. CV_DESCALE rounds
+        # half-up. A floating-point implementation using rint()/cvRound would round
+        # exact ties differently.
+        #
+        # THE COEFFICIENT SLOTS ARE POSITIONAL, NOT LOGICAL. cvtcolor.cpp emits them in the
+        # canonical order (slot 0 = the channel at src[0], slot 1 = src[1], slot 2 = src[2]),
+        # having already resolved the CPU's blueIdx permutation into that order. So this reads
+        # src[0..2] and nothing else: adding a BLUE swap here would apply the permutation a
+        # second time.
         if not INV:
             c0 = tl.load(src + sp + 0, mask=m, other=0).to(tl.int32)
             c1 = tl.load(src + sp + 1, mask=m, other=0).to(tl.int32)
@@ -661,7 +770,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             y = tl.load(src + sp + 1, mask=m, other=0).to(tl.int32)
             z = tl.load(src + sp + 2, mask=m, other=0).to(tl.int32)
             # Negative coefficients: CV_DESCALE's add-then-arithmetic-shift floors a negative
-            # numerator; use a signed arithmetic shift to preserve that rounding.
+            # numerator. Triton's arithmetic right shift on int32 preserves that rounding.
             B = (x * E0 + y * E1 + z * E2 + (1 << (XYZ_SHIFT - 1))) >> XYZ_SHIFT
             G = (x * E3 + y * E4 + z * E5 + (1 << (XYZ_SHIFT - 1))) >> XYZ_SHIFT
             R = (x * E6 + y * E7 + z * E8 + (1 << (XYZ_SHIFT - 1))) >> XYZ_SHIFT
@@ -725,6 +834,10 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             # added here and the table is uploaded already shifted to start at 0.
             x = tl.load(t32 + T_ABXZ + ify + adiv - MIN_AB, mask=m, other=0)
             z = tl.load(t32 + T_ABXZ + ify - bdiv - MIN_AB, mask=m, other=0)
+            # ROWS ARE DESTINATION SLOTS. The CPU's constructor fills coeffs[i+blueIdx*3],
+            # coeffs[i+3], coeffs[i+(blueIdx^2)*3] -- for blueIdx 0 that is slots 0, 3, 6, i.e.
+            # row-major, and the CPU then writes dst[0]=bo (row 0), dst[1]=go (row 1),
+            # dst[2]=ro (row 2), so coefficients are used in row-major order.
             d0 = (E0 * x + E1 * y + E2 * z + (1 << (REV_SHIFT - 1))) >> REV_SHIFT
             d1 = (E3 * x + E4 * y + E5 * z + (1 << (REV_SHIFT - 1))) >> REV_SHIFT
             d2 = (E6 * x + E7 * y + E8 * z + (1 << (REV_SHIFT - 1))) >> REV_SHIFT
@@ -745,12 +858,29 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             tl.store(dst + dp + 1, d1.to(tl.uint8), mask=m)
             tl.store(dst + dp + 2, d2.to(tl.uint8), mask=m)
     elif OP == OP_LUV:
+        # color_lab.cpp:3356-3533 (RGB2Luv_b -> RGB2Luvinterpolate) and :3534-3895
+        # (Luv2RGBinteger).
+        #
+        # THE sRGB FORWARD DIRECTION IS A TRILINEAR LUT, NOT THE CIE FORMULA. RGB2Luv_b sets
+        # useInterpolation when srgb is set, so the 8-bit path is RGB2Luvinterpolate over
+        # RGB2LuvLUT_s16 -- a 33^3 grid. Computing exact CIE Luv would be WRONG here: the LUT
+        # approximates that formula and has different rounding from the floating-point path.
+        # Reproduce the LUT, including corner duplication. Only the forward direction uses the
+        # 33-node grid; Luv2BGR uses integer arithmetic like Lab2BGR.
+        #
+        # Corner layout: `t16` holds the LUT as int16 (its values are bounded by 16384, unlike
+        # LabCbrtTab_b). Each node carries 8 corners x 3 channels = 24 int16, corners at stride
+        # 1 in _p,_q,_r order and channels at stride 8 -- the CPU's own
+        # `baseLUT[i], baseLUT[i+8], baseLUT[i+16]` (color_lab.cpp:1344-1347).
+        # The 8 weights (trilinearLUT, :1305-1312) pair weight i with corner
+        # (_p = i>>2, _q = (i>>1)&1, _r = i&1) and use the fraction where the bit is 1, so
+        # weight i multiplies the node one step UP in each of those axes.
         if not INV:
             # The LUT is stored AFTER the reverse tables, at a fixed offset. The sRGB LUT is
             # the only 8-bit forward Luv path: RGB2Luv_b's useInterpolation is set exactly when
             # srgb is true and no custom coefficients were supplied (color_lab.cpp:3368-3371),
             # so there is no linear-Luv forward arm here at all -- those two codes are refused
-            # by request validation.
+            # by the public argument validator.
             r = tl.load(src + sp + BLUE, mask=m, other=0).to(tl.int32)
             g = tl.load(src + sp + 1, mask=m, other=0).to(tl.int32)
             b = tl.load(src + sp + (BLUE ^ 2), mask=m, other=0).to(tl.int32)
@@ -828,8 +958,8 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             vpl = tl.load(t64 + LL * 256 + vv, mask=m, other=0)
             y64 = y.to(tl.int64)
             xv = up.to(tl.int64) * vp.to(tl.int64)
-            # Signed integer // truncates toward zero as C++ division does; an
-            # arithmetic right shift would floor negative values instead.
+            # C++ integer division and Triton's signed // truncate toward zero.
+            # A right shift would floor negative values instead.
             x = (xv // BASE).to(tl.int32)
             x = ((y64 * x.to(tl.int64)) // BASE).to(tl.int32)
             zp = (vpl - xv * 85) // BASE          # 255/3 == 85 in the CPU (integer division)

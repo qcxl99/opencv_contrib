@@ -2,9 +2,7 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# CPU-aligned warpAffine kernels for the module runtime JIT.
-# Maintenance and numerical references are documented in doc/maintenance.markdown.
-# This installed source is self-contained; its content hash is part of the compile key.
+# Affine warp kernels for runtime compilation.
 
 import triton
 import triton.language as tl
@@ -290,8 +288,8 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
 
     Different family from _warp_linear/_warp_nearest: the column coordinate is
     M_x + M_xx*x with NO fma, computed from the absolute x, so every block computes a
-    column the same way. The reference uses the natural-width CPU call; the tests
-    check that behavior on the linked build rather than assuming cross-build invariance.
+    column the same way and the result does not depend on the destination width.
+    The cubic reference therefore does not need destination-width padding.
 
     Tap layout: ix0 = floor(sx) - 1, then ix0..ix0+3; sx and sy are clamped in float to
     [-max(dim,16), 2*max(dim,16)] first, as bicubicCoeffs does, so a wild matrix cannot
@@ -368,8 +366,8 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
                     bvs = bv.to(src.dtype.element_ty)
                     if TRANSPARENT:
                         # BORDER_TRANSPARENT (CUBIC): an out-of-range tap is the OLD DESTINATION
-                        # pixel, weights unchanged -- the same destination-fill blend LINEAR uses
-                        # and is written unless the whole 4x4 window is outside.
+                        # pixel with unchanged weights, as in the LINEAR blend. The result is
+                        # written unless the whole 4x4 window is outside.
                         bvs = tl.load(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c,
                                       mask=m, other=0)
                     v = tl.load(src + idx, mask=m & ok, other=bvs)

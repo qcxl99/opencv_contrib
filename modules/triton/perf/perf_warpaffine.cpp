@@ -2,21 +2,12 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Steady-state timing of cv::triton::warpAffine through the public entry, with the native CUDA
-// path as a same-card timing baseline.
-//
-// Unlike resize but like cvtColor, the two sides are close to the same computation: this module
-// computes what the CPU float invoker computes, and cv::cuda::warpAffine's textured path is a
-// different but comparable resampling. A ratio here is a same-card comparison of two warp
-// implementations, NOT a claim about the CPU result -- the module matches the CPU, cv::cuda does
-// not (see doc/warpaffine.markdown).
-//
-// This perf cycle includes public submission and stream completion. Small workloads may
-// be dominated by host submission; these rows must not be reported as pure device timing.
-// Device/graph measurements require their own explicit timing method and workload evidence.
-//
-// Compile and first-load costs are excluded by warming up before the measured cycle, and the
-// destination is preallocated so allocation is not in the timed region.
+// Warmed public-call timing with optional same-device native CUDA comparisons.
+// The selected CPU reference and cv::cuda::warpAffine use different sampling
+// arithmetic; timing ratios do not imply numerical equivalence.
+// Compilation, first load and output allocation occur before the timed cycle.
+// Public submission and stream completion are included. Host overhead can
+// dominate short operations; these rows are not isolated kernel timings.
 
 #include "perf_precomp.hpp"
 
@@ -125,7 +116,7 @@ PERF_TEST_P(Sz_Interp_Border_Type, TritonWarpAffineAreaTransparent, testing::Com
 // The native implementation on the same card and harness. cudawarping is an OPTIONAL dependency
 // of perf/ only -- the module never uses it -- so a build without it omits this baseline.
 //
-// cv::cuda::warpAffine is called directly with the source prepared by this perf fixture.
+// Call the native cv::cuda entry directly with the harness-owned GpuMat.
 PERF_TEST_P(Sz_Interp_Dtype, NativeCudaWarpAffine_Reference, testing::Combine(
     testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
     testing::Values(0, 1, 2),

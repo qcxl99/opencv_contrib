@@ -4,12 +4,22 @@
 
 // HIP (BW1000 / gfx936) accuracy test for the device entries (opencv2/triton/device.hpp).
 //
-// Standard opencv_test_triton now shares SDK-neutral accuracy fixtures through
-// validation/device_hip.cpp and the common numerical owners under validation/.
-// This separate executable supplements that coverage with HIP-specific lifecycle,
-// ownership/refusal and capture checks in five selectable groups. It also retains
-// its standalone numerical/ROI controls for minimal builds without opencv_ts.
-// It is not a substitute for the common OpenCV accuracy target or a CUDA result.
+// The module's own tests in test/ are written against cuda::GpuMat, cuda::Stream and the CUDA
+// driver API, so they cannot run on a HIP build. This is their counterpart for the entries a
+// HIP build serves: it allocates HIP device buffers, calls the public device entries
+// (-> runtime -> compile helper -> hsaco load -> launch) and checks every result against the
+// same references and bounds the CUDA tests use:
+//   resize      the portable CPU oracle (test/resize_reference.cpp, compiled into this
+//               binary by test/test_oracle.cpp); CV_8U bit-exact, CV_32F within f32Atol;
+//   cvtColor    this build's cv::cvtColor (the integer codes the module serves); bit-exact;
+//   warpAffine  cv::warpAffine's vector path cropped to dsize (NEAREST/LINEAR) or the natural
+//               call (CUBIC), as test/test_warpaffine.cpp defines it; CV_8U/CV_16U bit-exact,
+//               CV_32F within min(5e-5 * max(|ref|, 1), 1e-4).
+// Each accepted case also checks that only dst was written: the destination is a ROI of a
+// padded parent whose border bytes must be unchanged. A refused case must raise the documented
+// error and leave dst untouched. Scalar bounds use validation/numerics.hpp, the
+// same owner as the standard fixtures, without requiring gtest / opencv_ts.
+//
 // Plain main, no gtest: the target builds in a minimal core,imgproc,triton tree. It accepts the
 // gtest-style filters select five registered group tests, not individual inner checks.
 // Each group runs only when selected. XML lists those same group names and records
@@ -33,10 +43,10 @@
 #include "opencv2/imgproc.hpp"
 #include "opencv2/triton/device.hpp"
 
-#include "../../src/runtime/reference_cpu.hpp"
+#include "../resize_reference.hpp"
 #include "../../validation/numerics.hpp"
 
-namespace ref = kf_resize_ref;
+namespace ref = cv_triton_resize;
 namespace tr = cv::triton;
 
 #define HIPOK(call) do { hipError_t e_ = (call); if (e_ != hipSuccess) { \
@@ -343,11 +353,11 @@ static void resizeCase(cv::Size ssz, cv::Size dsz, int type, int interp, hipStre
 
 // ------------------------------------------------------------------------- cvtColor
 
-static void cvtCase(cv::Size sz, const kf_cvtcolor::CodeSpec& spec, int depth,
+static void cvtCase(cv::Size sz, const cv_triton_color::CodeSpec& spec, int depth,
                     hipStream_t stream, uint64 seed, bool boundaries = false)
 {
     const unsigned char fill = 0x5A;
-    const int sourceHeight = spec.op == kf_cvtcolor::Op::Yuv420 ? sz.height / 2 * 3 : sz.height;
+    const int sourceHeight = spec.op == cv_triton_color::Op::Yuv420 ? sz.height / 2 * 3 : sz.height;
     cv::Mat host = randomImage({sz.width, sourceHeight}, CV_MAKETYPE(depth, spec.scn), seed);
     if (boundaries)
     {
@@ -383,7 +393,7 @@ static void cvtCase(cv::Size sz, const kf_cvtcolor::CodeSpec& spec, int depth,
     const cv::Mat parent = downloadParent(dst), got = roiOf(parent, dst);
     std::string why;
     bool ok = true;
-    if (depth != CV_32F || spec.op == kf_cvtcolor::Op::Permute)
+    if (depth != CV_32F || spec.op == cv_triton_color::Op::Permute)
         ok = compare(got, want, [](double) { return 0.0; }, why);
     else
     {
@@ -397,7 +407,7 @@ static void cvtCase(cv::Size sz, const kf_cvtcolor::CodeSpec& spec, int depth,
                 for (int c = 0; c < spec.dcn; ++c)
                 {
                     const double a = got.ptr<float>(y)[x*spec.dcn+c], b = want.ptr<float>(y)[x*spec.dcn+c];
-                    if (!std::isfinite(a) || std::abs(a-b) > triton_validation::numeric::cvtF32Tolerance(b,scale))
+                    if (!std::isfinite(a) || std::abs(a-b) > triton_validation::numeric::cvtF32Tolerance(b,scale,cv_triton_color::float_cpu_separate4()))
                     { ok = false; why = cv::format("pixel(%d,%d,%d) got=%.12g ref=%.12g", y,x,c,a,b); }
                 }
             }
@@ -414,10 +424,10 @@ static void cvtCoverage(hipStream_t stream)
 {
     uint64 seed = 10001;
     int rows8 = 0, rows16 = 0, rows32 = 0;
-    for (const auto& spec : kf_cvtcolor::all())
+    for (const auto& spec : cv_triton_color::all())
         for (int depth : {CV_8U, CV_16U, CV_32F})
         {
-            using kf_cvtcolor::Op;
+            using cv_triton_color::Op;
             const bool word = spec.op == Op::Bayer || spec.op == Op::Gray || spec.op == Op::Yuv ||
                               spec.op == Op::YCrCb || (spec.op == Op::Permute && spec.scn == 1);
             const bool floating = spec.op == Op::Gray || spec.op == Op::Yuv || spec.op == Op::YCrCb ||

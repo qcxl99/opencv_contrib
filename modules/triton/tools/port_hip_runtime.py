@@ -31,8 +31,8 @@ def sub(old, new, count=None):
     out = out.replace(old, new)
 
 # ---- 1. header: what this file is, and why it differs ----------------------------------
-sub('// Runtime JIT, CUDA driver side. See runtime.hpp for the contract.\n',
-'''// Runtime JIT, HIP driver side (Hygon BW1000 / gfx936, DTK). See runtime.hpp for the contract.
+sub('// Runtime JIT for the CUDA driver API. See runtime.hpp for execution and ownership rules.\n',
+'''// Runtime JIT, HIP driver side (Hygon BW1000 / gfx936, DTK). See runtime.hpp for execution and ownership rules.
 //
 // GENERATED from cuda_runtime.cpp by tools/port_hip_runtime.py -- do not edit; edit the CUDA
 // file and re-run the port. Exactly one of the two is compiled into a build (CMakeLists.txt).
@@ -42,8 +42,8 @@ sub('// Runtime JIT, CUDA driver side. See runtime.hpp for the contract.\n',
 //     -> 936; an arch with a letter suffix such as gfx90a has no integer form in the key and is
 //     refused); warp_size from the device (64 on gfx936, not 32).
 //   * Kernels: kernels/<op>_cpu_hip.py where the CUDA source calls a libdevice primitive
-//     flagtree's hip build lacks (resize, warpAffine; tools/make_kernels_cpu_hip.py derives
-//     them and refuses a stale copy); cvtColor also uses the derived source for explicit rounded float operations.
+//     the HIP compiler lacks; tools/make_kernels_cpu_hip.py derives resize, cvtColor
+//     and warpAffine sources and rejects stale copies.
 //   * Binary: manifest format "hsaco", loaded with hipModuleLoadData.
 //   * Compile helper environment: ROCM_PATH is forwarded (the hip compiler finds clang and its
 //     device libraries through it), and the GPU is hidden from the helper with the HIP and ROCR

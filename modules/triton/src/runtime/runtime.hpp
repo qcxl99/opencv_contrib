@@ -2,19 +2,22 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Module-private runtime JIT. Not installed.
-// Adapters call resize(), cvtColor() or warpAffine(). Each validates its supported request,
-// obtains a verified artifact (context-local module cache -> disk cache -> separate compile
-// helper process), prepares stream-ordered tables when needed, and submits on the caller's
-// stream. Resize serves copy, nearest, linear, cubic, area_fast and fractional AREA routes.
-// Supported input subsets remain operation/backend-specific; unsupported calls do not fall back.
-// C++ loads verified cubin/hsaco entry metadata; Python is used only by the compile helper.
-// In-flight work retains modules/tables; graph captures pin resources until the caller releases
-// them after all dependent graphs and executions are finished. See the public API contract.
-// CUDA driver 12.8 observations: module load/unload can wait for prior context work. Releases
-// occur outside the runtime lock; tables use stream-ordered allocation/free.
-// CUDA and HIP implementations are selected at build time. Their capability and test results
-// are backend-specific, not interchangeable. See doc/maintenance.markdown.
+// Module-private CUDA/HIP JIT runtime. Not installed.
+//
+// resize(), cvtColor() and warpAffine() validate requests before device submission.
+// resize supports NEAREST, LINEAR, CUBIC and AREA, including fractional AREA;
+// the other operators define their supported combinations in their provider headers.
+//
+// Binaries are resolved through the process-local module cache, the verified disk
+// cache, or a separate Torch-free compile-helper process. Python is not embedded.
+// Resize coordinate/coefficient tables are built in C++, uploaded on the caller's
+// stream, and made visible to other streams through events. Launch arguments are
+// checked against the verified manifest and supported compiler ABI.
+//
+// Modules and tables remain alive until their launches complete. Captured graphs
+// retain resources until releaseCapturePins() is called. Cache eviction drops only
+// the cache reference; potentially blocking driver cleanup runs outside the state
+// mutex. First use of a key may compile, load a module, allocate and upload tables.
 #ifndef OPENCV_TRITON_RUNTIME_HPP
 #define OPENCV_TRITON_RUNTIME_HPP
 
@@ -29,39 +32,39 @@
 
 namespace cv { namespace triton { namespace runtime {
 
-/** Is the selected backend usable for `device`? Pure query: no allocation or submission. */
+/** Is the selected device backend usable for `device`? Pure query: no allocation, no submission. */
 bool deviceAvailable(int device);
-const char* name();   // "cuda-jit" or "hip-jit"
+const char* name();   // backend runtime identifier
 
 /** Run one resize. `req` views must belong to the context current on the calling thread.
  *  Returns Submitted (work is on ex.stream), Unsupported (nothing submitted, dst untouched)
  *  or Error. `route` (if given) receives the route name. */
-kf_resize_rt::Status resize(const kf_resize_rt::ResizeRequest& req, const kf_resize_rt::ExecContext& ex,
+cv_triton_runtime::Status resize(const cv_triton_runtime::ResizeRequest& req, const cv_triton_runtime::ExecContext& ex,
                             std::string* route = nullptr);
 
 /** Run one cvtColor. Same contract as resize(): Submitted, Unsupported (nothing submitted,
  *  dst untouched) or Error. `opName` receives the conversion's name. */
-kf_resize_rt::Status cvtColor(const kf_cvtcolor::Request& req, const kf_resize_rt::ExecContext& ex,
+cv_triton_runtime::Status cvtColor(const cv_triton_color::Request& req, const cv_triton_runtime::ExecContext& ex,
                               std::string* opName = nullptr);
 
 /** Run one warpAffine. Same contract as resize(): Submitted, Unsupported (nothing submitted,
  *  dst untouched) or Error. */
-kf_resize_rt::Status warpAffine(const kf_warpaffine::Request& req, const kf_resize_rt::ExecContext& ex);
+cv_triton_runtime::Status warpAffine(const cv_triton_warp::Request& req, const cv_triton_runtime::ExecContext& ex);
 
 }}}  // namespace cv::triton::runtime
 
 namespace cv { namespace triton { namespace detail {
 
 /** ImageView -> the runtime's device view (alloc_base/bytes = the owning allocation, 0 = unknown). */
-kf_resize_rt::DeviceView toDeviceView(const ImageView& v, int device, std::uintptr_t alloc_base, std::size_t alloc_bytes);
+cv_triton_runtime::DeviceView toDeviceView(const ImageView& v, int device, std::uintptr_t alloc_base, std::size_t alloc_bytes);
 /** The common entry of resizeCore() and the GpuMat adapter. dsize empty = fx/fy given (the
  *  caller's values, passed through unchanged). Raises the mapped OpenCV error. */
-void resizeDevice(const kf_resize_rt::DeviceView& src, const kf_resize_rt::DeviceView& dst, Size dsize,
+void resizeDevice(const cv_triton_runtime::DeviceView& src, const cv_triton_runtime::DeviceView& dst, Size dsize,
                   double fx, double fy, int interpolation, int device, std::uintptr_t stream);
 /** cvtColor counterpart: validates, calls runtime::cvtColor, raises the mapped OpenCV error. */
-void cvtColorDevice(const kf_cvtcolor::Request& req, int device, std::uintptr_t stream);
+void cvtColorDevice(const cv_triton_color::Request& req, int device, std::uintptr_t stream);
 /** warpAffine counterpart: validates, calls runtime::warpAffine, raises the mapped OpenCV error. */
-void warpAffineDevice(const kf_warpaffine::Request& req, int device, std::uintptr_t stream);
+void warpAffineDevice(const cv_triton_warp::Request& req, int device, std::uintptr_t stream);
 
 }}}  // namespace cv::triton::detail
 

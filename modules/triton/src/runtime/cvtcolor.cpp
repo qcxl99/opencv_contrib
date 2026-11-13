@@ -5,19 +5,22 @@
 // Pure part of the cvtColor provider: the code table, request validation and the explicit
 // compile key. No device access, so it is testable without a GPU.
 //
-// The reference is this build's cv::cvtColor, not every CPU build. OpenCV dispatches
-// through HAL and SIMD implementations, so changed builds need their own validation.
-// Integer conversions/copies use exact comparison, while finite float arithmetic uses
-// the per-pixel input-scale bound in the public API and validation/numerics.hpp.
-// Cases and CPU reference checks live in test/test_cvtcolor.cpp and validation/.
-// Reverse HSV/HLS and forward linear Luv remain unsupported: their CPU floating
-// expressions and SIMD/tail choices are not covered by this module's numerical contract.
-// A deterministic result for a fixed CPU build/input is not a width-independent or
-// cross-build bit-exact guarantee. Unsupported codes are refused rather than approximated.
+// Integer conversions follow the fixed-point formulas and lookup tables used by
+// OpenCV's generic CPU implementation. Channel permutations are exact copies.
+// Tests compare the public GPU entry with the linked cv::cvtColor implementation;
+// alternative HAL, IPP or SIMD paths may use different rounding.
+//
+// Reverse HSV/HLS and forward linear Luv are not implemented. Their CPU floating
+// point paths can differ between vector blocks and scalar tails; the conversion
+// table below lists the supported alternatives explicitly.
 #include "cvtcolor.hpp"
 
 #include <algorithm>
 #include <cfloat>
+#include <cfenv>
+#include <map>
+#include <tuple>
+#include "opencv2/imgproc.hpp"
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -30,11 +33,11 @@
 // the same header modules/imgproc/src/color_lab.cpp itself includes.
 #include "opencv2/core/softfloat.hpp"
 
-namespace kf_cvtcolor {
+namespace cv_triton_color {
 
-using kf_resize_rt::Code;
-using kf_resize_rt::Reason;
-using kf_resize_rt::Status;
+using cv_triton_runtime::Code;
+using cv_triton_runtime::Reason;
+using cv_triton_runtime::Status;
 
 namespace {
 
@@ -202,8 +205,8 @@ const CodeSpec TABLE[] = {
     // code, because the CPU computes them from softdouble in the constructor and nine hand-
     // written ints per row would be neither checkable nor correctable.
     //
-    // Forward linear Luv codes 76/77 remain unsupported: the CPU vector/tail
-    // expressions differ and this module does not promise their numerical equivalence.
+    // Forward linear Luv (COLOR_LBGR2Luv and COLOR_LRGB2Luv) is not implemented.
+    // Its CPU vector and scalar paths can produce different rounded results.
     {"BGR2XYZ", 32, Op::Xyz, 3, 3, 0, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
     {"RGB2XYZ", 33, Op::Xyz, 3, 3, 2, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
     {"XYZ2BGR", 34, Op::Xyz, 3, 3, 0, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
@@ -273,7 +276,104 @@ const std::vector<CodeSpec>& all() {
     return table();
 }
 
-Status resolve_output(const kf_resize_rt::DeviceView& s, int code, Output& out) {
+namespace {
+// Volatile stores enforce one binary32 rounding per operation even in FMA builds.
+float separate_mul(float a, float b) { volatile float v = a * b; return v; }
+float separate_add(float a, float b) { volatile float v = a + b; return v; }
+float separate_sub(float a, float b) { volatile float v = a - b; return v; }
+
+cv::Mat separate4_model(const cv::Mat& src, const CodeSpec& c) {
+    cv::Mat dst(src.rows, src.cols, CV_MAKETYPE(CV_32F, c.dcn));
+    for (int y = 0; y < src.rows; ++y)
+        for (int x = 0; x < src.cols; ++x) {
+            const float* s = src.ptr<float>(y) + x * c.scn;
+            float* d = dst.ptr<float>(y) + x * c.dcn;
+            if (c.op == Op::Gray || !c.inverse) {
+                const float a = separate_mul(s[0], c.blue == 0 ? .114f : .299f);
+                const float b = separate_mul(s[1], .587f);
+                const float e = separate_mul(s[2], c.blue == 0 ? .299f : .114f);
+                const float v = c.op != Op::Gray && x < (src.cols / 4) * 4
+                                    ? separate_add(a, separate_add(b, e))
+                                    : separate_add(separate_add(a, b), e);
+                d[0] = v;
+                if (c.op != Op::Gray) {
+                    const bool uv = c.op == Op::Yuv;
+                    const float cr = separate_add(separate_mul(separate_sub(s[c.blue ^ 2], v), uv ? .877f : .713f), .5f);
+                    const float cb = separate_add(separate_mul(separate_sub(s[c.blue], v), uv ? .492f : .564f), .5f);
+                    d[uv ? 2 : 1] = cr; d[uv ? 1 : 2] = cb;
+                }
+            } else {
+                const bool uv = c.op == Op::Yuv;
+                const float cr = separate_sub(s[uv ? 2 : 1], .5f);
+                const float cb = separate_sub(s[uv ? 1 : 2], .5f);
+                d[c.blue] = separate_add(s[0], separate_mul(cb, uv ? 2.032f : 1.773f));
+                d[1] = separate_add(separate_add(s[0], separate_mul(cb, uv ? -.395f : -.344f)),
+                                    separate_mul(cr, uv ? -.581f : -.714f));
+                d[c.blue ^ 2] = separate_add(s[0], separate_mul(cr, uv ? 1.140f : 1.403f));
+                if (c.dcn == 4) d[3] = 1.f;
+            }
+        }
+    return dst;
+}
+
+using FloatControls = std::tuple<bool, bool, bool, int>;
+FloatControls float_controls() {
+    return std::make_tuple(cv::useOptimized(), cv::ipp::useIPP(),
+                           cv::ipp::useIPP_NotExact(), std::fegetround());
+}
+
+bool identify_separate4() {
+    // A fixture match identifies only the tested finite normal domain. It is not a
+    // universal guarantee for other HALs, nonfinite inputs, overflow or subnormals.
+    int codes = 0;
+    for (const CodeSpec& c : all()) {
+        if (c.op != Op::Gray && c.op != Op::Yuv && c.op != Op::YCrCb) continue;
+        ++codes;
+        for (int w : {1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 65})
+            for (bool roi : {false, true}) {
+                cv::Mat parent(5, w + 7, CV_MAKETYPE(CV_32F, c.scn));
+                cv::RNG rng(0x932500 + c.code * 31 + w);
+                rng.fill(parent, cv::RNG::UNIFORM, -2., 2.);
+                cv::Mat src = parent(cv::Rect(2, 1, w, 3));
+                if (!roi) src = src.clone();
+                for (int y = 0; y < src.rows; ++y)
+                    for (int x = 0; x < w; ++x)
+                        for (int k = 0; k < c.scn; ++k)
+                            src.ptr<float>(y)[x*c.scn+k] *= (x+y)%3 ? 32767.5f : 1.f;
+                const cv::Mat expected = separate4_model(src, c);
+                cv::Mat actual;
+                cv::cvtColor(src, actual, c.code);
+                if (actual.size() != expected.size() || actual.type() != expected.type()) return false;
+                for (int y = 0; y < actual.rows; ++y)
+                    for (int x = 0; x < actual.cols * actual.channels(); ++x) {
+                        const float a = actual.ptr<float>(y)[x], b = expected.ptr<float>(y)[x];
+                        if (!std::isfinite(a) || !std::isfinite(b) || a != b) return false;
+                    }
+            }
+    }
+    return codes == 12;
+}
+} // namespace
+
+bool float_cpu_separate4() {
+    // IPP controls can be thread-local: cache by their values, not by a process
+    // default. Never mutate caller controls. Do not publish an unstable probe.
+    static std::mutex mutex;
+    static std::map<FloatControls, bool> cache;
+    const FloatControls before = float_controls();
+    if (std::get<3>(before) != FE_TONEAREST) return false;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (float_controls() != before) return false;
+    const auto found = cache.find(before);
+    if (found != cache.end()) return found->second && float_controls() == before;
+    bool matches = false;
+    try { matches = identify_separate4(); } catch (const cv::Exception&) { return false; }
+    if (float_controls() != before) return false;
+    cache.emplace(before, matches);
+    return matches;
+}
+
+Status resolve_output(const cv_triton_runtime::DeviceView& s, int code, Output& out) {
     const CodeSpec* spec = find(code);
     if (!spec)
         return unsupported(Reason::Interpolation,
@@ -297,22 +397,20 @@ Status resolve_output(const kf_resize_rt::DeviceView& s, int code, Output& out) 
     // Everything else stays 8U, and the colour permutes do NOT get 16U as a side effect: the
     // scn == 1 condition is what keeps BGR2BGRA and the YUV2GRAY_* extractChannel rows out.
     //
-    // Numerical criteria and scope are shared with validation/numerics.hpp;
-    // changes to the selected CPU build still require validation.
-    //
     // src and dst must agree: the CPU creates dst at src's depth (`CV_MAKE_TYPE(depth, dcn)`)
     // and has no mixed-depth path.
-    const bool u8 = s.type == kf_resize_rt::ElemType::U8;
-    const bool u16 = s.type == kf_resize_rt::ElemType::U16;
+    const bool u8 = s.type == cv_triton_runtime::ElemType::U8;
+    const bool u16 = s.type == cv_triton_runtime::ElemType::U16;
     const bool bayer = spec->op == Op::Bayer;
     const bool serves16U = bayer || spec->op == Op::Gray || spec->op == Op::Yuv ||
                            spec->op == Op::YCrCb ||
                            (spec->op == Op::Permute && spec->scn == 1);
-    const bool f32 = s.type == kf_resize_rt::ElemType::F32;
-    // Float channel copies preserve bits. Arithmetic (gray/YUV/YCrCb) uses the
-    // documented per-pixel input-scale bound, since CPU expressions depend on
-    // vector/tail/FMA dispatch. See validation/numerics.hpp and the public API.
-
+    const bool f32 = s.type == cv_triton_runtime::ElemType::F32;
+    // CV_32F copies preserve source bits. Arithmetic conversions allow
+    // |got-ref| <= 8*2^-24*max(1,|ref|,max|input channels at this pixel|), accounting
+    // for differences in CPU fused arithmetic and vector/scalar evaluation order.
+    // YUV2GRAY_* are Op::Permute, but the CPU cvtColor wrapper admits CV_8U
+    // only before calling extractChannel. Do not invent a 32F cvtColor extension.
     const bool f32_exact_copy = f32 && ((spec->op == Op::Permute && spec->scn != 2) ||
                                         (spec->op == Op::Gray && spec->inverse));
     const bool f32_arithmetic = f32 && (spec->op == Op::Gray ||
@@ -343,15 +441,17 @@ Status resolve_output(const kf_resize_rt::DeviceView& s, int code, Output& out) 
                                "width and a height divisible by 3 (got " +
                                std::to_string(s.cols) + "x" + std::to_string(s.rows) + ")");
     }
-    const Status source = kf_resize_rt::validate_view(s, "src");
+    const Status source = cv_triton_runtime::validate_view(s, "src");
     if (!source.ok()) return source;
     const int rows = spec->op == Op::Yuv420 ? (s.rows / 3) * 2 : s.rows;
+    const Status output = cv_triton_runtime::validate_output_shape(rows, s.cols, spec->dcn);
+    if (!output.ok()) return output;
     if (static_cast<long long>(rows) * s.cols > 0x7fffffffLL)
         return unsupported(Reason::IndexRange, "pixel count exceeds int32 indexing");
     // Admission precedes output allocation in every adapter. uv_rs is i32,
     // while the pointer arithmetic itself is 64-bit.
     if (spec->op == Op::Yuv420 && static_cast<unsigned long long>(rows) *
-        (s.step / kf_resize_rt::elem_size(s.type)) > 0x7fffffffULL)
+        (s.step / cv_triton_runtime::elem_size(s.type)) > 0x7fffffffULL)
         return unsupported(Reason::IndexRange, "4:2:0 chroma-plane offset exceeds int32 indexing");
     out.spec = spec;
     out.cols = s.cols;
@@ -360,7 +460,7 @@ Status resolve_output(const kf_resize_rt::DeviceView& s, int code, Output& out) 
 }
 
 Status normalize(const Request& req, Normalized& out) {
-    const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
+    const cv_triton_runtime::DeviceView &s = req.src, &d = req.dst;
     Output expected;
     const Status resolved = resolve_output(s, req.code, expected);
     if (!resolved.ok()) return resolved;
@@ -376,9 +476,9 @@ Status normalize(const Request& req, Normalized& out) {
                            std::to_string(expected.cols) + "x" + std::to_string(expected.rows) +
                            ", dst is " + std::to_string(d.cols) + "x" + std::to_string(d.rows));
     if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
-    const Status destination = kf_resize_rt::validate_view(d, "dst");
+    const Status destination = cv_triton_runtime::validate_view(d, "dst");
     if (!destination.ok()) return destination;
-    if (s.ptr < d.end() && d.ptr < s.end())
+    if (cv_triton_runtime::views_overlap(s, d))
         return unsupported(Reason::InPlaceOrOverlap, "src and dst overlap (in-place is not supported)");
     // The pixel count and the launch geometry are the DESTINATION's: grid() emits one program per
     // `n.rows` row, so leaving rows at the source height launches 1.5x the programs for a 4:2:0
@@ -390,8 +490,8 @@ Status normalize(const Request& req, Normalized& out) {
     out.rows = d.rows;
     out.cols = d.cols;
     out.n = n;
-    out.u16 = s.type == kf_resize_rt::ElemType::U16;
-    out.f32 = s.type == kf_resize_rt::ElemType::F32;
+    out.u16 = s.type == cv_triton_runtime::ElemType::U16;
+    out.f32 = s.type == cv_triton_runtime::ElemType::F32;
     return prepared();
 }
 
@@ -421,7 +521,7 @@ HsvTables hsv_tables_full() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// XYZ / Lab / Luv constants, replicated from OpenCV modules/imgproc/src/color_lab.cpp.
+// XYZ / Lab / Luv constants, replicated from modules/imgproc/src/color_lab.cpp.
 // Every value below is quoted from that file rather than re-derived, because the CPU's numbers
 // are the specification here, not the textbook ones.
 namespace {
@@ -498,7 +598,6 @@ void whiteChroma(softfloat& un, softfloat& vn) {
 }  // namespace
 
 void coeffs_for(int code, int out[9]) {
-    std::fill(out, out + 9, 0);
     // The CPU builds these in the FUNCTOR CONSTRUCTORS from softdouble at run time -- they are
     // not literals in the source (except XYZ's), so replicating the constructor is the only way
     // to get them.
@@ -509,7 +608,7 @@ void coeffs_for(int code, int out[9]) {
     // i.e. ROW r IS DESTINATION SLOT r, in slot order 0,1,2 = whatever the CPU writes there
     // (B,G,R for a BGR destination). Getting this wrong is not subtle numerically but IS subtle
     // to read: a transposed or row-permuted colour matrix still looks like a colour matrix.
-    // Preserve the constructors' destination-slot coefficient order.
+    std::fill(out, out + 9, 0);
     const bool forward = (code == 44 || code == 45 || code == 74 || code == 75 ||   // BGR/RGB -> Lab
                           code == 50 || code == 51);                                // BGR/RGB -> Luv
     const bool xyz = (code == 32 || code == 33);
@@ -539,8 +638,6 @@ void coeffs_for(int code, int out[9]) {
         // XYZ2RGB_i<uchar> (color_lab.cpp:671-700) applies swapBlueCoeffsRows when blueIdx == 0 --
         // ROWS, not columns, and blueIdx 0 is the BGR-output code. The CPU writes dst[0] from
         // flat row 0, so a row swap moves which destination channel each matrix row feeds.
-        //
-        // XYZ2BGR reverses destination rows; XYZ2RGB retains their original order.
         for (int r = 0; r < 3; ++r) {
             const int srcRow = (blueIdx == 0) ? 2 - r : r;
             for (int c = 0; c < 3; ++c) out[3 * r + c] = kXYZ2sRGB_i[3 * srcRow + c];
@@ -569,9 +666,7 @@ void coeffs_for(int code, int out[9]) {
     // Lab2RGBinteger / Luv2RGBinteger (color_lab.cpp:2391-2411, :3534-3552).
     //
     // THE INDEX ORDER IS TRANSPOSED HERE: `c[j] = XYZ2sRGB_D65[i + j*3]`, against the forward
-    // direction's `c[j] = M[i*3 + j]`. Preserve that transpose:
-    // writing the reverse the same way as the forward produces a matrix that is exactly
-    // transposed, which still reads as a plausible RGB matrix.
+    // direction's `c[j] = M[i*3 + j]`. The reverse transform requires this transpose.
     //
     // c[j] is the j-th element of a COLUMN of the output matrix (it multiplies x, y, z in order
     // after the transpose), so it is written DOWN slot j. The CPU places c[j] at flat index
@@ -579,8 +674,6 @@ void coeffs_for(int code, int out[9]) {
     // column order is (0,1,2) and for blueIdx 2 it is reversed to (2,1,0). Since the CPU writes
     // dst[r] from flat row r, blueIdx 2 exchanges which destination channel the outer columns
     // feed, which is the `row` reversal below.
-    //
-    // Preserve that destination-slot layout for Lab2BGR.
     for (int i = 0; i < 3; ++i) {
         softdouble c[3];
         for (int j = 0; j < 3; ++j) c[j] = kXYZ2sRGB_D65[i + j * 3];
@@ -648,8 +741,8 @@ LabLuvTables buildLabLuvTables() {
     softfloat un, vn;
     whiteChroma(un, vn);
 
-    // initLUTforLUV (color_lab.cpp:1017-1058). LvToVpl_b is `long long` in the CPU because the
-    // value reaches 6.2e13 for the supported (L,v) domain.
+    // initLUTforLUV (color_lab.cpp:1017-1058). LvToVpl_b uses `long long`
+    // because intermediate values exceed the signed 32-bit range.
     t.lu.resize(256 * 256);
     t.lv.resize(256 * 256);
     t.lvpl.resize(256 * 256);
@@ -783,8 +876,7 @@ std::string signature(const Normalized& n) {
     // byte step by 2. Getting this wrong is silent for 8U and a wrong row every time for 16U,
     // so the kernel states it as `ES` and divides by the same constant.
     // The pointer type must follow the element type, not just the "is it 16-bit" question: a 32F
-    // buffer read through a *u8 pointer decodes every float as bytes and produces garbage
-    // This preserves the documented finite-input numerical bound.
+    // buffer read through a *u8 pointer would interpret float storage as byte samples.
     const char* t = n.u16 ? "u16" : (n.f32 ? "fp32" : "u8");
     // uv_rs is the chroma plane base in ELEMENTS from `src`, i.e. H * src_rs (the Y plane's
     // height times the row pitch). It is a runtime argument like the strides, and it is only read
@@ -803,6 +895,7 @@ std::string constexprs_text(const Normalized& n) {
       << ",HR=" << s.hrange << ",INV=" << (s.inverse ? 1 : 0) << ",OP=" << static_cast<int>(s.op)
       << ",SCN=" << s.scn
       << ",SWG=" << s.swg << ",U16=" << (n.u16 ? 1 : 0) << ",F32=" << (n.f32 ? 1 : 0)
+      << ",F32_CPU_SEPARATE4=" << (n.f32_cpu_separate4 ? 1 : 0)
       << ",ORD=" << s.ord;
     // The nine coefficients are constexprs for the same reason the channel counts are: they
     // come from the CODE, so C++ computes them exactly and they belong in the key. The kernel
@@ -838,4 +931,4 @@ void grid(const Normalized& n, int block, unsigned out[3]) {
     out[2] = 1;
 }
 
-}  // namespace kf_cvtcolor
+}  // namespace cv_triton_color

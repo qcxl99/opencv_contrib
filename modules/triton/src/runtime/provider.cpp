@@ -15,9 +15,9 @@
 
 #include "dispatch_table.hpp"
 
-namespace kf_resize_rt {
+namespace cv_triton_runtime {
 
-namespace ref = kf_resize_ref;
+namespace ref = cv_triton_resize;
 
 const char* reason_name(Reason r) {
     switch (r) {
@@ -93,11 +93,9 @@ const char* tname(ElemType t)
          : (t == ElemType::U16 ? "u16" : (t == ElemType::S16 ? "i16" : "fp32"));
 }
 
-// The runtime-argument lists of the four JIT functions in kernels/resize_cpu.py,
-// in Triton's type strings. Constexpr parameters are not runtime arguments. Every
-// integer is i32 (normalize() keeps them in range), so Triton's value-dependent
-// i32/i64 typing never applies. tests/test_provider_protocol.py checks these strings
-// against the signatures the JIT actually compiles.
+// Runtime arguments of the resize JIT functions in kernels/resize_cpu.py, in
+// Triton type strings. Constexpr parameters are excluded. Integer arguments are
+// i32; normalize() validates their ranges before compilation or launch.
 std::string signature(ref::Route r, ElemType t) {
     const std::string T = tname(t);
     const std::string io = "src:*" + T + ", dst:*" + T + ", ";
@@ -125,6 +123,41 @@ std::string signature(ref::Route r, ElemType t) {
 
 Status validate_view(const DeviceView& view, const char* name) { return check_view(view, name); }
 
+Status validate_output_shape(int rows, int cols, int channels)
+{
+    if (rows <= 0 || cols <= 0 || channels <= 0)
+        return unsupported(Reason::EmptyOrSize, "destination dimensions and channels must be positive");
+    const long long width = static_cast<long long>(cols) * channels;
+    if (width > I32_MAX || rows > I32_MAX / width)
+        return unsupported(Reason::IndexRange, "packed destination span exceeds int32 element indexing");
+    return prepared();
+}
+
+bool views_overlap(const DeviceView& first, const DeviceView& second)
+{
+    if (first.ptr >= second.end() || second.ptr >= first.end())
+        return false;
+    const std::size_t firstWidth = first.row_bytes(), secondWidth = second.row_bytes();
+    int firstRow = 0, secondRow = 0;
+    std::uintptr_t firstBegin = first.ptr, secondBegin = second.ptr;
+    while (firstRow < first.rows && secondRow < second.rows)
+    {
+        if (firstBegin < secondBegin + secondWidth && secondBegin < firstBegin + firstWidth)
+            return true;
+        if (firstBegin + firstWidth <= secondBegin)
+        {
+            ++firstRow;
+            if (firstRow < first.rows) firstBegin += first.step;
+        }
+        else
+        {
+            ++secondRow;
+            if (secondRow < second.rows) secondBegin += second.step;
+        }
+    }
+    return false;
+}
+
 Status resolve_output(const ResizeRequest& req, ref::Size2& out) {
     const DeviceView& s = req.src;
     if (s.type != ElemType::U8 && s.type != ElemType::F32)
@@ -135,7 +168,7 @@ Status resolve_output(const ResizeRequest& req, ref::Size2& out) {
         return unsupported(Reason::DepthOrChannels, "channels must be 1, 3 or 4");
     if (s.rows <= 0 || s.cols <= 0)
         return unsupported(Reason::EmptyOrSize, "src is empty");
-    // Validate scale-derived dimensions before the oracle's double-to-int conversion.
+    // Validate scale-derived dimensions before the size resolver's double-to-int conversion.
     // Explicit dsize keeps cv::resize precedence, even if ignored fx/fy are nonfinite.
     if (!(req.dsize_w > 0 && req.dsize_h > 0))
     {
@@ -151,7 +184,7 @@ Status resolve_output(const ResizeRequest& req, ref::Size2& out) {
         return unsupported(Reason::EmptyOrSize, e.what());
     }
     if (out.dst_h <= 0 || out.dst_w <= 0) return unsupported(Reason::EmptyOrSize, "resolved size is empty");
-    return prepared();
+    return validate_output_shape(out.dst_h, out.dst_w, s.channels);
 }
 
 Status normalize(const ResizeRequest& req, Normalized& out) {
@@ -169,7 +202,7 @@ Status normalize(const ResizeRequest& req, Normalized& out) {
 
     if (d.rows != z.dst_h || d.cols != z.dst_w)
         return unsupported(Reason::EmptyOrSize, "dst size differs from the resolved size");
-    if (s.ptr < d.end() && d.ptr < s.end())
+    if (views_overlap(s, d))
         return unsupported(Reason::InPlaceOrOverlap, "src and dst overlap (in-place is not supported)");
 
     out.src_h = s.rows; out.src_w = s.cols; out.dst_h = z.dst_h; out.dst_w = z.dst_w;
@@ -201,9 +234,8 @@ LaunchConfig default_config(const Normalized& n, const Target* target) {
     // The class comes from the route the request actually takes (n.route, already resolved
     // from the caller's fx/fy by normalize()). Re-deriving it from the rounded sizes would
     // pick a different table row for fx/fy requests: fx = 1/3 runs area_fast while its
-    // rounded sizes look like area, and the two rows differ. This mirrors _cpu_default,
-    // which takes the caller's inverses for the same reason; tests/test_provider_protocol.py
-    // compares the two keys byte for byte.
+    // rounded sizes look like area, and the two rows differ. Preserve the caller's
+    // inverse scales when fx/fy determined the output size.
     const ref::RouteInfo look = n.route;
     const char* want = ref::route_name(look.kind);
     const char* ydir = n.dst_h > n.src_h ? "up" : "down";
@@ -228,7 +260,7 @@ LaunchConfig default_config(const Normalized& n, const Target* target) {
         cfg.block_w = DISPATCH_FALLBACK_BLOCK_W;
         cfg.num_warps = DISPATCH_FALLBACK_NUM_WARPS;
     }
-    // HIP defaults mirror the measured Python JIT extension. CUDA keeps the table above.
+    // HIP uses backend-specific defaults. CUDA keeps the table above.
     if (target && target->backend == "hip" && static_cast<long long>(n.dst_h) * n.dst_w >= 65536) {
         const bool f32 = n.type == ElemType::F32;
         const double sy = 1.0 / n.inv_y, sx = 1.0 / n.inv_x;
@@ -338,7 +370,7 @@ LaunchShape launch_shape(const Normalized& n, const LaunchConfig& requested, con
     }
     std::sort(c.begin(), c.end());
     // Grid axis 1 counts the tile's second dimension, which the kernels agree on with
-    // _cpu_launch_spec: the pixel-major area kernels tile BLOCK_W output PIXELS, the
+    // The pixel-major area kernels tile BLOCK_W output PIXELS, the
     // element-major (row-sliding) nearest and separable ones tile BLOCK_W channel values.
     const long long W = static_cast<long long>(n.dst_w) * n.channels;
     const long long axis1 = (r == ref::ROUTE_AREA || r == ref::ROUTE_AREA_FAST) ? n.dst_w : W;
@@ -348,60 +380,4 @@ LaunchShape launch_shape(const Normalized& n, const LaunchConfig& requested, con
     return ls;
 }
 
-}  // namespace kf_resize_rt
-
-// ---------------------------------------------------------------- C ABI (tests)
-
-namespace {
-kf_resize_rt::DeviceView view(std::uintptr_t ptr, int rows, int cols, int cn, int is_f32, std::size_t step,
-                              std::uintptr_t ctx) {
-    kf_resize_rt::DeviceView v;
-    v.ctx.native = ctx; v.ctx.device = 0;
-    v.ptr = ptr; v.rows = rows; v.cols = cols; v.channels = cn;
-    v.type = is_f32 ? kf_resize_rt::ElemType::F32 : kf_resize_rt::ElemType::U8;
-    v.step = step;
-    return v;
-}
-}  // namespace
-
-// normalize() over raw fields. Returns the Code; *reason gets the Reason; *route the route.
-extern "C" int kf_rt_normalize(std::uintptr_t src_ptr, int src_rows, int src_cols, std::size_t src_step, std::uintptr_t src_ctx,
-                               std::uintptr_t dst_ptr, int dst_rows, int dst_cols, std::size_t dst_step, std::uintptr_t dst_ctx,
-                               int src_cn, int dst_cn, int src_f32, int dst_f32, int dsize_w, int dsize_h, double fx, double fy,
-                               int interp, int* reason, int* route) {
-    kf_resize_rt::ResizeRequest q;
-    q.src = view(src_ptr, src_rows, src_cols, src_cn, src_f32, src_step, src_ctx);
-    q.dst = view(dst_ptr, dst_rows, dst_cols, dst_cn, dst_f32, dst_step, dst_ctx);
-    q.dsize_w = dsize_w; q.dsize_h = dsize_h; q.fx = fx; q.fy = fy; q.interpolation = interp;
-    kf_resize_rt::Normalized n;
-    kf_resize_rt::Status s = kf_resize_rt::normalize(q, n);
-    if (reason) *reason = static_cast<int>(s.reason);
-    if (route) *route = s.ok() ? static_cast<int>(n.route.kind) : -1;
-    return static_cast<int>(s.code);
-}
-
-// The key text a request maps to (default config/target/toolchain, empty source hash),
-// written into `out`; returns its length, 0 for the copy route, -1 if unsupported.
-extern "C" int kf_rt_key_text(int src_h, int src_w, int dst_w, int dst_h, double fx, double fy, int cn, int is_f32,
-                              int interp, char* out, int out_len, unsigned* grid) {
-    const std::size_t es = is_f32 ? 4 : 1;
-    const kf_resize_ref::Size2 z = [&] {
-        try { return kf_resize_ref::resolve_size(src_h, src_w, dst_w, dst_h, fx, fy); }
-        catch (...) { return kf_resize_ref::Size2{0, 0, 0, 0}; }
-    }();
-    if (z.dst_h <= 0 || z.dst_w <= 0) return -1;
-    kf_resize_rt::ResizeRequest q;
-    const std::size_t sstep = static_cast<std::size_t>(src_w) * cn * es, dstep = static_cast<std::size_t>(z.dst_w) * cn * es;
-    q.src = view(0x10000, src_h, src_w, cn, is_f32, sstep, 1);
-    q.dst = view(0x10000 + static_cast<std::size_t>(src_h) * sstep + 4096, z.dst_h, z.dst_w, cn, is_f32, dstep, 1);
-    q.dsize_w = dst_w; q.dsize_h = dst_h; q.fx = fx; q.fy = fy; q.interpolation = interp;
-    kf_resize_rt::Normalized n;
-    if (!kf_resize_rt::normalize(q, n).ok()) return -1;
-    kf_resize_rt::LaunchShape ls = kf_resize_rt::launch_shape(n, {}, {}, {});
-    if (grid) { grid[0] = ls.grid[0]; grid[1] = ls.grid[1]; grid[2] = ls.grid[2]; }
-    if (ls.is_copy) return 0;
-    const std::string t = ls.key.text();
-    if (static_cast<int>(t.size()) + 1 > out_len) return -1;
-    std::memcpy(out, t.c_str(), t.size() + 1);
-    return static_cast<int>(t.size());
-}
+}  // namespace cv_triton_runtime

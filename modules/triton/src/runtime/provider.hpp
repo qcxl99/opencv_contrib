@@ -2,13 +2,9 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Private request and planning types shared by the module's operators.
-// Not a public API or a cross-version plugin ABI. Adapters translate OpenCV/native types
-// into device views; the plan resolves supported requests, tables, compile keys and grids.
-// CUDA/HIP runtimes own actual memory, events, compilation, loading and submission.
-// DeviceService/ResizeProvider below are private interface declarations, not the runtime's
-// active dispatch mechanism. See doc/maintenance.markdown for source provenance.
-// No OpenCV, CUDA, HIP or Torch type appears here.
+// Module-private request, launch and resource interfaces. These declarations are not
+// installed and do not define a cross-version plugin ABI. Adapters translate public
+// image and stream types into these backend-neutral structures.
 #pragma once
 
 #include <cstddef>
@@ -17,21 +13,17 @@
 #include <string>
 #include <vector>
 
-#include "reference_cpu.hpp"
+#include "resize_plan.hpp"
 
-namespace kf_resize_rt {
+namespace cv_triton_runtime {
 
 // ------------------------------------------------------------------ identities
 
 enum class Backend : int { CUDA = 1, HIP = 2 };
-// U16 exists because warpAffine serves CV_16U. It is a property
-// of this shared runtime, not of resize, which still accepts CV_8U and CV_32F only and says
-// so at its own entry.
-// S16 exists as an identity because CV_16S is a legal cv::warpAffine input and the type system
-// has to be able to name it, but NO operator admits it yet: cv::warpAffine sends every CV_16S
-// type down its legacy fixed-point path (imgwarp.cpp:2272, "// no default"), which is a
-// different algorithm from the float kernels these operators reproduce. See warpaffine.cpp
-// normalize() for the measurement.
+// Element identities are shared across operators. Each operator validates its own
+// supported depths: resize accepts U8/F32; warpAffine also accepts U16. S16 is
+// representable here but is not admitted by these operators. OpenCV's CV_16S
+// warpAffine uses a fixed-point path distinct from the implemented float sampling path.
 enum class ElemType : int { U8 = 0, F32 = 1, U16 = 2, S16 = 3 };
 inline std::size_t elem_size(ElemType t)
 {
@@ -39,8 +31,8 @@ inline std::size_t elem_size(ElemType t)
 }
 
 // Which device context a buffer, stream or module belongs to. `native` is the raw
-// CUcontext / hipCtx_t value; `generation` is obtained from the native context-lifetime
-// identity, so a reused raw context handle cannot reuse another lifetime's resources. No cache keys a
+// CUcontext / hipCtx_t value; `generation` is assigned by the DeviceService and changes
+// whenever it sees that context destroyed and a handle value reused, so no cache keys a
 // resource on a bare handle alone.
 struct ContextId {
     Backend backend = Backend::CUDA;
@@ -87,7 +79,7 @@ enum class Reason : int {
     // Unsupported
     DepthOrChannels, Interpolation, EmptyOrSize, TypeMismatch, StepLayout, IndexRange,
     InPlaceOrOverlap, ContextMismatch,
-    RouteNotEnabled,   // a valid request on a route this build does not serve yet
+    RouteNotEnabled,   // a valid request on a route this build does not serve
     // Error
     ToolchainUnavailable, CompileFailed, CompileTimeout, ManifestInvalid, LoadFailed,
     DeviceAlloc, LaunchFailed,
@@ -110,7 +102,7 @@ struct ResizeRequest {
     DeviceView src, dst;
     int dsize_w = 0, dsize_h = 0;       // > 0: dsize wins; else fx/fy
     double fx = 0, fy = 0;
-    int interpolation = kf_resize_ref::INTER_LINEAR;
+    int interpolation = cv_triton_resize::INTER_LINEAR;
 };
 
 // The request after cv::resize parameter resolution. inv_x / inv_y are the CALLER'S
@@ -120,38 +112,43 @@ struct Normalized {
     ElemType type = ElemType::U8;
     int interpolation = 0;
     double inv_y = 0, inv_x = 0;
-    kf_resize_ref::RouteInfo route;
+    cv_triton_resize::RouteInfo route;
 };
 
 // Pure checks, no device access. Unsupported carries the reason; the explicit API maps
-// it to StsUnsupportedFormat / StsBadArg, a future dispatcher may try another provider.
+// it to StsUnsupportedFormat / StsBadArg.
 //  * depth U8/F32, channels 1/3/4, interpolation NEAREST/LINEAR/CUBIC/AREA;
 //  * src/dst same type and channel count, same context; dst size == resolved size;
 //  * step a multiple of the element size and >= the row bytes;
 //  * every scalar the kernels take fits int32 (rows, W = cols*cn, row strides in
 //    elements, tap counts): beyond that the request is Unsupported, never truncated;
-//  * no in-place and no overlap of the byte ranges [ptr, end()) (conservative).
+//  * no in-place and no overlap of the active row bytes of either view.
 // Source admission and output resolution before an adapter allocates dst. No device access.
-Status resolve_output(const ResizeRequest& req, kf_resize_ref::Size2& out);
+Status resolve_output(const ResizeRequest& req, cv_triton_resize::Size2& out);
 Status normalize(const ResizeRequest& req, Normalized& out);
 
 // Shared layout/range validator; geometry and supported depth stay operator-owned.
 Status validate_view(const DeviceView& view, const char* name);
 
+// Reject an output whose packed layout already exceeds kernel indexing, before
+// allocation. The actual pitch must still be checked by validate_view afterwards.
+Status validate_output_shape(int rows, int cols, int channels);
+
+// Both views must have passed validate_view. Padding between rows is not accessed.
+bool views_overlap(const DeviceView& first, const DeviceView& second);
+
 // ------------------------------------------------------------ compile key
 
 // What identifies a compiled binary, and nothing else. Triton is given no implicit
-// specialisation (kernel.py: `cn: tl.constexpr`, every other runtime argument
+// specialisation (kernels/resize_cpu.py: `cn: tl.constexpr`, every other runtime argument
 // do_not_specialize), so this key is complete: two calls with equal keys run the same
 // binary, whatever their sizes, strides or pointer alignment.
 // `ry` is the RY constexpr of _resize_cpu_area_fast_kernel (window rows split over RY
 // lanes) and is unused by every other kernel; 1 is the classic form and any value is
 // bit-identical, so it only changes which binary is compiled.
 //
-// A FIELD LEFT AT 0 IS "NOT SUPPLIED": launch_shape() then takes that value from the
-// dispatch table below, which mirrors _cpu_default / _CPU_TABLE in the exported resize kernel source.
-// That is what the JIT path does, so a default-constructed LaunchConfig means "the JIT's
-// own defaults for this request", not "BLOCK_H=1, BLOCK_W=256, 4 warps".
+// Zero-valued fields are unspecified: launch_shape() fills them from the runtime
+// dispatch table. A default-constructed LaunchConfig selects the backend defaults.
 struct LaunchConfig { int block_h = 0, block_w = 0, num_warps = 0, num_stages = 3, ry = 0; };
 struct Target { std::string backend = "cuda"; int arch = 90; int warp_size = 32; };
 struct Toolchain {
@@ -180,17 +177,16 @@ struct LaunchShape {
     unsigned grid[3] = {1, 1, 1};
 };
 
-// The launch shape _cpu_default(src_h, src_w, dst_h, dst_w, channels, mode, is_f32) picks
-// for this request, as a LaunchConfig. num_stages is Triton's default (3) and `ry` applies
-// only to ROUTE_AREA_FAST. tests/test_provider_protocol.py checks it against the JIT.
+// Default launch configuration for the normalized request and selected target.
+// num_stages is Triton's default (3); `ry` applies only to ROUTE_AREA_FAST.
 LaunchConfig default_config(const Normalized& n, const Target* target = nullptr);
 LaunchShape launch_shape(const Normalized& n, const LaunchConfig& cfg, const Target& t, const Toolchain& tc,
                          int batch = 1, const DeviceView* src = nullptr, const DeviceView* dst = nullptr);
 
 // ------------------------------------------------------- device service
 
-// Private service interface declarations. Current CUDA/HIP runtimes perform these operations
-// directly; these declarations do not prescribe a future OpenCV backend interface.
+// Private interface for device-specific memory, event, module and launch services.
+// Backend implementations remain internal to the module.
 struct DeviceBuffer { ContextId ctx; std::uintptr_t ptr = 0; std::size_t bytes = 0; };
 struct Event { std::uintptr_t handle = 0; };
 struct Module { ContextId ctx; std::uintptr_t handle = 0; std::uintptr_t function = 0; int shared_bytes = 0; };
@@ -250,4 +246,4 @@ public:
     virtual Status enqueue(Prepared& p, const ExecContext& ex) = 0;
 };
 
-}  // namespace kf_resize_rt
+}  // namespace cv_triton_runtime
