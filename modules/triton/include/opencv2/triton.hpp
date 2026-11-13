@@ -36,7 +36,8 @@
  *     at integer or fractional ratios, including AREA's upscaled-axis route.
  *   - Linux, CUDA.
  *
- * @see @ref tutorial_triton_resize "Triton resize usage guide" for build instructions and examples.
+ * @see @ref tutorial_triton_h20_first_use "H20 build, install and first-use walkthrough".
+ * @see @ref tutorial_triton_resize "Triton resize usage guide" for resize details.
  */
 
 namespace cv { namespace triton {

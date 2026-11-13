@@ -1,7 +1,6 @@
 H20 first use: build, install and test {#tutorial_triton_h20_first_use}
 ===================================
 
-@ingroup triton
 @tableofcontents
 
 This walkthrough follows the ordinary OpenCV workflow: choose matching OpenCV and
@@ -17,7 +16,8 @@ Use their instructions for the selected source revision. This page adds this
 module's toolchain, public-entry and cache checks; it does not replace OpenCV's
 build system or introduce a different installation package.
 
-Read the module [README](../README.md) for supported inputs and limitations.
+Read the module README for supported inputs and limitations; see
+@ref triton "the API reference" for signatures.
 CUDA examples use `GpuMat` and caller-supplied streams. They do not intercept
 standard `cv::resize` calls, and they do not test the separate HIP device-buffer
 interface. A successful first-use run establishes usability of the tested
@@ -38,6 +38,12 @@ containing this module. A branch name or a source-text match is not an identity
 check. Resolve unfinished merge/rebase work before recording a stable acceptance
 snapshot. Keep the build, install, virtual environment and writable cache outside
 the source trees, including any pinned CPU reference build.
+
+The source-status commands below assume Git checkouts, as normally used for a
+contribution. If using source archives, follow OpenCV's archive workflow and
+record the release/download origin, archive SHA-256 and any unpacked-tree changes
+instead of the Git-only commands; the build/install/use steps are the same.
+An archive hash alone does not identify subsequent local edits.
 
 Use one Bash session for the following sections. All commands are manual; opening
 a new terminal does not rerun them. Select an idle H20 first. A second visible H20
@@ -301,7 +307,7 @@ for name in ('accuracy', 'perf'):
     failures = int(tree.attrib.get('failures', 0)) + int(tree.attrib.get('errors', 0))
     skipped = sum(1 for c in tree.iter('testcase') if c.find('skipped') is not None
                   or c.attrib.get('status') == 'notrun')
-    assert tests > 0 and failures == 0, (name, tree.attrib)
+    assert tests > skipped and failures == 0, (name, tree.attrib, skipped)
     if name == 'perf':
         assert tests == 3 and skipped == 0, (name, tree.attrib, skipped)
     print(name, 'reported=', tests, 'failures=', failures, 'skipped/notrun=', skipped)
