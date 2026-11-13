@@ -11,11 +11,6 @@
 // its arguments, unwraps them into an ImageView/ExecutionContext pair and calls
 // resizeCore() here.
 //
-// An earlier revision shipped this header under include/opencv2/triton/ with
-// CV_EXPORTS on every type, which made a raw device-pointer API part of the
-// installed surface while the same file said callers should not use it. Nothing
-// in the module or its tests needs it from outside, so it is now private.
-
 #ifndef OPENCV_TRITON_CORE_INTERNAL_HPP
 #define OPENCV_TRITON_CORE_INTERNAL_HPP
 

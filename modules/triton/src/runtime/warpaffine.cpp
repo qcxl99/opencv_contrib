@@ -250,8 +250,7 @@ Status normalize(const Request& req, Normalized& out)
     }
 
     // One tile of output pixels per program, the same knob shape resize and cvtColor expose.
-    // BLOCK_W 128 with BLOCK_H 1 measured best on the qualification set
-    // (runs/warpaffine-0001); the search can still override it through LaunchConfig.
+    // Defaults are BLOCK_W 128 and BLOCK_H 1; LaunchConfig may override them.
     out.block_h = 1;
     out.block_w = 128;
     out.num_warps = 4;

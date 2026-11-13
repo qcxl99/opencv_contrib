@@ -1,6 +1,10 @@
-// C++ port of operators/resize/reference_cpu.py. Every function names the Python function
-// it mirrors; read that file for the resize.cpp line references. Compile with
-// -ffp-contract=off: every float32 multiply and add below must round on its own.
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
+// Portable implementation of the selected resize reference and its planning tables.
+// See reference_cpu.hpp and doc/maintenance.markdown for semantics and provenance.
+// Compile with -ffp-contract=off: each float32 multiply/add rounds independently.
 #include "reference_cpu.hpp"
 
 #include <algorithm>

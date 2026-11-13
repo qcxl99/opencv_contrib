@@ -5,7 +5,7 @@
 // Pure part of the warpAffine provider: validation and the explicit compile key. No device
 // access, so it is testable without a GPU.
 //
-// Semantics are CPU cv::warpAffine (kernelforge-lab contract warpaffine/0.4.3), NOT
+// Semantics are CPU cv::warpAffine as described in the public API, NOT
 // cv::cuda::warpAffine. The two differ: this OpenCV's CPU warpAffine evaluates float
 // coordinates with float weights (warp_kernels.simd.hpp), while the GPU kernel still runs the
 // older fixed-point remap pipeline. cv::cuda::warpAffine is a timing baseline only.
@@ -13,13 +13,12 @@
 // Supported: INTER_NEAREST, INTER_LINEAR and INTER_CUBIC; INTER_AREA aliases LINEAR;
 // CV_8U/CV_16U/CV_32F, 1/3/4 channels; five standard borders plus TRANSPARENT for
 // NEAREST/LINEAR/AREA; WARP_INVERSE_MAP both ways. CUBIC+TRANSPARENT is refused, as is
-// INTER_LANCZOS4, whose 8x8 table is a separate contract -- approximating it behind an
-// unmeasured tolerance is exactly the failure this project has paid for once already.
+// INTER_LANCZOS4, whose 8x8 table is outside the supported algorithm subset.
 //
 // CUBIC is a different CPU code path (genericWarp -> bicubicVec), not another member of the
 // invoker family, and it is the one place the "selected vector path" rule does not apply:
 // that path computes each column from the absolute x with no fma, so it has no width
-// dependence (measured 0 of 320 width pairs). Its reference is the NATURAL-WIDTH call.
+// body/tail boundary of that invoker. Its reference is the NATURAL-WIDTH call.
 #pragma once
 
 #include <cstddef>

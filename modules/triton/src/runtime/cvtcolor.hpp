@@ -20,9 +20,7 @@
 //
 // Unsupported depths/codes (reverse HSV, HLS, forward linear Luv, Bayer VNG/EA,
 // YUV encoding) are refused; no nearby conversion or CPU fallback is selected.
-// Historic CPU formula characterization in runs/cvtcolor-ext-0001 informs the
-// numerical criterion, but cannot by itself certify a GPU module or a later
-// build. test/test_cvtcolor.cpp exercises this module's actual public GPU entry
+// test/test_cvtcolor.cpp exercises this module's actual public GPU entry
 // against that build's own cv::cvtColor; changed IPP/HAL/toolchains need their
 // own evidence. The module README owns the public scope and limitations.
 #pragma once
@@ -78,8 +76,7 @@ struct CodeSpec {
     int k[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     // Yuv422 only: which byte slot holds chroma U within the 4-byte macropixel -- 0 for UYVY,
     // 1 for YUY2, 2 for YVYU (color_yuv.simd.hpp:1722-1730). Appended at the END of the struct
-    // deliberately: inserting it in the middle renumbered every later field and silently moved
-    // the Lab/Luv `k[]` initialisers by one position (measured: k[0] read 217 instead of 12615).
+    // to preserve the positional initialisers of the coefficient rows.
     int ord = 0;
 };
 
@@ -137,7 +134,7 @@ HsvTables hsv_tables_full();
 // The three arrays are kept in the element type the kernel loads them as. `cbrt` is int32 and
 // NOT int16 even though the CPU stores ushort: its entries reach 37555, so a signed 16-bit load
 // would come back negative. `luv` is int64 for the same reason at the other end -- LvToVpl_b
-// reaches 6.2e13 (measured over all 65536 (L,v) pairs), which is why the CPU declares it
+// can reach 6.2e13 over the (L,v) domain, which is why the CPU declares it
 // `long long`.
 struct LabLuvTables {
     std::vector<int> gamma;       // 256:     sRGBGammaTab_b (or linearGammaTab_b, identical scale)

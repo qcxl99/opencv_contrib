@@ -1,15 +1,14 @@
-// Private resize provider protocol (BACKLOG B3). Destination: opencv_contrib
-// modules/triton/src/runtime/ (it replaces the one-call backend::launchResize of
-// src/backend/backend.hpp). Not a public API and not a cross-version plugin ABI.
-//
-// Layering (docs/opencv/jit-integration.md §4, adjusted in §15):
-//   entry adapter (GpuMat today, a HIP view, a future HAL/UMat adapter)
-//     -> ResizeProvider: support query, prepare, enqueue        (this header)
-//        -> plan: normalisation, route, tables, compile key     (reference_cpu.hpp + this header)
-//        -> JIT runtime: compile helper, caches, load           (B4)
-//        -> DeviceService: memory, streams, events, modules     (B5; CUDA now, HIP at P4)
-//
-// No OpenCV, CUDA, HIP or Torch type appears here. Adapters translate their types.
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
+// Private request and planning types shared by the module's operators.
+// Not a public API or a cross-version plugin ABI. Adapters translate OpenCV/native types
+// into device views; the plan resolves supported requests, tables, compile keys and grids.
+// CUDA/HIP runtimes own actual memory, events, compilation, loading and submission.
+// DeviceService/ResizeProvider below are private interface declarations, not the runtime's
+// active dispatch mechanism. See doc/maintenance.markdown for source provenance.
+// No OpenCV, CUDA, HIP or Torch type appears here.
 #pragma once
 
 #include <cstddef>
@@ -25,7 +24,7 @@ namespace kf_resize_rt {
 // ------------------------------------------------------------------ identities
 
 enum class Backend : int { CUDA = 1, HIP = 2 };
-// U16 exists because warpAffine serves CV_16U (contract warpaffine/0.4.1). It is a property
+// U16 exists because warpAffine serves CV_16U. It is a property
 // of this shared runtime, not of resize, which still accepts CV_8U and CV_32F only and says
 // so at its own entry.
 // S16 exists as an identity because CV_16S is a legal cv::warpAffine input and the type system
@@ -40,9 +39,9 @@ inline std::size_t elem_size(ElemType t)
 }
 
 // Which device context a buffer, stream or module belongs to. `native` is the raw
-// CUcontext / hipCtx_t value; `generation` is assigned by the DeviceService and changes
-// whenever it sees that context destroyed and a handle value reused, so no cache keys a
-// resource on a bare handle alone (report §5.2).
+// CUcontext / hipCtx_t value; `generation` is obtained from the native context-lifetime
+// identity, so a reused raw context handle cannot reuse another lifetime's resources. No cache keys a
+// resource on a bare handle alone.
 struct ContextId {
     Backend backend = Backend::CUDA;
     int device = -1;
@@ -88,7 +87,7 @@ enum class Reason : int {
     // Unsupported
     DepthOrChannels, Interpolation, EmptyOrSize, TypeMismatch, StepLayout, IndexRange,
     InPlaceOrOverlap, ContextMismatch,
-    RouteNotEnabled,   // a valid request on a route this build does not serve yet (P1: copy, nearest, linear, area_fast)
+    RouteNotEnabled,   // a valid request on a route this build does not serve yet
     // Error
     ToolchainUnavailable, CompileFailed, CompileTimeout, ManifestInvalid, LoadFailed,
     DeviceAlloc, LaunchFailed,
@@ -139,7 +138,7 @@ Status normalize(const ResizeRequest& req, Normalized& out);
 // Shared layout/range validator; geometry and supported depth stay operator-owned.
 Status validate_view(const DeviceView& view, const char* name);
 
-// ------------------------------------------------------------ compile key (B2)
+// ------------------------------------------------------------ compile key
 
 // What identifies a compiled binary, and nothing else. Triton is given no implicit
 // specialisation (kernel.py: `cn: tl.constexpr`, every other runtime argument
@@ -150,7 +149,7 @@ Status validate_view(const DeviceView& view, const char* name);
 // bit-identical, so it only changes which binary is compiled.
 //
 // A FIELD LEFT AT 0 IS "NOT SUPPLIED": launch_shape() then takes that value from the
-// dispatch table below, which mirrors _cpu_default / _CPU_TABLE in operators/resize/kernel.py.
+// dispatch table below, which mirrors _cpu_default / _CPU_TABLE in the exported resize kernel source.
 // That is what the JIT path does, so a default-constructed LaunchConfig means "the JIT's
 // own defaults for this request", not "BLOCK_H=1, BLOCK_W=256, 4 warps".
 struct LaunchConfig { int block_h = 0, block_w = 0, num_warps = 0, num_stages = 3, ry = 0; };
@@ -188,10 +187,10 @@ LaunchConfig default_config(const Normalized& n, const Target* target = nullptr)
 LaunchShape launch_shape(const Normalized& n, const LaunchConfig& cfg, const Target& t, const Toolchain& tc,
                          int batch = 1, const DeviceView* src = nullptr, const DeviceView* dst = nullptr);
 
-// ------------------------------------------------------- device service (B5)
+// ------------------------------------------------------- device service
 
-// Everything device-specific the provider needs, and nothing else. CUDA implements it
-// now; HIP at P4; a future main-library device backend can implement it too.
+// Private service interface declarations. Current CUDA/HIP runtimes perform these operations
+// directly; these declarations do not prescribe a future OpenCV backend interface.
 struct DeviceBuffer { ContextId ctx; std::uintptr_t ptr = 0; std::size_t bytes = 0; };
 struct Event { std::uintptr_t handle = 0; };
 struct Module { ContextId ctx; std::uintptr_t handle = 0; std::uintptr_t function = 0; int shared_bytes = 0; };
@@ -243,7 +242,7 @@ public:
     virtual ~ResizeProvider() = default;
     // Pure query: no allocation, no submission, no compilation.
     virtual Support query(const ResizeRequest& req, const ExecContext& ex) = 0;
-    // May compile (cold miss: the separate compile process, B4), load, allocate and
+    // May compile (cold miss: the separate compile process), load, allocate and
     // upload tables on ex.stream. Never touches dst. Returns Prepared, Unsupported or Error.
     virtual Status prepare(const ResizeRequest& req, const ExecContext& ex, Prepared& out) = 0;
     // Submits on ex.stream, does not synchronise, records the completion event on every

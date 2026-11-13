@@ -25,7 +25,7 @@ the host build's `cv::resize`.
 rounding). It is a performance baseline only (`perf/`), with different semantics.
 This module is **not a drop-in replacement for `cv::cuda::resize`**.
 
-Supported subset (this milestone)
+Supported subset
 ---------------------------------
 
 | dimension | supported |
@@ -40,7 +40,7 @@ Supported subset (this milestone)
 Unsupported depths, channels and interpolation modes raise
 `cv::Error::StsUnsupportedFormat`. All four declared interpolations execute the
 CPU-aligned kernels; there is no implicit fallback to CPU or to `cv::cuda`.
-Windows is not built in this milestone. HIP uses the device-buffer entries described below.
+Windows is not supported. HIP uses the device-buffer entries described below.
 
 Sizing and interpolation are validated before an adapter allocates the output.
 Scale-derived dimensions require finite positive `fx`/`fy` and must fit positive

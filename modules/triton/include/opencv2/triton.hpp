@@ -21,20 +21,26 @@
 /** @defgroup triton Triton-backed operations
  *
  * Kernels are written in Triton and compiled on first use by a separate, Torch-free helper
- * process into a verified on-disk cache; the call path is C++ and never enters Python.
+ * process into a verified on-disk cache; the launch path is C++. Only a cache miss starts
+ * the Python compile helper.
  *
- * Semantics: OpenCV CPU cv::resize as computed by a pinned reference configuration (OpenCV
+ * The module builds for Linux with CUDA or HIP. This header exposes CUDA GpuMat APIs
+ * (including their Python wrappers); HIP builds refuse those calls. C++ device-buffer
+ * entries for both backends are declared in opencv2/triton/device.hpp. See the module README
+ * for each operation's support and backend-specific verification scope.
+ *
+ * Resize semantics: OpenCV CPU cv::resize as computed by a pinned reference configuration (OpenCV
  * 5.0.0 generic resize.cpp path, 128-bit SIMD, no FMA, no IPP, no HAL): CV_8U bit-exact, CV_32F
  * within a bound derived from that configuration's float32 rounding. cv::cuda::resize computes
  * a different result; this is NOT a drop-in replacement for it.
  *
- * Supported subset of this milestone (anything else raises, nothing falls back):
+ * Resize subset (anything else raises, nothing falls back):
  *   - CV_8U or CV_32F, 1, 3 or 4 channels, ROI source/destination, row-contiguous pixels
  *   - explicit dsize, or fx/fy (> 0) when dsize is empty -- dsize wins if both are given, and
  *     given fx/fy are used unchanged as the inverse scales, as in cv::resize
  *   - routes: same size (a device copy), INTER_NEAREST, INTER_LINEAR, INTER_CUBIC, INTER_AREA
  *     at integer or fractional ratios, including AREA's upscaled-axis route.
- *   - Linux, CUDA.
+ *   - CUDA GpuMat here; CUDA/HIP device-buffer variants in device.hpp.
  *
  * @see @ref tutorial_triton_h20_first_use "H20 build, install and first-use walkthrough".
  * @see @ref tutorial_triton_resize "Triton resize usage guide" for resize details.
@@ -45,9 +51,11 @@ namespace cv { namespace triton {
 //! @addtogroup triton
 //! @{
 
-/** @brief Is a usable Triton backend present for the current device?
+/** @brief Is a usable device present for the configured Triton backend?
  *
- * False means no usable CUDA device for the current device index. Pure query: no allocation,
+ * CUDA checks OpenCV's current device; HIP checks visible device 0. A true result does not
+ * imply that CUDA GpuMat/Python operations work on HIP; use haveDevice(device) for an explicit
+ * device query and the device-buffer C++ entries there. Pure query: no allocation,
  * no submission, no compilation. Whether the compile toolchain is present matters only on a
  * cache miss, and is reported then (an exception), not here.
  */
@@ -56,16 +64,19 @@ CV_EXPORTS_W bool haveBackend();
 /** @brief Name of the active backend, or an empty string if none. */
 CV_EXPORTS_W String backendName();
 
-/** @brief Release the module's resources that are held on behalf of captured CUDA graphs.
+/** @brief Release the module's resources that are held on behalf of captured backend graphs.
  *
- * Every operation here can be recorded into a CUDA graph: call it while a stream is capturing
+ * The CUDA GpuMat and CUDA/HIP device-buffer operations support capture on a warmed stream
+ * within the backend's documented limitations. Call while that backend stream is capturing
  * and the launch is recorded, not executed. A captured graph refers to the compiled module and
  * to its per-operation tables by handle and may be launched much later, so at capture time the
  * runtime pins those resources so a later launch cannot read an unloaded module or a recycled
- * table. CUDA gives no notification when a graph is destroyed, so the pin is released here.
+ * table. The module receives no graph-destruction notification, so pins are released here.
  *
  * **Contract:** call this once the graphs you captured through this module are destroyed or no
- * longer used. Releasing pins while a graph that reads them can still be launched is a
+ * longer used and their in-flight executions have finished. This releases this runtime's
+ * graph pins across contexts, so all affected graphs must satisfy that condition.
+ * Releasing pins while a graph that reads them can still be launched is a
  * use-after-free that no API can detect.
  *
  * **Cost of not calling it:** pins grow with the number of distinct compiled kernels and table
@@ -193,15 +204,12 @@ CV_EXPORTS_AS(cvtColor) void cvtColorForPython(const cuda::GpuMat& src, CV_OUT c
  * allocation of an empty destination does not provide a defined background. INTER_AREA has
  * LINEAR sampling semantics here, rather than resize-style area integration.
  *
- * Accuracy (contract warpaffine/0.4.3; measured against the selected reference on the core
- * suite, a deterministic combination sweep over this surface and a random sweep):
- *   - CV_8U: bit-exact (got == ref), no one-level allowance.
- *   - CV_16U: |got - ref| <= 1 on every element; its one-level allowance is unchanged.
- *   - CV_32F: |got - ref| <= min(5e-5 * max(|ref|, 1.0), 1e-4) PER ELEMENT, never normalised by the image
- *     maximum. Against the selected reference the measured worst is 0 non-identical elements of
- *     549,312 compared, so the bound is headroom; the accuracy test reports the counts, max
- *     |diff|, max normalised error and max ULP rather than a bare pass. CUBIC float32 measured
- *     1.8e-7 relative, five orders of magnitude inside the same bound.
+ * Accuracy against the selected reference:
+ *   - CV_8U: bit-exact (got == ref).
+ *   - CV_16U: |got - ref| <= 1 on every element.
+ *   - CV_32F: |got - ref| <= min(5e-5 * max(|ref|, 1.0), 1e-4) per element,
+ *     never normalised by the image maximum.
+ * Tests report counts, maximum absolute/normalised error and ULP separately from passing.
  *
  * The fused/separate multiply-add choice is calibrated from fixed probes of the actual linked
  * CPU implementation, per depth/channel count and cv::useOptimized() state. Hardware FMA
@@ -212,20 +220,14 @@ CV_EXPORTS_AS(cvtColor) void cvtColorForPython(const cuda::GpuMat& src, CV_OUT c
  * selected CPU vector-path semantics. That build computes a column's source coordinate as
  * v_fma(M0, x, (float)(y*M1 + M2)) in the SIMD body but as x*M0 + y*M1 + M2 in the scalar tail,
  * and the tail's length depends on the destination width, so the shared region of two different
- * widths can disagree. Magnitude depends on the interpolation: under INTER_NEAREST an ulp can
- * select the ADJACENT source pixel (measured up to 239 of 255 for CV_8U; fixture: width 40 ->
- * 193, widths 48/64/128 -> 65 at one pixel); under INTER_LINEAR the measured worst over
- * 80 seeds x 4 widths was 1 level, which is a measurement on this reference build and not a
- * general guarantee. CV_16U behaves the same way (NEAREST up to an adjacent pixel, LINEAR 1
- * level). This module computes the vector-path result, so it matches a natural-width CPU call
- * except at those isolated pixels -- visibly wrong under NEAREST. See doc/warpaffine.markdown.
+ * widths can disagree. Under NEAREST an ulp at a rounding tie may select an adjacent
+ * source pixel, so no small-output-error guarantee is offered against a natural-width call.
+ * LINEAR can also differ; the numerical bounds above apply only to the selected reference.
+ * The padded reference is tied to the linked CPU build, not a cross-ISA guarantee.
  *
- * INTER_CUBIC is the exception and it is measured, not assumed: cv::warpAffine routes it
- * through genericWarp() -> bicubicVec/bicubicRef, whose column coordinate is
- * M_x + M(0,0)*x evaluated from the ABSOLUTE x with no fma. There is no body/tail split, and
- * over 80 seeds x 4 widths 0 of 320 (seed, width) pairs differ for CV_8U, CV_16U and CV_32F.
- * The CUBIC reference is therefore the natural-width call -- padding would change nothing and
- * applying the rule would hide that. `Triton_WarpAffine.CpuCubicIsWidthInvariant` pins it.
+ * INTER_CUBIC uses the natural-width CPU call through genericWarp()/bicubicVec/bicubicRef.
+ * Its absolute-column coordinate expression differs from the NN/LINEAR invoker above.
+ * See doc/warpaffine.markdown and the CPU width-invariance controls in the tests.
  *
  * @param src   Source GpuMat, CV_8U, CV_16U or CV_32F, 1/3/4 channels. ROI accepted.
  * @param dst   Destination GpuMat. Created if needed; never aliased with src. For

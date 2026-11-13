@@ -1,4 +1,8 @@
 #!/usr/bin/env python
+# This file is part of OpenCV project.
+# It is subject to the license terms in the LICENSE file found in the top-level directory
+# of this distribution and at http://opencv.org/license.html.
+
 import cv2 as cv
 import numpy as np
 
@@ -15,10 +19,8 @@ from tests_common import NewOpenCVTests, unittest
 #      HAL). cv::resize of an arbitrary build is that reference only if the
 #      build is configured so.
 #
-# An earlier version put both behind the reference-build check, so on an
-# ordinary build EVERY python test skipped and a broken binding would have gone
-# unnoticed. The C++ suite covers the numbers on any build against a portable
-# oracle (test/test_resize.cpp); Python is here to prove the binding itself.
+# Binding tests run independently of the reference-build numerical check. The C++
+# resize suite uses a portable oracle; these tests also exercise the Python wrappers.
 
 _F32_ATOL = {cv.INTER_NEAREST: 0.0, cv.INTER_LINEAR: 4.948e-07, cv.INTER_CUBIC: 1.401e-06, cv.INTER_AREA: 8.419e-07}
 
@@ -329,8 +331,7 @@ class triton_cvtcolor_test(_TritonBase):
                 cv.triton.cvtColor(cv.cuda_GpuMat(img), code)
         # CV_32F is served only where the module has a stated contract: the bit-copy codes and
         # the three arithmetic families (colour->gray, YCrCb, YUV). Everything else at 32F is
-        # refused. An earlier version of this test refused 32F BGR2GRAY outright, which stopped
-        # being true once that family got its measured bound (contract-32f.md).
+        # refused. Supported float arithmetic uses its documented per-pixel bound.
         f32 = np.random.RandomState(5).uniform(0.0, 1.0, (32, 32, 3)).astype(np.float32)
         for code in (cv.COLOR_BGR2XYZ, cv.COLOR_BGR2HSV, cv.COLOR_BGR2Lab):
             with self.assertRaises(cv.error):

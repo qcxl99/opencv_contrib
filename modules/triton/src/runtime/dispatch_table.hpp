@@ -1,7 +1,10 @@
-// GENERATED, do not edit: from operators/resize/kernel.py by tools/export_module_kernels.py.
-//   CPU_CONFIG and _CPU_TABLE, as the C++ launch-shape resolver (kf_resize_rt::default_config)
-//   reads them. kernel.py stays the single source of truth; tests/test_module_sync.py fails
-//   if this file is not exactly what kernel.py generates.
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
+// Resize dispatch configuration; provenance is recorded in doc/maintenance.markdown.
+// See doc/maintenance.markdown for configuration maintenance.
+// Maintained as module source; not regenerated during OpenCV builds.
 #pragma once
 
 namespace kf_resize_rt {

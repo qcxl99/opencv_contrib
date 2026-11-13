@@ -3,7 +3,7 @@
 // of this distribution and at http://opencv.org/license.html.
 // Shared accuracy through real public APIs, without CUDA/HIP SDK headers.
 #include "../validation/device.hpp"
-#include <cstring>
+#include "../validation/guards.hpp"
 #include <limits>
 #include "../validation/reference.hpp"
 #include "../validation/resize_cases.hpp"
@@ -18,15 +18,28 @@ static void requireDevice()
     if (!device::available()) throw SkipTestException("no usable validation backend");
 }
 
-static bool guardsEqual(const Mat& before, const Mat& after, Rect changed)
+// CPU-only control: supported depths/channels, separate row pitches, and byte corruption.
+TEST(Triton_Validation, GuardBandsBytewise)
 {
-    if (before.size() != after.size() || before.type() != after.type()) return false;
-    for (int y = 0; y < before.rows; ++y)
-        for (int x = 0; x < before.cols; ++x)
-            if (!changed.contains(Point(x, y)) &&
-                std::memcmp(before.ptr(y) + x * before.elemSize(),
-                            after.ptr(y) + x * after.elemSize(), before.elemSize()) != 0) return false;
-    return true;
+    for (int depth : {CV_8U, CV_16U, CV_32F})
+        for (int channels : {1, 3, 4})
+        {
+            const int type = CV_MAKETYPE(depth, channels);
+            SCOPED_TRACE(cv::format("depth=%d channels=%d", depth, channels));
+            Mat beforeStorage(7, 12, type, Scalar::all(77));
+            Mat afterStorage(7, 15, type, Scalar::all(77));
+            const Mat before = beforeStorage(Rect(1, 1, 9, 5));
+            Mat after = afterStorage(Rect(2, 1, 9, 5));
+            const Rect changed(2, 1, 4, 3);
+            EXPECT_TRUE(guardsEqual(before, after, changed));
+            after(changed).setTo(Scalar::all(13));
+            EXPECT_TRUE(guardsEqual(before, after, changed));
+            after.ptr(0)[after.elemSize() - 1] ^= 1;
+            EXPECT_FALSE(guardsEqual(before, after, changed));
+            EXPECT_FALSE(guardsEqual(before, after(Rect(0, 0, 8, 5)), changed));
+            const Mat otherType(after.size(), CV_MAKETYPE(depth, channels == 1 ? 3 : 1));
+            EXPECT_FALSE(guardsEqual(before, otherType, changed));
+        }
 }
 
 TEST(Triton_Common, ResizeRoutesLayoutsAndStreams)

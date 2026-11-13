@@ -13,7 +13,7 @@
 //     refused); warp_size from the device (64 on gfx936, not 32).
 //   * Kernels: kernels/<op>_cpu_hip.py where the CUDA source calls a libdevice primitive
 //     flagtree's hip build lacks (resize, warpAffine; tools/make_kernels_cpu_hip.py derives
-//     them and refuses a stale copy); cvtColor's kernels call none and are used as written.
+//     them and refuses a stale copy); cvtColor also uses the derived source for explicit rounded float operations.
 //   * Binary: manifest format "hsaco", loaded with hipModuleLoadData.
 //   * Compile helper environment: ROCM_PATH is forwarded (the hip compiler finds clang and its
 //     device libraries through it), and the GPU is hidden from the helper with the HIP and ROCR
@@ -379,8 +379,7 @@ void countEvicted(const std::vector<std::shared_ptr<V>>& ev, long long& counter,
 
 // True when `stream` is inside a capture region. cuStreamIsCapturing is legal there, unlike
 // hipEventQuery: querying any event while capturing invalidates the whole capture
-// (hipErrorStreamCaptureUnsupported, measured -- runs/cvtcolor-module-0001/bench/
-// probe_capture_min2.cpp).
+// (hipErrorStreamCaptureUnsupported).
 bool capturing(hipStream_t stream)
 {
     if (!stream) return false;
@@ -398,7 +397,7 @@ bool capturing(hipStream_t stream)
 //  * capturing -- the work is not executing, it is being recorded, so there is no completion to
 //    wait for. Creating an event here would also put a capture-scoped event into `pending`, and
 //    the NEXT capture that waits on it fails with CUDA_ERROR_STREAM_CAPTURE_ISOLATION
-//    (measured: runs/cvtcolor-module-0001/bench/probe_graph2.cpp). But the graph produced by
+//    . The graph produced by
 //    this capture may be launched much later, after the LRU has evicted everything it read, so
 //    the module and tables are PINNED instead of being left to the cache. Without this, a
 //    replay after an eviction would reference an unloaded module or a freed table buffer.
@@ -602,8 +601,7 @@ void pack(std::vector<unsigned char>& host, std::map<std::string, std::size_t>& 
     off[name] = at;
 }
 
-// The tables the P1 kernels read, built by the portable oracle's plan half, exactly as
-// operators/resize/kernel.py::_cpu_plan builds them.
+// Coordinate/coefficient tables built by the portable resize reference's plan half.
 void buildTables(const Normalized& n, TableRes& t)
 {
     const ref::Route k = n.route.kind;

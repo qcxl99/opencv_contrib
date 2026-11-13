@@ -2,7 +2,7 @@ cvtColor: supported conversions and execution {#tutorial_triton_cvtcolor}
 ============================================
 
 The optional Triton module provides explicit `cv::triton::cvtColor` calls.
-The [module README](../README.md) lists the conversion families. The native
+The module README lists the conversion families. The native
 code table contains 84 distinct numeric codes at CV_8U, 20 at CV_16U and 20 at
 CV_32F. Enum aliases share a row. A supported code at one depth does not imply
 support at another depth; unsupported combinations raise without CPU fallback.

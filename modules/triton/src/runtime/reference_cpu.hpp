@@ -1,22 +1,15 @@
-// Portable reference for resize (contract resize/0.15.0): OpenCV 5.0.0 CPU cv::resize as
-// computed by the pinned reference configuration (contract.yaml semantics.oracle_build:
-// resize.cpp's generic code, 128-bit SIMD, no FMA, no IPP, no HAL).
-//
-// Why it exists (BACKLOG B1): the CPU result is a property of the OpenCV build. An IPP-HAL
-// build of the same version differs on 507 of 2069 cases (runs/cpu-build-dependence-0001),
-// so a test that compares against the host's own cv::resize tests the host build, not the
-// contract. This file computes the contract on any host. It is a C++ port of
-// operators/resize/reference_cpu.py, line for line, and is checked bit-exact against it and
-// against the pinned cv2 (tests/test_reference_cpu_cpp.py).
-//
-// It must be compiled with -ffp-contract=off (no fused multiply-add) and on a target whose
-// float evaluation is IEEE single (FLT_EVAL_METHOD == 0). The 128-bit SIMD/tail split of the
-// reference build is reproduced with explicit constants, independent of the host's SIMD.
-//
-// Two halves:
-//   * plan: size resolution, routing and the coordinate/coefficient tables. The module's
-//     C++ runtime builds its device tables from this half (BACKLOG B5).
-//   * evaluate: the scalar computation over those tables, the test oracle.
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
+// Portable resize reference: OpenCV 5.0.0 generic resize.cpp, 128-bit SIMD,
+// no FMA, IPP or custom HAL. The reference result depends on the selected build;
+// comparing with an arbitrary host cv::resize would test a different numerical contract.
+// Source provenance is recorded in doc/maintenance.markdown.
+// Compile with -ffp-contract=off and IEEE single float evaluation (FLT_EVAL_METHOD == 0).
+// The reference SIMD/tail boundaries are explicit constants, independent of host SIMD width.
+// The plan half resolves sizes/routes and coordinate/coefficient tables for production;
+// the evaluate half is the scalar numerical oracle used by the module tests.
 #pragma once
 
 #include <cstddef>

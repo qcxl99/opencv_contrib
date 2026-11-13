@@ -2,14 +2,9 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# CPU-aligned resize kernels (contract resize/0.15.0) for the runtime JIT of modules/triton.
-# GENERATED, do not edit: exported from kernelforge-lab by tools/export_module_kernels.py.
-#   lab file:    operators/resize/hip_optimizations.py
-#   lab sha256:  8a443e0261557291364be7a03b70f21de2fa8c5c063e3c3d158584a70a25cf9e
-#   functions:   _hip_area2_packed, _hip_area2_channels
-# The runtime compiles these through tools/compile_helper.py; the compile key carries this
-# file's own sha256, so editing it here only changes which binaries are built, never which
-# binaries are trusted.
+# CPU-aligned resize HIP kernels for the module runtime JIT.
+# Maintenance and numerical references are documented in doc/maintenance.markdown.
+# This installed source is self-contained; its content hash is part of the compile key.
 
 import triton
 import triton.language as tl

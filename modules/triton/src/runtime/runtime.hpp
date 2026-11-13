@@ -2,32 +2,19 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Module-private runtime JIT (P1; kernelforge-lab BACKLOG B5). Not installed.
-//
-// The one entry the adapters call is runtime::resize(). It
-//   * normalises and validates the request (provider.hpp normalize(): CPU cv::resize
-//     parameter resolution, int32 ranges, overlap), and serves the P1 routes only (copy,
-//     nearest, linear, area_fast); cubic and fractional area are Unsupported/route_not_enabled;
-//   * finds the binary for the request's compile key: in-process module cache -> disk cache
-//     (verified: compile_protocol.hpp verify_artifact) -> the Torch-free compile helper in a
-//     separate process (compile_key), never Python in this process;
-//   * builds the coordinate/coefficient tables in C++ (reference_cpu.hpp, the same code as
-//     the portable oracle), uploads them on the caller's stream and records an event; a call on
-//     another stream waits on that event;
-//   * launches with the manifest's parameter list. The two trailing scratch pointers are passed
-//     as null only when launch_abi_ok() holds: a validated compiler ABI, zero scratch bytes,
-//     and exactly (global_scratch, profile_scratch) after the runtime arguments;
-//   * keeps every module and table a launch uses alive until that launch's completion event:
-//     cache eviction drops the cache's reference only.
-//
-// Costs to know, measured on the 12.8 driver: cuModuleLoadData, cuModuleUnload and cuMemFree block
-// until the context's in-flight work has drained. So:
-//   * the first use of a key in a context stalls the calling thread on its own earlier work;
-//   * nothing that can unload is destroyed under the state mutex;
-//   * tables are stream-ordered memory (cuMemAllocAsync / cuMemFreeAsync), so evicting them, the
-//     common case once many shapes are in use, does not stall the application's thread.
-//
-// Linux/CUDA only in this milestone.
+// Module-private runtime JIT. Not installed.
+// Adapters call resize(), cvtColor() or warpAffine(). Each validates its supported request,
+// obtains a verified artifact (context-local module cache -> disk cache -> separate compile
+// helper process), prepares stream-ordered tables when needed, and submits on the caller's
+// stream. Resize serves copy, nearest, linear, cubic, area_fast and fractional AREA routes.
+// Supported input subsets remain operation/backend-specific; unsupported calls do not fall back.
+// C++ loads verified cubin/hsaco entry metadata; Python is used only by the compile helper.
+// In-flight work retains modules/tables; graph captures pin resources until the caller releases
+// them after all dependent graphs and executions are finished. See the public API contract.
+// CUDA driver 12.8 observations: module load/unload can wait for prior context work. Releases
+// occur outside the runtime lock; tables use stream-ordered allocation/free.
+// CUDA and HIP implementations are selected at build time. Their capability and test results
+// are backend-specific, not interchangeable. See doc/maintenance.markdown.
 #ifndef OPENCV_TRITON_RUNTIME_HPP
 #define OPENCV_TRITON_RUNTIME_HPP
 
@@ -42,9 +29,9 @@
 
 namespace cv { namespace triton { namespace runtime {
 
-/** Is the CUDA driver usable for `device`? Pure query: no allocation, no submission. */
+/** Is the selected backend usable for `device`? Pure query: no allocation or submission. */
 bool deviceAvailable(int device);
-const char* name();   // "cuda-jit"
+const char* name();   // "cuda-jit" or "hip-jit"
 
 /** Run one resize. `req` views must belong to the context current on the calling thread.
  *  Returns Submitted (work is on ex.stream), Unsupported (nothing submitted, dst untouched)

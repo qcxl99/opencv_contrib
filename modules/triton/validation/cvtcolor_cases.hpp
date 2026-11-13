@@ -109,7 +109,7 @@ const CvtCase kCases[] = {
     // The forward sRGB Luv codes are in here even though their CPU path is a trilinear LUT
     // rather than the CIE formula -- reproducing the LUT IS the bit-exact target, and the
     // comparison below is against this build's cv::cvtColor, so a kernel that computed exact
-    // CIE Luv would fail here (measured: up to 1 LSB on each of L, u, v).
+    // CIE Luv would not in general match that quantised LUT.
     //
     // cv::COLOR_LBGR2Luv (76) and cv::COLOR_LRGB2Luv (77) are absent because the module refuses them:
     // the CPU's float forward path answers differently in its SIMD body than in its scalar tail
@@ -140,7 +140,7 @@ const CvtCase kCases[] = {
 // separate from kCases so the many tests that iterate kCases keep covering exactly the 8U set
 // they were written for; MatchesCpu16U walks this one. One row per served code — a 16U code
 // missing here is not caught by CoversEverySupportedCode (that compares the 8U table), so the
-// probe in runs/cvtcolor-ext-0001/probe-16u/ sweeps the same list independently.
+// Each row specifies its supported depth explicitly.
 const CvtCase kCases16U[] = {
     {cv::COLOR_BayerBG2BGR, "BayerBG2BGR", 1, 3, CV_16U},
     {cv::COLOR_BayerGB2BGR, "BayerGB2BGR", 1, 3, CV_16U},

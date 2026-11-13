@@ -2,14 +2,9 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# CPU-aligned resize kernels (contract resize/0.15.0) for the runtime JIT of modules/triton.
-# GENERATED, do not edit: exported from kernelforge-lab by tools/export_module_kernels.py.
-#   lab file:    operators/warpaffine/kernel.py
-#   lab sha256:  f19f9d99c4ce204fdace13e85145a30c45dbdc1950b3be7b302d1865f1a8be51
-#   functions:   _pmod, _bm, _fma, _mapped_coord, _warp_nearest, _warp_linear, _bicubic_weights_t, _warp_cubic
-# The runtime compiles these through tools/compile_helper.py; the compile key carries this
-# file's own sha256, so editing it here only changes which binaries are built, never which
-# binaries are trusted.
+# CPU-aligned warpAffine kernels for the module runtime JIT.
+# Maintenance and numerical references are documented in doc/maintenance.markdown.
+# This installed source is self-contained; its content hash is part of the compile key.
 
 import triton
 import triton.language as tl
@@ -260,8 +255,8 @@ def _warp_linear(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, ds
         # pixel with its weight unchanged -- out = sum(w_k*S_k) + (1 - sum(w_k))*dst_old, so the
         # blend degenerates smoothly to "keep the old value" as the point leaves the image. No
         # renormalisation and no border value; the pixel is still written unless the whole 2x2
-        # window is outside (ix < -1 || ix >= W || iy < -1 || iy >= H). Measured rule:
-        # WA_TRANSPARENT.md. The destination must already hold its intended contents.
+        # window is outside (ix < -1 || ix >= W || iy < -1 || iy >= H).
+        # The destination must already hold its intended contents.
         lstore = m & ~outside if TRANSPARENT else m
         tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, v, mask=lstore)
 
@@ -295,9 +290,8 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
 
     Different family from _warp_linear/_warp_nearest: the column coordinate is
     M_x + M_xx*x with NO fma, computed from the absolute x, so every block computes a
-    column the same way and the result does not depend on the destination width. That
-    is measured (0 of 320 width pairs for uint8, uint16, float32), not argued: it is why
-    this kernel needs no pad-to-128 reference rule.
+    column the same way. The reference uses the natural-width CPU call; the tests
+    check that behavior on the linked build rather than assuming cross-build invariance.
 
     Tap layout: ix0 = floor(sx) - 1, then ix0..ix0+3; sx and sy are clamped in float to
     [-max(dim,16), 2*max(dim,16)] first, as bicubicCoeffs does, so a wild matrix cannot
@@ -375,7 +369,7 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
                     if TRANSPARENT:
                         # BORDER_TRANSPARENT (CUBIC): an out-of-range tap is the OLD DESTINATION
                         # pixel, weights unchanged -- the same destination-fill blend LINEAR uses
-                        # (WA_TRANSPARENT.md). Written unless the whole 4x4 window is outside.
+                        # and is written unless the whole 4x4 window is outside.
                         bvs = tl.load(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c,
                                       mask=m, other=0)
                     v = tl.load(src + idx, mask=m & ok, other=bvs)

@@ -5,46 +5,15 @@
 // Pure part of the cvtColor provider: the code table, request validation and the explicit
 // compile key. No device access, so it is testable without a GPU.
 //
-// Why this subset, and what "exact" is exact against. The reference is THIS build's
-// cv::cvtColor, not "the CPU" in the abstract: integer arithmetic does not by itself make two
-// implementations produce the same bytes, and cv::cvtColor does dispatch through
-// cv_hal_cvtBGRtoBGR / cvtBGRtoYUV / cvtBGRtoHSV, so a HAL build is a different reference.
-// What integer arithmetic does buy here is stronger and checkable: each output pixel depends
-// only on its own input bytes and on 256-entry constant tables, so the result cannot depend on
-// where the pixel sits in a row -- no reduction, no accumulation order, no SIMD width. That is
-// the property that makes the result reproducible, and it was measured (not assumed), together
-// with equality to the reference over the whole 8-bit input space, in
-// runs/cvtcolor-module-0001 (exhaustive.cpp; identity.json records the exact sources):
-//
-//   channel permutes                    pure gathers
-//   BGR/RGB/BGRA/RGBA -> GRAY           CV_DESCALE, gray_shift = 15
-//   BGR/RGB <-> YUV, YCrCb              fixed point, yuv_shift = 14
-//   BGR/RGB -> HSV, HSV_FULL            integer, hsv_shift = 12, 180 or 256 hue range
-//
-// Scope: the claim holds for the build recorded in runs/cvtcolor-module-0001/identity.json --
-// generic C++ path, no IPP, no custom HAL -- and is re-checked there by
-// test_cvtcolor.cpp's ReferenceBuildIsCharacterised, which reads those fields by value and
-// fails if they change. An earlier version of this comment claimed color.cpp had no HAL entry
-// points; it does, one level down in color_rgb/color_yuv/color_hsv.dispatch.cpp, which is why
-// the reference is a specific build rather than "the CPU".
-//
-// Refused, with the reason recorded instead of a tolerance invented:
-//   * HSV2BGR and HSV_FULL2BGR (codes 54, 55, 70, 71), and the HLS pair. The reverse
-//     direction is float32, and its SIMD body and its scalar tail do not agree: the body
-//     applies v_trunc to the final *255 and the tail applies saturate_cast. Measured over all
-//     2^24 (h,s,v): 74% of inputs differ between the two, always by +1 in the tail, so this is
-//     not a rounding tie -- it is two different answers for most of the input space. The split
-//     is deterministic for a given width and CPU dispatch (the body covers whole vector
-//     blocks, the tail the remainder), so it could be emulated by baking that split in; but
-//     even then the per-pixel float algebra is not reproducible from source (the best model
-//     still misses ~1836 of 16.7M pixels on the 180-range body, decided by FMA contraction).
-//     Claiming "bit-exact" would be claiming a number the CPU does not have.
-//
-//     HLS was previously refused for the same stated reason and that reason was WRONG: HLS2RGB
-//     rounds in the body too, so it has no truncate/round split. Its real residual is 8 inputs
-//     out of 16.7M, from a vector-vs-scalar difference in the p1/p2 formula. It stays refused
-//     because it is float and unproven, not because of truncation.
-//   * Depth/family combinations outside normalize(), and codes absent from the table below.
+// The reference is this build's cv::cvtColor, not every CPU build. OpenCV dispatches
+// through HAL and SIMD implementations, so changed builds need their own validation.
+// Integer conversions/copies use exact comparison, while finite float arithmetic uses
+// the per-pixel input-scale bound in the public API and validation/numerics.hpp.
+// Cases and CPU reference checks live in test/test_cvtcolor.cpp and validation/.
+// Reverse HSV/HLS and forward linear Luv remain unsupported: their CPU floating
+// expressions and SIMD/tail choices are not covered by this module's numerical contract.
+// A deterministic result for a fixed CPU build/input is not a width-independent or
+// cross-build bit-exact guarantee. Unsupported codes are refused rather than approximated.
 #include "cvtcolor.hpp"
 
 #include <algorithm>
@@ -233,13 +202,8 @@ const CodeSpec TABLE[] = {
     // code, because the CPU computes them from softdouble in the constructor and nine hand-
     // written ints per row would be neither checkable nor correctable.
     //
-    // NOT HERE, and why (spec: runs/cvtcolor-ext-0001/spec-xyz-lab-luv.md §3, probe/quant2.cpp):
-    //   COLOR_LBGR2Luv (76) and COLOR_LRGB2Luv (77). The forward linear-Luv path is float32 and
-    //   the same build answers differently in its SIMD body (rows >= 8 pixels) and its scalar
-    //   tail (rows < 8): 5264 of the 16.7M cube differ by 1 LSB for LBGR2Luv, 5200 for
-    //   LRGB2Luv, and the split happens at width 8. There is no single CPU answer to reproduce,
-    //   so a bit-exact kernel is not merely hard here -- it is undefined. Refused rather than
-    //   given a +-1 tolerance that would hide it.
+    // Forward linear Luv codes 76/77 remain unsupported: the CPU vector/tail
+    // expressions differ and this module does not promise their numerical equivalence.
     {"BGR2XYZ", 32, Op::Xyz, 3, 3, 0, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
     {"RGB2XYZ", 33, Op::Xyz, 3, 3, 2, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
     {"XYZ2BGR", 34, Op::Xyz, 3, 3, 0, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
@@ -333,10 +297,8 @@ Status resolve_output(const kf_resize_rt::DeviceView& s, int code, Output& out) 
     // Everything else stays 8U, and the colour permutes do NOT get 16U as a side effect: the
     // scn == 1 condition is what keeps BGR2BGRA and the YUV2GRAY_* extractChannel rows out.
     //
-    // Measured, not assumed: the spec (runs/cvtcolor-ext-0001/spec-16u-32f.md §2a, §3a) found
-    // these three families position independent and bit-exact at 16U over 19.2M pixels across 24
-    // widths, with byte-identical ISA dumps across AVX512/AVX2/SSE3/scalar -- no dispatch-
-    // dependent variant is needed.
+    // Numerical criteria and scope are shared with validation/numerics.hpp;
+    // changes to the selected CPU build still require validation.
     //
     // src and dst must agree: the CPU creates dst at src's depth (`CV_MAKE_TYPE(depth, dcn)`)
     // and has no mixed-depth path.
@@ -347,18 +309,10 @@ Status resolve_output(const kf_resize_rt::DeviceView& s, int code, Output& out) 
                            spec->op == Op::YCrCb ||
                            (spec->op == Op::Permute && spec->scn == 1);
     const bool f32 = s.type == kf_resize_rt::ElemType::F32;
-    // CV_32F has TWO kinds of coverage, and they are not the same claim:
-    //   * the bit-copy codes (channel permutes and gray -> colour), where the CPU writes each
-    //     source float into a destination slot unchanged, so the module is bit-exact; and
-    //   * the arithmetic codes (colour -> gray, YCrCb/YUV both ways), where the CPU itself has
-    //     several answers -- its fused body for W >= 16, its fused tail for W < 16, and an
-    //     unfused build -- so no bit-exact target exists. Those are served under the measured,
-    //     documented bound |got-ref| <= 8*2^-24*max(1,|ref|,max|input|) (contract-32f.md §7.1,
-    //     worst measured 3.999 with k=8 as 2x headroom), and the test compares with that bound
-    //     rather than for equality. The bound is NOT the warpAffine one: that form is 200-400x
-    //     too loose at unit scale and 78-156x too tight at 65535 scale (contract-32f.md §7.2).
-    // YUV2GRAY_* are Op::Permute, but the CPU cvtColor wrapper admits CV_8U
-    // only before calling extractChannel. Do not invent a 32F cvtColor extension.
+    // Float channel copies preserve bits. Arithmetic (gray/YUV/YCrCb) uses the
+    // documented per-pixel input-scale bound, since CPU expressions depend on
+    // vector/tail/FMA dispatch. See validation/numerics.hpp and the public API.
+
     const bool f32_exact_copy = f32 && ((spec->op == Op::Permute && spec->scn != 2) ||
                                         (spec->op == Op::Gray && spec->inverse));
     const bool f32_arithmetic = f32 && (spec->op == Op::Gray ||
@@ -467,7 +421,7 @@ HsvTables hsv_tables_full() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// XYZ / Lab / Luv constants, replicated from /tmp/ocv-pr-main/modules/imgproc/src/color_lab.cpp.
+// XYZ / Lab / Luv constants, replicated from OpenCV modules/imgproc/src/color_lab.cpp.
 // Every value below is quoted from that file rather than re-derived, because the CPU's numbers
 // are the specification here, not the textbook ones.
 namespace {
@@ -544,6 +498,7 @@ void whiteChroma(softfloat& un, softfloat& vn) {
 }  // namespace
 
 void coeffs_for(int code, int out[9]) {
+    std::fill(out, out + 9, 0);
     // The CPU builds these in the FUNCTOR CONSTRUCTORS from softdouble at run time -- they are
     // not literals in the source (except XYZ's), so replicating the constructor is the only way
     // to get them.
@@ -554,9 +509,7 @@ void coeffs_for(int code, int out[9]) {
     // i.e. ROW r IS DESTINATION SLOT r, in slot order 0,1,2 = whatever the CPU writes there
     // (B,G,R for a BGR destination). Getting this wrong is not subtle numerically but IS subtle
     // to read: a transposed or row-permuted colour matrix still looks like a colour matrix.
-    // Every claim below was settled by probe-lab/flat.cpp, which searches the arrangements and
-    // reports the mismatch count against this build's cv::cvtColor.
-    std::fill(out, out + 9, 0);
+    // Preserve the constructors' destination-slot coefficient order.
     const bool forward = (code == 44 || code == 45 || code == 74 || code == 75 ||   // BGR/RGB -> Lab
                           code == 50 || code == 51);                                // BGR/RGB -> Luv
     const bool xyz = (code == 32 || code == 33);
@@ -587,9 +540,7 @@ void coeffs_for(int code, int out[9]) {
         // ROWS, not columns, and blueIdx 0 is the BGR-output code. The CPU writes dst[0] from
         // flat row 0, so a row swap moves which destination channel each matrix row feeds.
         //
-        // Measured over the whole sampled cube (probe-lab/layout.cpp): XYZ2BGR is exact with the
-        // row swap and wrong without it; XYZ2RGB is the mirror image. The mismatch counts are
-        // 0 vs ~607k, so this is not a close call.
+        // XYZ2BGR reverses destination rows; XYZ2RGB retains their original order.
         for (int r = 0; r < 3; ++r) {
             const int srcRow = (blueIdx == 0) ? 2 - r : r;
             for (int c = 0; c < 3; ++c) out[3 * r + c] = kXYZ2sRGB_i[3 * srcRow + c];
@@ -618,7 +569,7 @@ void coeffs_for(int code, int out[9]) {
     // Lab2RGBinteger / Luv2RGBinteger (color_lab.cpp:2391-2411, :3534-3552).
     //
     // THE INDEX ORDER IS TRANSPOSED HERE: `c[j] = XYZ2sRGB_D65[i + j*3]`, against the forward
-    // direction's `c[j] = M[i*3 + j]`. The spec calls this out as the easy mistake, and it is:
+    // direction's `c[j] = M[i*3 + j]`. Preserve that transpose:
     // writing the reverse the same way as the forward produces a matrix that is exactly
     // transposed, which still reads as a plausible RGB matrix.
     //
@@ -629,8 +580,7 @@ void coeffs_for(int code, int out[9]) {
     // dst[r] from flat row r, blueIdx 2 exchanges which destination channel the outer columns
     // feed, which is the `row` reversal below.
     //
-    // Measured over the sampled cube (probe-lab/layout.cpp): with this form Lab2BGR is exact on
-    // the sampled pixels; every other arrangement tried is wrong on 16k+ of them.
+    // Preserve that destination-slot layout for Lab2BGR.
     for (int i = 0; i < 3; ++i) {
         softdouble c[3];
         for (int j = 0; j < 3; ++j) c[j] = kXYZ2sRGB_D65[i + j * 3];
@@ -699,7 +649,7 @@ LabLuvTables buildLabLuvTables() {
     whiteChroma(un, vn);
 
     // initLUTforLUV (color_lab.cpp:1017-1058). LvToVpl_b is `long long` in the CPU because the
-    // value reaches 6.2e13 -- measured over all 65536 (L,v) pairs by probe-lab/luvtbl.cpp.
+    // value reaches 6.2e13 for the supported (L,v) domain.
     t.lu.resize(256 * 256);
     t.lv.resize(256 * 256);
     t.lvpl.resize(256 * 256);
@@ -834,7 +784,7 @@ std::string signature(const Normalized& n) {
     // so the kernel states it as `ES` and divides by the same constant.
     // The pointer type must follow the element type, not just the "is it 16-bit" question: a 32F
     // buffer read through a *u8 pointer decodes every float as bytes and produces garbage
-    // (measured: 3.3e38 differences before this was fixed).
+    // This preserves the documented finite-input numerical bound.
     const char* t = n.u16 ? "u16" : (n.f32 ? "fp32" : "u8");
     // uv_rs is the chroma plane base in ELEMENTS from `src`, i.e. H * src_rs (the Y plane's
     // height times the row pitch). It is a runtime argument like the strides, and it is only read

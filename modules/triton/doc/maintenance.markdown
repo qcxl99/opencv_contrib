@@ -1,11 +1,32 @@
 Maintaining the Triton module {#tutorial_triton_maintenance}
 =============================
 
-The module builds and runs from this contrib tree without KernelForge or Torch.
-The CUDA Python files under kernels/ and private C++ provider files are complete
-vendored sources, with their original notices and recorded origin. They are part
-of the module source package, not artifacts regenerated during OpenCV configure.
-The runtime verifies their content identity before trusting a JIT artifact.
+The module builds and runs from this contrib tree without an external development
+checkout or Torch. Kernel sources, compile-helper code and private C++ planning
+sources are complete parts of this source package. They are not fetched or
+regenerated from another repository during configuration. The runtime verifies
+source and artifact content identity before trusting a JIT artifact.
+
+License and algorithm sources
+-----------------------------
+
+The module contribution uses this repository's Apache-2.0 LICENSE; source files
+carry the OpenCV project notice. These notices do not replace contributors'
+responsibility to have the rights to submitted code. Preserve any original
+third-party notices when incorporating further code. Triton and GPU SDKs are
+external dependencies; their packages retain their own licenses.
+
+The CPU-aligned algorithms and constants follow the selected OpenCV CPU
+implementations in modules/imgproc/src/resize.cpp, color*.simd*.hpp and
+imgwarp.cpp/warp dispatch code, under their applicable OpenCV source notices.
+Resize reproduces the explicitly selected OpenCV 5.0.0 reference configuration;
+cvtColor and warpAffine use the build-specific references documented by their APIs.
+
+The module sources are maintained in this tree. Dispatch values in
+src/runtime/dispatch_table.hpp are checked-in configuration, not a build-time
+export from an external project. Keep their launch parameters consistent with
+kernels/resize_cpu.py and the private provider. Record the actual OpenCV/contrib
+revisions and local changes when producing validation evidence.
 
 HIP kernels are derived with `python3 tools/make_kernels_cpu_hip.py`; the HIP
 runtime is derived with `python3 tools/port_hip_runtime.py`. Both generators and
@@ -14,15 +35,6 @@ corresponding CUDA source. A stale kernel derivation is rejected by configuratio
 The resize derivation also includes kernels/resize_hip_fast.py, a self-contained
 HIP-specific source. Preserve its layout/alignment guards in the provider.
 
-The current research checkout additionally checks mirrored sources against
-KernelForge using its export_module_kernels.py/test_module_sync.py. That external
-synchronizer is a development integration check, not a user build dependency.
-When maintaining exported module sources, reconcile an intentional change into
-the mirrored lab source before invoking that exporter; do not blindly overwrite
-module edits with a stale research checkout. The delivery includes the exact
-module snapshot, related lab delta and source manifests so synchronization can
-be reviewed. After upstream ownership changes, remove or update that mirror
-agreement explicitly rather than presenting stale lab provenance as current.
 
 Validation cases and numerical owners live under validation/. Common accuracy
 and candidate perf sources use device.hpp; CMake selects device_cuda.cpp or
@@ -48,3 +60,6 @@ a documented gap and cannot produce a speedup or full paired qualification.
 The root README describes delivered interfaces and backend boundaries. See the
 H20 guide for NVIDIA-specific first use; it does not grant HIP acceptance. The
 BW1000 guide records the corresponding HIP commands and limitations.
+
+See @ref tutorial_triton_validation for explicit CPU/source, module-off, enabled-build
+and installation verification entry points and their separate evidence boundaries.

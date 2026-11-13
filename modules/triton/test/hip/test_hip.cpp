@@ -4,22 +4,12 @@
 
 // HIP (BW1000 / gfx936) accuracy test for the device entries (opencv2/triton/device.hpp).
 //
-// The module's own tests in test/ are written against cuda::GpuMat, cuda::Stream and the CUDA
-// driver API, so they cannot run on a HIP build. This is their counterpart for the entries a
-// HIP build serves: it allocates HIP device buffers, calls the public device entries
-// (-> runtime -> compile helper -> hsaco load -> launch) and checks every result against the
-// same references and bounds the CUDA tests use:
-//   resize      the portable CPU oracle (src/runtime/reference_cpu.cpp, compiled into this
-//               binary by test/test_oracle.cpp); CV_8U bit-exact, CV_32F within f32Atol;
-//   cvtColor    this build's cv::cvtColor (the integer codes the module serves); bit-exact;
-//   warpAffine  cv::warpAffine's vector path cropped to dsize (NEAREST/LINEAR) or the natural
-//               call (CUBIC), as test/test_warpaffine.cpp defines it; CV_8U/CV_16U bit-exact,
-//               CV_32F within min(5e-5 * max(|ref|, 1), 1e-4).
-// Each accepted case also checks that only dst was written: the destination is a ROI of a
-// padded parent whose border bytes must be unchanged. A refused case must raise the documented
-// error and leave dst untouched. Scalar bounds use validation/numerics.hpp, the
-// same owner as the standard fixtures, without requiring gtest / opencv_ts.
-//
+// Standard opencv_test_triton now shares SDK-neutral accuracy fixtures through
+// validation/device_hip.cpp and the common numerical owners under validation/.
+// This separate executable supplements that coverage with HIP-specific lifecycle,
+// ownership/refusal and capture checks in five selectable groups. It also retains
+// its standalone numerical/ROI controls for minimal builds without opencv_ts.
+// It is not a substitute for the common OpenCV accuracy target or a CUDA result.
 // Plain main, no gtest: the target builds in a minimal core,imgproc,triton tree. It accepts the
 // gtest-style filters select five registered group tests, not individual inner checks.
 // Each group runs only when selected. XML lists those same group names and records

@@ -1,4 +1,4 @@
-# PROPOSED optional module: cv::triton::resize through a runtime JIT of Triton kernels.
+# Optional module: image operations through a runtime JIT of Triton kernels.
 #
 # Off by default, like any module that needs an external toolchain (precedent: cnn_3dobj):
 # enable it with -DBUILD_opencv_triton=ON. An ordinary OpenCV build needs no Python, Triton or
@@ -16,7 +16,7 @@
 #         make_kernels_cpu_hip.py; a stale copy fails the configure), else the CUDA source as
 #         written. The entries are opencv2/triton/device.hpp (device buffers + a hip stream);
 #         the GpuMat entries exist and raise, since OpenCV has no cv::cuda here. Accuracy is
-#         test/hip/. Needs a Triton that targets hip (flagtree, not upstream) and ROCM_PATH.
+#         common test/ fixtures plus supplemental test/hip/. Needs HIP-capable Triton and ROCM_PATH.
 #   auto  cuda where the OpenCV build has CUDA (unchanged), else hip if a HIP toolkit is found,
 #         else the module is disabled. A tree whose CUDA is a compatibility layer (WITH_CUDA=ON
 #         on a BW1000 box) must say -DTRITON_BACKEND=hip.
@@ -121,7 +121,7 @@ else()
        "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cuda_runtime.cpp")
   set(_triton_kernel_files resize_cpu.py cvtcolor_cpu.py warpaffine_cpu.py)
 endif()
-# Installed headers: only the public umbrella. src/core.hpp is deliberately NOT here -- it is a
+# Installed headers: the public umbrella and device-buffer API. src/core.hpp is NOT here -- it is a
 # raw device-pointer layer the plan code shares with the GpuMat adapter, not an API for callers.
 file(GLOB _triton_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton.hpp"
                        "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton/device.hpp")
@@ -221,25 +221,22 @@ if(_triton_backend STREQUAL "cuda")
   file(GLOB _triton_cuda_test_sources "${CMAKE_CURRENT_LIST_DIR}/test/*.cpp"
                                      "${CMAKE_CURRENT_LIST_DIR}/test/*.hpp")
   ocv_add_accuracy_tests(FILES "Src" ${_triton_cuda_test_sources})
+  if(TARGET opencv_test_triton)
+    # Pure admission/normalisation controls call private plan functions. Compile
+    # those into the tests rather than exporting implementation symbols as API.
+    target_sources(opencv_test_triton PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cvtcolor.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime/warpaffine.cpp")
+  endif()
   # Select top-level perf sources only; future backend support is selected here.
   file(GLOB _triton_common_perf_sources "${CMAKE_CURRENT_LIST_DIR}/perf/*.cpp"
                                        "${CMAKE_CURRENT_LIST_DIR}/perf/*.hpp")
   ocv_add_perf_tests(FILES "Src" ${_triton_common_perf_sources})
   ocv_add_samples()
-  # perf/ only: cv::cuda::resize as a labelled timing baseline. The implementation, the accuracy
-  # tests and the sample never use it, so cudawarping is an OPTIONAL dependency -- and it MUST be
-  # checked before being linked. Linking it unconditionally meant a build with triton but without
-  # cudawarping (a legal configuration: the module does not depend on it) failed at configure or
-  # link time instead of simply omitting the baseline test.
+  # Native CUDA libraries are optional perf baselines, not implementation dependencies.
   if(TARGET opencv_perf_triton)
-    # `TARGET opencv_cudawarping` is NOT a usable test here: a module's CMakeLists runs in the
-    # first pass, before other modules' targets exist, so the target check was false even in a
-    # build that had cudawarping enabled. HAVE_opencv_cudawarping is the configure-time answer,
-    # and ocv_check_dependencies is the standard way to ask it.
-    #
-    # Two separate baselines, two separate guards: cv::cuda::resize is in cudawarping and
-    # cv::cuda::cvtColor in cudaimgproc, and a build may have either, both or neither. Each
-    # missing one omits its own perf test and nothing else.
+    # Module discovery precedes target creation. Query configure-time dependencies;
+    # each missing baseline omits only its own perf rows.
     ocv_check_dependencies(opencv_cudawarping)
     if(OCV_DEPENDENCIES_FOUND)
       ocv_target_include_modules(opencv_perf_triton opencv_cudawarping)

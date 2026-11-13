@@ -6,7 +6,7 @@
 // and the GpuMat adapter (cuda_resize_adapter.cpp) -- reduce to detail::resizeDevice(), which
 // hands the request to the runtime JIT (src/runtime/runtime.hpp) and maps its status to an
 // OpenCV error. Numerics: OpenCV CPU cv::resize as the pinned reference configuration
-// (kernelforge-lab contract resize/0.15.0), not cv::cuda::resize. There is no fallback to CPU or
+// as described in the public API, not cv::cuda::resize. There is no fallback to CPU or
 // to cv::cuda: a call that returns has submitted the computation (or the identity copy).
 
 #include "precomp.hpp"

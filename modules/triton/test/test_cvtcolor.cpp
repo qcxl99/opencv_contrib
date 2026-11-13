@@ -298,11 +298,7 @@ TEST(Triton_CvtColor, MatchesCpuOnBoundaries)
         {
             SCOPED_TRACE(label(c, sz) + " / " + b.name);
             Mat host(sz, CV_MAKETYPE(c.depth, c.scn), Scalar::all(0));
-            // Written through a byte pointer at the code's channel count. An earlier version
-            // wrote `Vec3b px; px[3] = ...` for the 4-channel codes: that is three bytes past the
-            // end of px, and `at<Vec3b>` on a 4-channel Mat strides rows by 3*cols instead of
-            // 4*cols. Both are undefined behaviour that happened not to crash, so the boundary
-            // test could pass without ever placing the intended pixel.
+            // Use byte addressing at the actual channel count, including 4-channel inputs.
             for (int i = 0; i < (int)b.colours.size(); ++i)
             {
                 const Vec3b& v = b.colours[i];
@@ -516,13 +512,9 @@ TEST(Triton_CvtColor, RejectsMalformedVideoBeforeLaunch)
 
 // Which build is being compared against, and what that does and does not establish.
 //
-// An earlier version of this test claimed "the reference is the generic CPU path" on the
-// strength of color.cpp having no CALL_HAL. That was wrong: the top-level entries call
-// hal::cvtBGRtoBGR / cvtBGRtoYUV / cvtBGRtoHSV in color_rgb.dispatch.cpp and friends, and
-// those do have CALL_HAL. What this test can honestly do is check the configuration by VALUE
-// -- a custom HAL would have to be compiled in and would say so -- and refuse to draw a
-// numeric conclusion on a build it cannot characterise. It cannot observe a runtime-registered
-// HAL, so it does not claim to.
+// Check build configuration by value, not the absence of a top-level CALL_HAL macro.
+// OpenCV dispatch functions may call HAL one level down. This diagnostic cannot observe
+// runtime dispatch selection and does not claim a particular executed implementation.
 static std::string buildField(const std::string& key)
 {
     const std::string info = cv::getBuildInformation();
@@ -609,22 +601,9 @@ TEST(Triton_CvtColor, ReusesCompiledArtifacts)
     EXPECT_EQ(0.0, cvtest::norm(got, cpuCvt(host, COLOR_BGR2YUV), NORM_INF));
 }
 
-// Asynchronous keep-alive, with a deterministic eviction of the resources the pending launch
-// is holding. Three earlier attempts are worth recording, because each passed or failed for the
-// wrong reason:
-//
-//   * `frees_after >= frees_before` -- satisfied by any release of anything. Cannot fail.
-//   * shrinking the cache to 1/1 and asserting global frees == 0 -- but the shrink also frees
-//     unrelated entries, which is legitimate, so the assertion was wrong, not the runtime.
-//   * shrinking to 1/1 and then calling -- the shrink had already evicted the module the call
-//     needed, so the call reloaded it; `cuModuleLoad` drains the context, the "pending" launch
-//     was synchronised away, and the measured call blocked for the whole 400 ms block.
-//
-// The construction below removes all three: the cache is first emptied of unrelated entries,
-// exactly two codes are warmed, and then the two evictions are produced deliberately -- a table
-// eviction by a second code, a module eviction by a limit shrink -- with the counters checked
-// in between. Statistics are reset after the setup evictions, so a free counted later can only
-// belong to the resources under test.
+// Deterministic keep-alive: remove unrelated entries, prewarm two codes, then block
+// the stream and force table/module eviction without loading a module in that window.
+// Reset counters after setup so deferred releases belong to the resources under test.
 TEST(Triton_CvtColor, HoldsResourcesWhileInFlight)
 {
     if (!ready()) throw SkipTestException("no Triton backend");
@@ -775,8 +754,7 @@ TEST(Triton_CvtColor, ResolvesAndRefusesBeforeOutputAllocation)
 // a code missing from coeffs_for's lists fails here rather than as a numeric mismatch somewhere
 // in a 640x480 image. It also pins the coefficient layout the kernel indexes by: slot order is
 // (BLUE-side, green, RED-side), so a BGR code's slot 0 must be the BLUE coefficient and an RGB
-// code's slot 0 the RED one -- the exact confusion that produced a wrong matrix on the first
-// attempt at this family.
+// code's slot 0 the RED one.
 TEST(Triton_CvtColor, CoefficientRowsMatchTheConstructor)
 {
     for (const kf_cvtcolor::CodeSpec& spec : kf_cvtcolor::all())
@@ -806,9 +784,7 @@ TEST(Triton_CvtColor, CoefficientRowsMatchTheConstructor)
         EXPECT_EQ(4096, lab->k[3 * r] + lab->k[3 * r + 1] + lab->k[3 * r + 2])
             << "RGB2Lab_b row " << r << " must sum to 1 << lab_shift";
     // The reverse matrices are in DESTINATION-SLOT order, so the BGR and RGB variants of one
-    // family carry the same rows in the opposite order. Those exact row orders were established
-    // by probe-lab/final_layout.cpp, which searches every plausible arrangement and reports the
-    // mismatch count against this build's cv::cvtColor -- the winner is 0, the others are 16k+.
+    // family carry the same rows in the opposite order; the checks below pin that ordering.
     const kf_cvtcolor::CodeSpec* labr = kf_cvtcolor::find(COLOR_Lab2BGR);
     ASSERT_TRUE(labr != nullptr);
     EXPECT_EQ(217, labr->k[0]);      // row 2 of the untransposed matrix: B from the lab triple

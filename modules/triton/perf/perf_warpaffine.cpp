@@ -11,12 +11,9 @@
 // implementations, NOT a claim about the CPU result -- the module matches the CPU, cv::cuda does
 // not (see doc/warpaffine.markdown).
 //
-// What a ratio does and does not mean at these sizes. The submission floor measured on this
-// class of card is tens of microseconds; a warp of a 720p image finishes well under it, so the
-// small-image rows are there to show the floor being hit, not to rank the implementations. The
-// 1080p and 4K rows are the ones where device work dominates. This is also why the module's own
-// banked measurement used graph replay and reported intervals: an event-timed loop at the floor
-// measures submission, not the kernel.
+// This perf cycle includes public submission and stream completion. Small workloads may
+// be dominated by host submission; these rows must not be reported as pure device timing.
+// Device/graph measurements require their own explicit timing method and workload evidence.
 //
 // Compile and first-load costs are excluded by warming up before the measured cycle, and the
 // destination is preallocated so allocation is not in the timed region.
@@ -128,9 +125,7 @@ PERF_TEST_P(Sz_Interp_Border_Type, TritonWarpAffineAreaTransparent, testing::Com
 // The native implementation on the same card and harness. cudawarping is an OPTIONAL dependency
 // of perf/ only -- the module never uses it -- so a build without it omits this baseline.
 //
-// The bridge is not involved: this is cv::cuda::warpAffine called directly, with the source the
-// harness built. It is the same call the module's own baseline used, minus the pitch-staging
-// workaround that the lab bridge needed for a non-aligned tensor.
+// cv::cuda::warpAffine is called directly with the source prepared by this perf fixture.
 PERF_TEST_P(Sz_Interp_Dtype, NativeCudaWarpAffine_Reference, testing::Combine(
     testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
     testing::Values(0, 1, 2),

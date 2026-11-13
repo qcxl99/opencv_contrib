@@ -20,13 +20,12 @@ paths rather than copying another user's build cache):
 cmake -S /path/to/opencv -B /path/to/build -G Ninja \
   -DOPENCV_EXTRA_MODULES_PATH=/path/to/opencv_contrib/modules \
   -DCMAKE_INSTALL_PREFIX=/path/to/install -DBUILD_opencv_triton=ON \
-  -DBUILD_LIST=core,imgproc,triton,python3,ts \
+  -DBUILD_LIST=core,imgproc,triton,python3,python_bindings_generator,ts \
   -DTRITON_BACKEND=hip -DWITH_CUDA=OFF -DTRITON_ROCM_PATH=/opt/dtk \
   -DTRITON_PYTHON_EXECUTABLE=/path/to/python -DTRITON_PYTHONPATH=/path/to/flagtree \
   -DPYTHON3_EXECUTABLE=/path/to/python -DBUILD_TESTS=ON \
   -DBUILD_PERF_TESTS=ON -DBUILD_EXAMPLES=ON
-cmake --build /path/to/build --target opencv_triton opencv_test_triton \
-  opencv_perf_triton opencv_test_triton_hip example_triton_device opencv_python3
+cmake --build /path/to/build --parallel 4
 cmake --install /path/to/build
 ```
 
@@ -69,6 +68,8 @@ Retain source/resource/binary hashes, actual commands, device occupancy and raw
 samples. Host issue, HIP event span, graph replay, process startup and working
 set measurements have different boundaries. A profiler trace is scoped to its
 observed workload. Paired GPUfusion baseline qualification requires a verified
-native HIP adapter and source/library isolation; the CUDA-only lab bridge must
+native HIP adapter and source/library isolation; a CUDA-only comparison adapter must
 not be relabeled as a HIP implementation. No H20 acceptance follows from these
 checks. See maintenance.markdown and the module README for current scope.
+
+See @ref tutorial_triton_validation for CPU/source and module-off checks.

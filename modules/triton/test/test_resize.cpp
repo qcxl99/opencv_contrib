@@ -3,7 +3,7 @@
 // of this distribution and at http://opencv.org/license.html.
 
 // cv::triton::resize through its real public entry (GpuMat + C++ launcher + binaries from the
-// runtime JIT) against the portable CPU oracle: the P1 routes copy, nearest, linear, area_fast x
+// runtime JIT) against the portable CPU oracle: copy, nearest, linear, cubic and AREA routes x
 // CV_8U/CV_32F x C1/C3/C4 x whole images and ROI views, with output reuse and guard bands. The
 // reference is deliberately not this build's cv::resize, whose result depends on the build, and
 // not cv::cuda::resize, which computes something else.

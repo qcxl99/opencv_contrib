@@ -5,7 +5,7 @@
 // cv::triton::warpAffine through its real public entry (GpuMat + C++ planner + binaries from
 // the runtime JIT) against this build's own cv::warpAffine.
 //
-// Contract warpaffine/0.4.3 selects this linked CPU build's padded VECTOR path
+// The selected reference uses this linked CPU build's padded VECTOR path
 // for NEAREST/LINEAR/AREA and its natural-width call for CUBIC. These are named
 // reference routes, not a portable oracle or a promise about arbitrary CPU
 // builds/natural destination widths. Fused versus separate arithmetic is
@@ -77,21 +77,12 @@ static Mat gpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int bord
  * pixel. On this build, M=[[1,1.9,-20],[0.4,1,-10]] over a 37x53 source, pixel (14,37):
  * destination width 40 -> 193, widths 48/64/128 -> 65.
  *
- * Reproducing that would mean reproducing which columns fall in the tail, i.e. depending on the
- * destination width in a way no implementation should. The contract (warpaffine/0.4.3,
- * semantics.reference_path) therefore defines the reference as the vector path: evaluate at a
- * destination width rounded up to a multiple of 128, then crop. Verified stable -- padding by
- * 128 and by 256 give identical crops -- so it is a pure function of the inputs. The module
- * matches it exactly. A natural-width call differs on critical columns by the value of an
- * ADJACENT SOURCE PIXEL under NEAREST -- unrelated to this one, measured up to 239 levels, not
- * bounded by any tolerance stated here -- and by at most 1 level under LINEAR.
- *
- * INTER_CUBIC is the exception, and it is measured rather than assumed: it does not go through
- * this invoker family at all (cv::warpAffine routes it to genericWarp -> bicubicVec), and that
- * path computes each column's coordinate from the absolute destination x with no fma, so it has
- * no body/tail split. Over 80 seeds x 4 widths, 0 of 320 (seed, width) pairs differ for CV_8U,
- * CV_16U and CV_32F. Padding it would therefore change nothing, and applying the rule would
- * hide the fact that this path has no width dependence. CpuCubicIsWidthInvariant pins that.
+ * The reference helper pads/crops NN/LINEAR/AREA to select the linked build's vector
+ * path. This removes the identified body/tail boundary from compared columns but is not
+ * a cross-ISA guarantee. NEAREST may select an adjacent source pixel at ties, so bounds
+ * against this reference do not imply a small difference from natural-width CPU calls.
+ * CUBIC uses its separate genericWarp/bicubic path at natural width; the width-invariance
+ * control checks that behavior on the actual linked CPU build.
  */
 static Mat cpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int border,
                    const Scalar& bv = Scalar())
@@ -155,7 +146,7 @@ static double spacing_at(float v)
     return sp > 0 ? sp : double(std::numeric_limits<float>::denorm_min());
 }
 
-/** Compare under contract warpaffine/0.4.3: CV_8U exact, CV_16U at most 1 LSB, CV_32F
+/** Compare against the selected reference: CV_8U exact, CV_16U at most 1 LSB, CV_32F
  *  min(5e-5*max(|ref|,1), 1e-4). */
 static ::testing::AssertionResult meetsWarpContract(const Mat& got, const Mat& ref_,
                                                     WarpStats* stats = nullptr)
@@ -364,8 +355,7 @@ TEST(Triton_WarpAffine, CpuCubicIsWidthInvariant)
         }
     EXPECT_EQ(0, differing)
         << "INTER_CUBIC differed across destination widths (worst " << worst
-        << "); the contract states 0 of 320 pairs and makes the natural-width call the CUBIC "
-           "reference, so this needs the reference rule revisited";
+        << "); the selected natural-width CUBIC reference needs revalidation on this build";
 }
 
 // CUBIC through the module against the natural-width CPU call, at widths that are NOT
@@ -446,7 +436,7 @@ TEST(Triton_WarpAffine, RecordsAccuracy)
                     (depth == CV_8U ? cu : (depth == CV_16U ? cu16 : cf)).merge(st);
                 }
     std::cout << cv::format(
-        "contract warpaffine/0.4.3, kernel vs the selected reference "
+        "kernel vs the selected reference "
         "(vector path for NEAREST/LINEAR, natural width for CUBIC):\n"
         "  CV_8U  elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
         "  CV_16U elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"

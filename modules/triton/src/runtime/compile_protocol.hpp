@@ -1,7 +1,11 @@
-// Compile protocol, C++ side (BACKLOG B4). Destination: opencv_contrib modules/triton/src/runtime/.
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
+// Private C++ compile protocol for the module runtime.
 //
 // The runtime never embeds Python. On a cache miss it writes a structured request, runs the
-// Torch-free compile helper (operators/resize/cpp/compile_helper.py) as a separate process
+// Torch-free compile helper (tools/compile_helper.py) as a separate process
 // under a deadline, and accepts only an artifact it can verify itself:
 //
 //   request  {protocol, key{kernel, signature, constexprs, num_warps, num_stages, target,
@@ -10,8 +14,8 @@
 //             message}, artifact_dir, manifest_sha256}
 //   artifact <cache_dir>/<key_digest>/{manifest.json, kernel.cubin | kernel.hsaco}
 //
-// key_text is KernelKey::text() (B3) and key_digest = sha256(key_text): the cache entry, the
-// manifest and the B3 key name one another. An entry is valid only if its manifest parses,
+// key_text is KernelKey::text() and key_digest = sha256(key_text): the cache entry, the
+// manifest and the compile key name one another. An entry is valid only if its manifest parses,
 // names this protocol and this key, and the binary matches the manifest's hash; anything
 // else (a half-published directory, a corrupted file) is a miss, never a hit.
 #pragma once
@@ -82,7 +86,7 @@ struct CompileOutcome {
 CompileOutcome compile_key(const HelperCommand& cmd, const KernelKey& key, const std::string& source_path,
                            const std::string& cache_dir);
 
-// The same for a request already serialised (B5 builds it with make_request; tests send
+// The same for a request already serialised (the runtime builds it with make_request; tests send
 // tampered ones).
 CompileOutcome run_request(const HelperCommand& cmd, const std::string& request);
 

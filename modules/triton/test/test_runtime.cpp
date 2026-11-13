@@ -436,9 +436,7 @@ TEST(Triton_Runtime, ArtifactIntegrity)
 //           -> replay twice with DIFFERENT inputs and check both answers
 //           -> destroy the graph -> release the pins -> confirm the resources are freed
 //
-// The output is also polluted between replays. An earlier version warmed with the correct answer
-// already in dst and then replayed the same input, so an empty graph -- or one that never ran --
-// would still have compared equal. Changing the input and overwriting dst removes that.
+// Change inputs and overwrite dst between replays so an empty/nonexecuting graph fails.
 // The public entry, not the internal one. A module user has no access to
 // detail::releaseCapturePins(), so the pin must be releasable through cv::triton:: with the
 // same effect; otherwise the header would promise graph support while leaving the resources

@@ -1,3 +1,7 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
 // Pure parts of the provider protocol: request normalisation and validation, the explicit
 // compile key, launch geometry. No device access. See provider.hpp.
 #include "provider.hpp"
@@ -89,7 +93,7 @@ const char* tname(ElemType t)
          : (t == ElemType::U16 ? "u16" : (t == ElemType::S16 ? "i16" : "fp32"));
 }
 
-// The runtime-argument lists of the four jit functions in operators/resize/kernel.py,
+// The runtime-argument lists of the four JIT functions in kernels/resize_cpu.py,
 // in Triton's type strings. Constexpr parameters are not runtime arguments. Every
 // integer is i32 (normalize() keeps them in range), so Triton's value-dependent
 // i32/i64 typing never applies. tests/test_provider_protocol.py checks these strings

@@ -13,10 +13,8 @@
 // Compile and first-load costs are excluded by warming up before the measured cycle, and the
 // destination is preallocated so allocation is not in the timed region.
 //
-// One caveat on what a ratio means at these sizes: the submission floor measured on this
-// class of card is ~35 us. A conversion that finishes well under that is measured as
-// submission-limited, not as the kernel's cost, so the small-image rows are there to show the
-// floor being hit rather than to rank the implementations.
+// Small workloads can be dominated by host submission. These synchronized-call
+// timings must not be reported as pure device execution or graph-replay timings.
 
 #include "perf_precomp.hpp"
 #include "../validation/cvtcolor_cases.hpp"

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compile helper for the resize module's runtime JIT (BACKLOG B4, protocol kf-resize-compile/1).
+# This file is part of OpenCV project.
+# It is subject to the license terms in the LICENSE file found in the top-level directory
+# of this distribution and at http://opencv.org/license.html.
+
+"""Compile helper for the module runtime JIT (protocol kf-resize-compile/1).
 
 The module never embeds Python. On a cache miss its C++ runtime (compile_protocol.cpp) runs
 this file as a separate process:
@@ -25,7 +29,7 @@ Publication is crash-safe:
 So a reader that only trusts <cache>/<digest> with a verifying manifest never sees a half
 artifact.
 
-KF_COMPILE_HELPER_TEST_FAULT is a TEST-ONLY hook (tests/test_compile_protocol.py):
+KF_COMPILE_HELPER_TEST_FAULT is a TEST-ONLY fault-injection hook:
   hang, slow (sleep after taking the lock), crash_mid_publish (exit 3 after the binary,
   before the manifest), kill_before_rename (SIGKILL after the manifest, before the rename).
 """

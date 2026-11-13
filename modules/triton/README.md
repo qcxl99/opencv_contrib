@@ -90,7 +90,7 @@ retain their exact comparisons.
 
 ### `cv::triton::warpAffine`
 
-Contract `warpaffine/0.4.3`: `CV_8U`, `CV_16U` and `CV_32F`; 1/3/4 channels; `INTER_NEAREST`, `INTER_LINEAR`
+Supported: `CV_8U`, `CV_16U` and `CV_32F`; 1/3/4 channels; `INTER_NEAREST`, `INTER_LINEAR`
 and `INTER_CUBIC`; `INTER_AREA` aliases `INTER_LINEAR`. The five standard border
 modes and `BORDER_TRANSPARENT` for NEAREST/LINEAR/AREA are supported, with
 `WARP_INVERSE_MAP` both ways.
@@ -130,17 +130,13 @@ build can depend on destination width: its SIMD body evaluates a column's coordi
 `v_fma(M0, x, (float)(y*M1 + M2))` (fused only on the selected FMA path) and its scalar tail as `x*M0 + y*M1 + M2`,
 one ulp apart, and the tail's length depends on the destination width. Two
 destination widths therefore disagree on the region they share — under
-`INTER_NEAREST` by an adjacent pixel's value (measured up to 239 of 255 for
-`CV_8U`), under `INTER_LINEAR` by at most one level in the measured range.
-`CV_16U` behaves the same way. This module computes the vector-path result, so
-it matches a natural-width CPU call except at those isolated pixels.
+`INTER_NEAREST` by an adjacent source pixel's value, with no small-error guarantee.
+The stated bounds apply to the selected reference, not all natural-width CPU calls.
+The padded reference is tied to the linked CPU build and is not a cross-ISA guarantee.
 
-`INTER_CUBIC` is the exception, and it is measured rather than assumed:
-`cv::warpAffine` routes it through `genericWarp` → `bicubicVec`, which evaluates
-a column's coordinate as `M_x + M(0,0)*x` from the **absolute** x with no fma,
-so there is no body/tail split. Over 80 seeds × 4 widths, 0 of 320 (seed, width)
-pairs differ for `CV_8U`, `CV_16U` and `CV_32F`; its reference is therefore the
-natural-width call.
+`INTER_CUBIC` uses the separate `genericWarp` → `bicubicVec` path and a natural-width
+CPU reference. Its absolute-column coordinate expression differs from the invoker
+above; the module tests check width invariance on the linked build.
 
 The runtime calibrates fused versus split operations against the linked CPU reference
 at rounding-sensitive coordinates; the result participates in the compile key.
@@ -291,6 +287,9 @@ built by `-DBUILD_EXAMPLES=ON` and need a Triton backend at run time:
 ```
 
 ## Further reading
+
+- [Contribution validation](doc/validation.markdown) — explicit CPU-only source/protocol checks,
+  module-off and enabled build matrix, and hardware/installation evidence boundaries.
 
 - [Module maintenance](doc/maintenance.markdown) — source ownership, local generation,
   shared validation and evidence boundaries

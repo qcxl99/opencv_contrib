@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# This file is part of OpenCV project.
+# It is subject to the license terms in the LICENSE file found in the top-level directory
+# of this distribution and at http://opencv.org/license.html.
+
 """Derive src/runtime/hip_runtime.cpp from src/runtime/cuda_runtime.cpp.
 
     port_hip_runtime.py            write src/runtime/hip_runtime.cpp
@@ -27,7 +31,7 @@ def sub(old, new, count=None):
     out = out.replace(old, new)
 
 # ---- 1. header: what this file is, and why it differs ----------------------------------
-sub('// Runtime JIT, CUDA driver side (P1). See runtime.hpp for the contract.\n',
+sub('// Runtime JIT, CUDA driver side. See runtime.hpp for the contract.\n',
 '''// Runtime JIT, HIP driver side (Hygon BW1000 / gfx936, DTK). See runtime.hpp for the contract.
 //
 // GENERATED from cuda_runtime.cpp by tools/port_hip_runtime.py -- do not edit; edit the CUDA
@@ -39,7 +43,7 @@ sub('// Runtime JIT, CUDA driver side (P1). See runtime.hpp for the contract.\n'
 //     refused); warp_size from the device (64 on gfx936, not 32).
 //   * Kernels: kernels/<op>_cpu_hip.py where the CUDA source calls a libdevice primitive
 //     flagtree's hip build lacks (resize, warpAffine; tools/make_kernels_cpu_hip.py derives
-//     them and refuses a stale copy); cvtColor's kernels call none and are used as written.
+//     them and refuses a stale copy); cvtColor also uses the derived source for explicit rounded float operations.
 //   * Binary: manifest format "hsaco", loaded with hipModuleLoadData.
 //   * Compile helper environment: ROCM_PATH is forwarded (the hip compiler finds clang and its
 //     device libraries through it), and the GPU is hidden from the helper with the HIP and ROCR

@@ -12,6 +12,7 @@
 #include "opencv2/core/cuda_stream_accessor.hpp"
 #include "opencv2/triton.hpp"
 #include "../validation/reference.hpp"
+#include "../validation/guards.hpp"
 #include "../src/runtime/reference_cpu.hpp"
 #include "../src/runtime/runtime.hpp"
 
@@ -46,20 +47,8 @@ inline bool guardsIntact(const cuda::GpuMat& parent, Rect r, double guard)
 {
     Mat m;
     parent.download(m);
-    const int cn = m.channels();
-    for (int y = 0; y < m.rows; ++y)
-        for (int x = 0; x < m.cols; ++x)
-        {
-            if (r.contains(Point(x, y)))
-                continue;
-            for (int c = 0; c < cn; ++c)
-            {
-                const double v = m.depth() == CV_8U ? double(m.ptr<uchar>(y)[x * cn + c]) : double(m.ptr<float>(y)[x * cn + c]);
-                if (v != guard)
-                    return false;
-            }
-        }
-    return true;
+    const Mat expected(m.size(), m.type(), Scalar::all(guard));
+    return guardsEqual(expected, m, r);
 }
 
 }}  // namespace opencv_test::triton_test

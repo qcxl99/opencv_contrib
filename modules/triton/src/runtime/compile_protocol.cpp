@@ -1,3 +1,7 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
 // Compile protocol, C++ side. See compile_protocol.hpp. POSIX only (fork/exec, flock is on
 // the helper's side); the module's Windows story is out of scope until a Windows backend exists.
 #include "compile_protocol.hpp"
@@ -393,7 +397,7 @@ bool verify_artifact(const std::string& dir, const std::string& expected_key_tex
 }
 
 bool compiler_abi_validated(const std::string& compiler, const std::string& format) {
-    // Extend only after checking the new compiler's entry parameters (tests/test_compile_protocol.py).
+    // Extend only after checking the new compiler's entry parameters against the compiled entry metadata.
     //   cubin: the PTX .entry parameters of upstream triton 3.6.0.
     //   hsaco: the AMDHSA kernel-argument metadata of flagtree's triton on gfx936, read by
     //          compile_helper.py's hip_abi(). flagtree reports the same version string "3.6.0",
@@ -588,7 +592,7 @@ int put(const std::string& s, char* out, int len) {
 }
 }  // namespace
 
-// The request for the key of one resize call (B3 normalize + launch_shape), with an explicit
+// The request for the key of one resize call (normalize + launch_shape), with an explicit
 // launch config, compiler identity and target. Returns its length, 0 for the copy route, -1 on error.
 //
 // The target is a parameter, not a default: a key names which backend the binary is for, and a

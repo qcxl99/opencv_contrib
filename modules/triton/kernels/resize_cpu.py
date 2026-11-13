@@ -2,14 +2,9 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# CPU-aligned resize kernels (contract resize/0.15.0) for the runtime JIT of modules/triton.
-# GENERATED, do not edit: exported from kernelforge-lab by tools/export_module_kernels.py.
-#   lab file:    operators/resize/kernel.py
-#   lab sha256:  1f789d6e459f2df7434d9a850d6814c4b6705385911c6edf2b767b137ecebe70
-#   functions:   _cpu_tile, _resize_cpu_nearest_kernel, _cpu_hlin, _cpu_hcub, _cpu_row, _cpu_tap, _resize_cpu_sep_kernel, _cpu_f32_tap, _cpu_f32_tapv, _cpu_f32_window_v, _cpu_step, _cpu_f32_window, _resize_cpu_area_fast_kernel, _resize_cpu_area_kernel
-# The runtime compiles these through tools/compile_helper.py; the compile key carries this
-# file's own sha256, so editing it here only changes which binaries are built, never which
-# binaries are trusted.
+# CPU-aligned resize kernels for the module runtime JIT.
+# Maintenance and numerical references are documented in doc/maintenance.markdown.
+# This installed source is self-contained; its content hash is part of the compile key.
 
 import triton
 import triton.language as tl
@@ -22,9 +17,7 @@ def _cpu_tile(dst_h, W, cn: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.con
 
     Every per-pixel quantity (offset/weight tables, clamped tap columns, window
     origin) is computed once per pixel and reused across the static channel loop;
-    the element-major layout this replaced recomputed it per channel value. The
-    kernels are issue-bound (ncu: 84% SM, 1.4% DRAM on LINEAR C3 up2), so the
-    per-element instruction count is the cost (runs/a1-perf-0002).
+    sharing these quantities avoids repeating address work for each channel.
     """
     rows = tl.program_id(0) * BLOCK_H + tl.arange(0, BLOCK_H)[:, None]
     px = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)[None, :]
@@ -32,12 +25,12 @@ def _cpu_tile(dst_h, W, cn: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.con
     return rows, px, rows < dst_h, px < dst_w, dst_w
 
 
-# Specialisation policy (A2/B2, runs/spec-a2-0001): the compile key is explicit. The
+# Specialisation policy: the compile key is explicit. The
 # channel count is a constexpr (`cn: tl.constexpr`), and every other runtime argument,
 # pointers included, is do_not_specialize, so Triton adds no implicit ==1 / %16 /
 # 16-byte-alignment keys. A C++ runtime can compute this key; it cannot portably
 # reproduce Triton's implicit one. Runtime-argument lists are unchanged by the
-# pixel-major layout (runs/a1-perf-0002); only the grid's second axis now counts
+# pixel-major layout; the grid's second axis counts
 # pixels instead of channel values.
 # Row-sliding kernels (nearest, separable): one program owns BLOCK_W consecutive output
 # elements (channel values, element-major) over BLOCK_H consecutive output rows and
@@ -45,7 +38,7 @@ def _cpu_tile(dst_h, W, cn: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.con
 # when it repeats or advances by one the horizontal results already in registers are
 # reused or shifted instead of reloaded and recomputed -- OpenCV's CPU resize keeps
 # the same ring of horizontally resized rows. Each output value is computed from the
-# same terms in the same order, so the output is unchanged (runs/a1-perf-0002).
+# same terms in the same order.
 @triton.jit(do_not_specialize=['src', 'dst', 'xofs', 'yofs', 'dst_h', 'W', 'src_rs', 'dst_rs', 'src_bs', 'dst_bs'])
 def _resize_cpu_nearest_kernel(src, dst, xofs, yofs, dst_h, W, cn: tl.constexpr,
                         src_rs, dst_rs, src_bs, dst_bs,
@@ -510,8 +503,7 @@ def _resize_cpu_area_kernel(src, dst, xs, xa, xc, ys, ya, yc, KX, KY,
         h1 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
         h2 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
         h3 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
-        # Unrolled x2, not x4: x4 left outliers up to 1.19x on short tap lists
-        # (runs/a1-area-c3-0001).
+        # Two-way unrolling exposes independent loads while limiting work on short tap lists.
         for kx in tl.range(0, KX, loop_unroll_factor=2):
             xlive = kx < xcnt
             a = tl.where(kx == 0, a_first, tl.where(kx == last, a_last, a_mid))
