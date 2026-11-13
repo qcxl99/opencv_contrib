@@ -13,6 +13,7 @@
 #include "runtime/cvtcolor.hpp"
 #include "runtime/warpaffine.hpp"
 #include "runtime/runtime.hpp"
+#include "entry.hpp"
 
 namespace cv { namespace triton {
 
@@ -38,42 +39,6 @@ kf_resize_rt::DeviceView toDeviceView(const ImageView& v, int device, std::uintp
     return d;
 }
 
-static void raiseCvt(const kf_resize_rt::Status& s)
-{
-    using kf_resize_rt::Reason;
-    const std::string what = cv::format("cv::triton::cvtColor: %s (%s)", s.message.c_str(),
-                                        kf_resize_rt::reason_name(s.reason));
-    if (s.code == kf_resize_rt::Code::Unsupported)
-    {
-        switch (s.reason)
-        {
-        case Reason::DepthOrChannels: case Reason::Interpolation: case Reason::TypeMismatch:
-        case Reason::RouteNotEnabled:
-            CV_Error(Error::StsUnsupportedFormat, what);
-        default:
-            CV_Error(Error::StsBadArg, what);
-        }
-    }
-    CV_Error(Error::StsError, what + (s.submitted ? " -- work had already been submitted; dst is undefined" : ""));
-}
-
-static void raise(const kf_resize_rt::Status& s)
-{
-    using kf_resize_rt::Reason;
-    const std::string what = cv::format("cv::triton::resize: %s (%s)", s.message.c_str(), kf_resize_rt::reason_name(s.reason));
-    if (s.code == kf_resize_rt::Code::Unsupported)
-    {
-        switch (s.reason)
-        {
-        case Reason::DepthOrChannels: case Reason::Interpolation: case Reason::TypeMismatch: case Reason::RouteNotEnabled:
-            CV_Error(Error::StsUnsupportedFormat, what);
-        default:
-            CV_Error(Error::StsBadArg, what);
-        }
-    }
-    CV_Error(Error::StsError, what + (s.submitted ? " -- work had already been submitted; dst is undefined" : ""));
-}
-
 void resizeDevice(const kf_resize_rt::DeviceView& src, const kf_resize_rt::DeviceView& dst, Size dsize,
                   double fx, double fy, int interpolation, int device, std::uintptr_t stream)
 {
@@ -86,52 +51,33 @@ void resizeDevice(const kf_resize_rt::DeviceView& src, const kf_resize_rt::Devic
     req.fy = fy;
     req.interpolation = interpolation;
     kf_resize_rt::ExecContext ex;
+    ex.ctx = req.src.ctx;
     ex.ctx.device = device;
     ex.stream = stream;
     const kf_resize_rt::Status s = runtime::resize(req, ex);
-    if (s.code != kf_resize_rt::Code::Submitted)
-        raise(s);
+    requireStatus(s, "resize", true);
     // Asynchronous: everything is on `stream`. No implicit synchronisation.
-}
-
-static void raiseWarp(const kf_resize_rt::Status& s)
-{
-    using kf_resize_rt::Reason;
-    const std::string what = cv::format("cv::triton::warpAffine: %s (%s)", s.message.c_str(),
-                                        kf_resize_rt::reason_name(s.reason));
-    if (s.code == kf_resize_rt::Code::Unsupported)
-    {
-        switch (s.reason)
-        {
-        case Reason::DepthOrChannels: case Reason::Interpolation: case Reason::TypeMismatch:
-        case Reason::RouteNotEnabled:
-            CV_Error(Error::StsUnsupportedFormat, what);
-        default:
-            CV_Error(Error::StsBadArg, what);
-        }
-    }
-    CV_Error(Error::StsError, what + (s.submitted ? " -- work had already been submitted; dst is undefined" : ""));
 }
 
 void warpAffineDevice(const kf_warpaffine::Request& req, int device, std::uintptr_t stream)
 {
     kf_resize_rt::ExecContext ex;
+    ex.ctx = req.src.ctx;
     ex.ctx.device = device;
     ex.stream = stream;
     const kf_resize_rt::Status s = runtime::warpAffine(req, ex);
-    if (s.code != kf_resize_rt::Code::Submitted)
-        raiseWarp(s);
+    requireStatus(s, "warpAffine", true);
     // Asynchronous: same contract as resizeDevice().
 }
 
 void cvtColorDevice(const kf_cvtcolor::Request& req, int device, std::uintptr_t stream)
 {
     kf_resize_rt::ExecContext ex;
+    ex.ctx = req.src.ctx;
     ex.ctx.device = device;
     ex.stream = stream;
     const kf_resize_rt::Status s = runtime::cvtColor(req, ex);
-    if (s.code != kf_resize_rt::Code::Submitted)
-        raiseCvt(s);
+    requireStatus(s, "cvtColor", true);
     // Asynchronous: same contract as resizeDevice().
 }
 

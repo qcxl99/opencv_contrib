@@ -126,9 +126,24 @@ void invert(const double M[6], double out[6])
     out[5] = -out[3] * M[2] - out[4] * M[5];
 }
 
-Status normalize(const Request& req, Normalized& out)
+// Matrix rules shared by pre-allocation admission and the final planner.
+static Status sampling_matrix(const Request& req, double out[6])
 {
-    const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
+    for (int i = 0; i < 6; ++i)
+        if (!std::isfinite(req.M[i]))
+            return unsupported(Reason::IndexRange, "matrix entries must be finite");
+    if (req.inverse_map) std::copy(req.M, req.M + 6, out);
+    else invert(req.M, out);
+    for (int i = 0; i < 6; ++i)
+        if (!std::isfinite(out[i]) ||
+            std::abs(out[i]) > static_cast<double>(std::numeric_limits<float>::max()))
+            return unsupported(Reason::IndexRange, "sampling matrix exceeds finite float32 range");
+    return prepared();
+}
+
+Status validate_source(const Request& req)
+{
+    const kf_resize_rt::DeviceView& s = req.src;
 
     // OpenCV's warpAffine rewrites AREA to LINEAR before selecting its kernel.
     const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
@@ -151,14 +166,27 @@ Status normalize(const Request& req, Normalized& out)
         return unsupported(Reason::Interpolation,
                            "cv::triton::warpAffine: border mode " + std::to_string(req.border_mode) +
                                " is not one of CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT");
-    if (s.type != d.type || s.channels != d.channels)
-        return unsupported(Reason::TypeMismatch, "src and dst must have the same depth and channel count");
     if (s.type != kf_resize_rt::ElemType::U8 && s.type != kf_resize_rt::ElemType::U16 &&
         s.type != kf_resize_rt::ElemType::F32)
         return unsupported(Reason::DepthOrChannels,
                            "cv::triton::warpAffine: CV_8U, CV_16U and CV_32F only");
     if (s.channels != 1 && s.channels != 3 && s.channels != 4)
         return unsupported(Reason::DepthOrChannels, "channels must be 1, 3 or 4");
+    for (int i = 0; i < 4; ++i)
+        if (!std::isfinite(req.border[i]))
+            return unsupported(Reason::IndexRange, "border components must be finite");
+    double matrix[6];
+    return sampling_matrix(req, matrix);
+}
+
+Status normalize(const Request& req, Normalized& out)
+{
+    const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
+    const Status admitted = validate_source(req);
+    if (!admitted.ok()) return admitted;
+    const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
+    if (s.type != d.type || s.channels != d.channels)
+        return unsupported(Reason::TypeMismatch, "src and dst must have the same depth and channel count");
     if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
     Status valid = kf_resize_rt::validate_view(s, "src");
     if (!valid.ok()) return valid;
@@ -175,10 +203,8 @@ Status normalize(const Request& req, Normalized& out)
     out.dst_h = d.rows;
     out.dst_w = d.cols;
     out.channels = s.channels;
-    if (req.inverse_map)
-        std::copy(req.M, req.M + 6, out.A);
-    else
-        invert(req.M, out.A);
+    const Status matrix = sampling_matrix(req, out.A);
+    if (!matrix.ok()) return matrix;
 
     out.border_mode_code = req.border_mode;
     out.border_x = req.border_mode;
@@ -189,14 +215,7 @@ Status normalize(const Request& req, Normalized& out)
         if (out.src_w <= 1) out.border_x = 1;
         if (out.src_h <= 1) out.border_y = 1;
     }
-    for (int i = 0; i < 6; ++i)
-        if (!std::isfinite(req.M[i])) return unsupported(Reason::IndexRange,"matrix entries must be finite");
-    for (int i = 0; i < 6; ++i)
-        if (!std::isfinite(out.A[i]) ||
-            std::abs(out.A[i]) > static_cast<double>(std::numeric_limits<float>::max()))
-            return unsupported(Reason::IndexRange,"sampling matrix exceeds finite float32 range");
     for (int i = 0; i < 4; ++i) {
-        if (!std::isfinite(req.border[i])) return unsupported(Reason::IndexRange,"border components must be finite");
         out.border[i] = (out.u8 || out.u16) ?
             std::max(0.0,std::min(out.u8 ? 255.0 : 65535.0,std::nearbyint(req.border[i]))) : req.border[i];
     }

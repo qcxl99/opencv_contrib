@@ -309,12 +309,11 @@ const std::vector<CodeSpec>& all() {
     return table();
 }
 
-Status normalize(const Request& req, Normalized& out) {
-    const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
-    const CodeSpec* spec = find(req.code);
+Status resolve_output(const kf_resize_rt::DeviceView& s, int code, Output& out) {
+    const CodeSpec* spec = find(code);
     if (!spec)
         return unsupported(Reason::Interpolation,
-                           "cvtColor code " + std::to_string(req.code) +
+                           "cvtColor code " + std::to_string(code) +
                                " is not served by this module: see cvtcolor.hpp for the "
                                "supported set and depth-specific numeric criteria");
     // Depth. CV_8U is the rule for the table; CV_16U is additionally served by the families whose
@@ -341,13 +340,13 @@ Status normalize(const Request& req, Normalized& out) {
     //
     // src and dst must agree: the CPU creates dst at src's depth (`CV_MAKE_TYPE(depth, dcn)`)
     // and has no mixed-depth path.
-    const bool u8 = s.type == kf_resize_rt::ElemType::U8 && d.type == kf_resize_rt::ElemType::U8;
-    const bool u16 = s.type == kf_resize_rt::ElemType::U16 && d.type == kf_resize_rt::ElemType::U16;
+    const bool u8 = s.type == kf_resize_rt::ElemType::U8;
+    const bool u16 = s.type == kf_resize_rt::ElemType::U16;
     const bool bayer = spec->op == Op::Bayer;
     const bool serves16U = bayer || spec->op == Op::Gray || spec->op == Op::Yuv ||
                            spec->op == Op::YCrCb ||
                            (spec->op == Op::Permute && spec->scn == 1);
-    const bool f32 = s.type == kf_resize_rt::ElemType::F32 && d.type == kf_resize_rt::ElemType::F32;
+    const bool f32 = s.type == kf_resize_rt::ElemType::F32;
     // CV_32F has TWO kinds of coverage, and they are not the same claim:
     //   * the bit-copy codes (channel permutes and gray -> colour), where the CPU writes each
     //     source float into a destination slot unchanged, so the module is bit-exact; and
@@ -372,10 +371,6 @@ Status normalize(const Request& req, Normalized& out) {
         return unsupported(Reason::DepthOrChannels,
                            std::string(spec->name) + " needs a " + std::to_string(spec->scn) +
                                "-channel source, got " + std::to_string(s.channels));
-    if (d.channels != spec->dcn)
-        return unsupported(Reason::DepthOrChannels,
-                           std::string(spec->name) + " writes " + std::to_string(spec->dcn) +
-                               " channels, dst has " + std::to_string(d.channels));
     if (spec->op == Op::Yuv422 && s.cols % 2 != 0)
         return unsupported(Reason::EmptyOrSize,
                            std::string(spec->name) + ": 4:2:2 conversion needs an even width");
@@ -393,15 +388,29 @@ Status normalize(const Request& req, Normalized& out) {
                                std::string(spec->name) + ": the 4:2:0 source must have an even "
                                "width and a height divisible by 3 (got " +
                                std::to_string(s.cols) + "x" + std::to_string(s.rows) + ")");
-        const int h = s.rows * 2 / 3;
-        if (d.rows != h || d.cols != s.cols)
-            return unsupported(Reason::EmptyOrSize,
-                               std::string(spec->name) + " writes " + std::to_string(s.cols) + "x" +
-                               std::to_string(h) + ", dst is " + std::to_string(d.cols) + "x" +
-                               std::to_string(d.rows));
     }
-    else if (s.rows != d.rows || s.cols != d.cols)
-        return unsupported(Reason::EmptyOrSize, "cvtColor does not change the image size");
+    out.spec = spec;
+    out.cols = s.cols;
+    out.rows = spec->op == Op::Yuv420 ? (s.rows / 3) * 2 : s.rows;
+    return prepared();
+}
+
+Status normalize(const Request& req, Normalized& out) {
+    const kf_resize_rt::DeviceView &s = req.src, &d = req.dst;
+    Output expected;
+    const Status resolved = resolve_output(s, req.code, expected);
+    if (!resolved.ok()) return resolved;
+    const CodeSpec* spec = expected.spec;
+    if (s.type != d.type)
+        return unsupported(Reason::DepthOrChannels, std::string(spec->name) +
+                           ": unsupported depth or mismatched src/dst depths for this conversion");
+    if (d.channels != spec->dcn)
+        return unsupported(Reason::DepthOrChannels, std::string(spec->name) + " writes " +
+                           std::to_string(spec->dcn) + " channels, dst has " + std::to_string(d.channels));
+    if (d.rows != expected.rows || d.cols != expected.cols)
+        return unsupported(Reason::EmptyOrSize, std::string(spec->name) + " writes " +
+                           std::to_string(expected.cols) + "x" + std::to_string(expected.rows) +
+                           ", dst is " + std::to_string(d.cols) + "x" + std::to_string(d.rows));
     if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
     for (const char* which : {"src", "dst"}) {
         const kf_resize_rt::DeviceView& v = which[0] == 's' ? s : d;
@@ -420,8 +429,8 @@ Status normalize(const Request& req, Normalized& out) {
     out.rows = d.rows;
     out.cols = d.cols;
     out.n = n;
-    out.u16 = u16;
-    out.f32 = f32;
+    out.u16 = s.type == kf_resize_rt::ElemType::U16;
+    out.f32 = s.type == kf_resize_rt::ElemType::F32;
     return prepared();
 }
 

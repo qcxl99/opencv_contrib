@@ -121,15 +121,40 @@ std::string signature(ref::Route r, ElemType t) {
 
 Status validate_view(const DeviceView& view, const char* name) { return check_view(view, name); }
 
-Status normalize(const ResizeRequest& req, Normalized& out) {
-    const DeviceView &s = req.src, &d = req.dst;
+Status resolve_output(const ResizeRequest& req, ref::Size2& out) {
+    const DeviceView& s = req.src;
     if (s.type != ElemType::U8 && s.type != ElemType::F32)
         return unsupported(Reason::DepthOrChannels, "resize serves U8 and F32 only");
     if (req.interpolation < ref::INTER_NEAREST || req.interpolation > ref::INTER_AREA)
         return unsupported(Reason::Interpolation, "interpolation must be NEAREST, LINEAR, CUBIC or AREA");
-    for (const DeviceView* v : {&s, &d})
-        if (v->channels != 1 && v->channels != 3 && v->channels != 4)
-            return unsupported(Reason::DepthOrChannels, "channels must be 1, 3 or 4");
+    if (s.channels != 1 && s.channels != 3 && s.channels != 4)
+        return unsupported(Reason::DepthOrChannels, "channels must be 1, 3 or 4");
+    if (s.rows <= 0 || s.cols <= 0)
+        return unsupported(Reason::EmptyOrSize, "src is empty");
+    // Validate scale-derived dimensions before the oracle's double-to-int conversion.
+    // Explicit dsize keeps cv::resize precedence, even if ignored fx/fy are nonfinite.
+    if (!(req.dsize_w > 0 && req.dsize_h > 0))
+    {
+        if (!std::isfinite(req.fx) || !std::isfinite(req.fy) || !(req.fx > 0 && req.fy > 0))
+            return unsupported(Reason::EmptyOrSize, "either dsize or both finite fx and fy (> 0) must be given");
+        const double width = s.cols * req.fx, height = s.rows * req.fy;
+        if (!std::isfinite(width) || !std::isfinite(height) || width > I32_MAX || height > I32_MAX)
+            return unsupported(Reason::IndexRange, "scale-derived size exceeds int32 dimensions");
+    }
+    try {
+        out = ref::resolve_size(s.rows, s.cols, req.dsize_w, req.dsize_h, req.fx, req.fy);
+    } catch (const std::invalid_argument& e) {
+        return unsupported(Reason::EmptyOrSize, e.what());
+    }
+    if (out.dst_h <= 0 || out.dst_w <= 0) return unsupported(Reason::EmptyOrSize, "resolved size is empty");
+    return prepared();
+}
+
+Status normalize(const ResizeRequest& req, Normalized& out) {
+    const DeviceView &s = req.src, &d = req.dst;
+    ref::Size2 z;
+    Status resolved = resolve_output(req, z);
+    if (!resolved.ok()) return resolved;
     if (s.type != d.type || s.channels != d.channels)
         return unsupported(Reason::TypeMismatch, "src and dst must have the same depth and channel count");
     if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
@@ -138,13 +163,6 @@ Status normalize(const ResizeRequest& req, Normalized& out) {
     st = check_view(d, "dst");
     if (!st.ok()) return st;
 
-    ref::Size2 z;
-    try {
-        z = ref::resolve_size(s.rows, s.cols, req.dsize_w, req.dsize_h, req.fx, req.fy);
-    } catch (const std::invalid_argument& e) {
-        return unsupported(Reason::EmptyOrSize, e.what());
-    }
-    if (z.dst_h <= 0 || z.dst_w <= 0) return unsupported(Reason::EmptyOrSize, "resolved size is empty");
     if (d.rows != z.dst_h || d.cols != z.dst_w)
         return unsupported(Reason::EmptyOrSize, "dst size differs from the resolved size");
     if (s.ptr < d.end() && d.ptr < s.end())

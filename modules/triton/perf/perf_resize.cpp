@@ -11,7 +11,7 @@
 
 namespace opencv_test { namespace {
 
-DEF_PARAM_TEST(Sz_Dsize_Cn_Interp, cv::Size, cv::Size, int, int, int);
+typedef ::perf::TestBaseWithParam<testing::tuple<cv::Size, cv::Size, int, int, int>> Sz_Dsize_Cn_Interp;
 
 PERF_TEST_P(Sz_Dsize_Cn_Interp, TritonResize, testing::Combine(
     testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
@@ -25,27 +25,29 @@ PERF_TEST_P(Sz_Dsize_Cn_Interp, TritonResize, testing::Combine(
     const int channels     = GET_PARAM(2);
     const int interp       = GET_PARAM(3);
 
-    if (!cv::triton::haveBackend())
+    if (!triton_validation::available())
         throw SkipTestException("no Triton backend available");
 
     cv::Mat host(srcSize, CV_MAKETYPE(GET_PARAM(4), channels));
     declare.in(host, WARMUP_RNG);
 
-    const cv::cuda::GpuMat src(host);
-    cv::cuda::GpuMat dst(dsize, src.type());   // preallocated: reusable, excluded
+    triton_validation::Image src; src.upload(host);
+    triton_validation::Stream stream(true);
+    triton_validation::Image dst(dsize, src.type());   // preallocated: reusable, excluded
 
     // Warm up compilation/module load and first-touch before measuring.
     for (int i = 0; i < 20; ++i)
-        cv::triton::resize(src, dst, dsize, 0, 0, interp);
-    cv::cuda::Stream::Null().waitForCompletion();
+        triton_validation::resize(src, dst, dsize, 0, 0, interp, stream);
+    stream.wait();
 
     TEST_CYCLE()
     {
-        cv::triton::resize(src, dst, dsize, 0, 0, interp);
-        cv::cuda::Stream::Null().waitForCompletion();
+        triton_validation::resize(src, dst, dsize, 0, 0, interp, stream);
+        stream.wait();
     }
 
-    CUDA_SANITY_CHECK(dst, 1e-10);
+    const cv::Mat result = dst.download();
+    SANITY_CHECK(result, 1e-10);
 }
 
 #ifdef OPENCV_TRITON_PERF_HAVE_CUDAWARPING

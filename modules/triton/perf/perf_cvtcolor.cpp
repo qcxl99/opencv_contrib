@@ -5,11 +5,9 @@
 // Steady-state timing of cv::triton::cvtColor through the runtime JIT, with the native CUDA
 // path as a same-card timing baseline.
 //
-// Unlike resize, the two sides here are the SAME computation: every code this module serves is
-// integer arithmetic on CV_8U, and cv::cuda::cvtColor uses the same fixed-point coefficients.
-// A ratio is therefore close to a like-for-like comparison -- the remaining difference is the
-// host-side path (this module's call into the JIT cache vs. cv::cuda's own dispatch), which is
-// exactly what a per-op benchmark should show.
+// The selected CV_8U conversions use CPU-aligned semantics. The optional cv::cuda baseline
+// is identified separately; its presence does not establish equality for every conversion.
+// Measurements below include public submission and stream completion, not pure device time.
 //
 // Compile and first-load costs are excluded by warming up before the measured cycle, and the
 // destination is preallocated so allocation is not in the timed region.
@@ -23,14 +21,11 @@
 
 namespace opencv_test { namespace {
 
-DEF_PARAM_TEST(Sz_Code, cv::Size, int);
+typedef ::perf::TestBaseWithParam<testing::tuple<cv::Size, int>> Sz_Code;
 
-// Seven codes, not all 22. These are the ones whose cost structure differs -- the arithmetic
-// codes (gray, the two chroma transforms, HSV) and the channel gathers -- so the table shows
-// the range of behaviour. The other 15 codes are the same kernels with different constants: a
-// BGRA2RGBA is not meaningfully slower or faster than BGR2RGBA, and RGB2GRAY is BGR2GRAY with a
-// different channel index. That is a reason for choosing these seven, not evidence about the
-// other fifteen: no performance number here covers a code that is not in kCodes.
+// Seven selected codes with distinct cost structures; this is not coverage of every
+// supported code/depth. All candidate paths use the same private validation adapter on
+// each backend; the optional native reference below is specifically CUDA.
 const int kCodes[] = {
     cv::COLOR_BGR2GRAY,
     cv::COLOR_BGRA2GRAY,
@@ -59,26 +54,28 @@ PERF_TEST_P(Sz_Code, TritonCvtColor, testing::Combine(
     const cv::Size size = GET_PARAM(0);
     const int code      = GET_PARAM(1);
 
-    if (!cv::triton::haveBackend())
+    if (!triton_validation::available())
         throw SkipTestException("no Triton backend available");
 
     cv::Mat host(size, CV_8UC(scnOf(code)));
     declare.in(host, WARMUP_RNG);
 
-    const cv::cuda::GpuMat src(host);
-    cv::cuda::GpuMat dst(size, CV_8UC(dcnOf(code)));   // preallocated: reusable, excluded
+    triton_validation::Image src; src.upload(host);
+    triton_validation::Stream stream(true);
+    triton_validation::Image dst(size, CV_8UC(dcnOf(code)));   // preallocated: reusable, excluded
 
     for (int i = 0; i < 20; ++i)
-        cv::triton::cvtColor(src, dst, code);
-    cv::cuda::Stream::Null().waitForCompletion();
+        triton_validation::cvtColor(src, dst, code, stream);
+    stream.wait();
 
     TEST_CYCLE()
     {
-        cv::triton::cvtColor(src, dst, code);
-        cv::cuda::Stream::Null().waitForCompletion();
+        triton_validation::cvtColor(src, dst, code, stream);
+        stream.wait();
     }
 
-    CUDA_SANITY_CHECK(dst, 1e-10);
+    const cv::Mat result = dst.download();
+    SANITY_CHECK(result, 1e-10);
 }
 
 #ifdef OPENCV_TRITON_PERF_HAVE_CUDAIMGPROC

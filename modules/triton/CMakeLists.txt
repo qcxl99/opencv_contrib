@@ -100,6 +100,7 @@ message(STATUS "triton: compile helper ${TRITON_PYTHON_EXECUTABLE}, ${_triton_co
 
 set(_triton_srcs
     "${CMAKE_CURRENT_LIST_DIR}/src/core_resize.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/entry.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/device_entries.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/python_entries.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/reference_cpu.cpp"
@@ -220,7 +221,10 @@ if(_triton_backend STREQUAL "cuda")
   file(GLOB _triton_cuda_test_sources "${CMAKE_CURRENT_LIST_DIR}/test/*.cpp"
                                      "${CMAKE_CURRENT_LIST_DIR}/test/*.hpp")
   ocv_add_accuracy_tests(FILES "Src" ${_triton_cuda_test_sources})
-  ocv_add_perf_tests()
+  # Select top-level perf sources only; future backend support is selected here.
+  file(GLOB _triton_common_perf_sources "${CMAKE_CURRENT_LIST_DIR}/perf/*.cpp"
+                                       "${CMAKE_CURRENT_LIST_DIR}/perf/*.hpp")
+  ocv_add_perf_tests(FILES "Src" ${_triton_common_perf_sources})
   ocv_add_samples()
   # perf/ only: cv::cuda::resize as a labelled timing baseline. The implementation, the accuracy
   # tests and the sample never use it, so cudawarping is an OPTIONAL dependency -- and it MUST be
@@ -257,6 +261,7 @@ if(_triton_backend STREQUAL "cuda")
   endif()
   foreach(_t opencv_test_triton opencv_perf_triton)
     if(TARGET ${_t})
+      target_sources(${_t} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/validation/device_cuda.cpp")
       # the tests compile the portable CPU oracle themselves (test/test_oracle.cpp)
       target_compile_options(${_t} PRIVATE -ffp-contract=off)
       ocv_target_include_directories(${_t} PRIVATE ${_triton_cuda_inc})
@@ -269,7 +274,7 @@ else()
   # (opencv2/triton/device.hpp) on real hip buffers, against the same portable oracle and the
   # same contract bounds (test/test_helpers.hpp owns them; the test reads them from there).
   if(BUILD_EXAMPLES)
-    add_executable(example_triton_device "${CMAKE_CURRENT_LIST_DIR}/samples/device.cpp")
+    add_executable(example_triton_device "${CMAKE_CURRENT_LIST_DIR}/samples/hip/device.cpp")
     ocv_target_include_modules(example_triton_device opencv_core opencv_imgproc ${the_module})
     target_include_directories(example_triton_device SYSTEM PRIVATE "${TRITON_HIP_INCLUDE_DIR}")
     target_compile_definitions(example_triton_device PRIVATE __HIP_PLATFORM_AMD__=1)

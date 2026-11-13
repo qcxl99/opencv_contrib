@@ -6,6 +6,7 @@ are part of a proposal under review and may change. For a quick start see the
 module's `README.md`; this page is the full usage guide.
 
 @see @ref triton "Triton API reference".
+@see @ref tutorial_triton_h20_first_use "H20 build, install and first-use walkthrough".
 
 What it computes
 ----------------
@@ -13,7 +14,7 @@ What it computes
 OpenCV CPU `cv::resize` as computed by a pinned reference configuration: the
 generic `resize.cpp` path of OpenCV 5.0.0, 128-bit SIMD, no FMA, no IPP, no
 HAL. `CV_8U` matches it bit-exactly; `CV_32F` within a bound derived from that
-configuration's own float32 rounding (the kernels are bit-exact in practice).
+configuration's own float32 rounding. Actual error is reported by the tests.
 "CPU `cv::resize`" without the configuration is not one function: an IPP-HAL
 build of the same version differs on about a quarter of test cases, so the tests
 compare against a portable C++ oracle compiled into the test binary, not against
@@ -52,7 +53,7 @@ How a call runs
    on-disk cache (`$OPENCV_TRITON_CACHE_DIR`, default `~/.cache/opencv/triton`)
    after verifying its manifest and binary hash, else compiled by
    `tools/compile_helper.py` in a **separate, Torch-free process** and then
-   verified the same way. Python never runs inside the calling process.
+   verified the same way. Compilation does not embed a Python interpreter in the C++ call path.
 3. Coordinate and coefficient tables are built in C++ by the same code as the
    test oracle, uploaded on the caller's stream, and reused; a call on another
    stream waits for the upload through an event.
@@ -71,18 +72,15 @@ driver property).
 Build
 -----
 
-```bash
-cmake -DOPENCV_EXTRA_MODULES_PATH=<opencv_contrib>/modules \
-      -DBUILD_opencv_triton=ON -DWITH_CUDA=ON \
-      -DTRITON_PYTHON_EXECUTABLE=<python that can import triton> \
-      -DTRITON_PYTHONPATH=<where triton is, if not on its default path> <opencv>
-```
+Use the standard out-of-source build described in the module README. For the
+complete Ubuntu/H20 source, Python, installation and public-entry test sequence,
+see @ref tutorial_triton_h20_first_use "H20 first use".
 
-The module is off by default; an ordinary build needs no Python, Triton or
-PyTorch, and an enabled build never needs PyTorch. Nothing is compiled at OpenCV
-build time. `make install` places `kernels/resize_cpu.py` and
-`tools/compile_helper.py` under `share/opencv5/triton`, found at run time
-relative to the library (so the install tree can be moved);
+The module is off by default and adds no Python/Triton/PyTorch dependency when
+disabled. Enabled builds do not require PyTorch. Triton kernels are compiled on
+first use, not during the OpenCV build. `cmake --install <build>` installs the
+kernel sources and `tools/compile_helper.py` under `share/opencv5/triton`, located
+relative to the library at runtime so that the prefix can be moved.
 `OPENCV_TRITON_RESOURCES`, `OPENCV_TRITON_PYTHON`, `OPENCV_TRITON_PYTHONPATH` and
 `OPENCV_TRITON_CACHE_DIR` override the defaults. Without an interpreter, cached
 keys still run; a cache miss raises a toolchain error.

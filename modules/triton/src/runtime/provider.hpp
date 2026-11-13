@@ -132,6 +132,8 @@ struct Normalized {
 //  * every scalar the kernels take fits int32 (rows, W = cols*cn, row strides in
 //    elements, tap counts): beyond that the request is Unsupported, never truncated;
 //  * no in-place and no overlap of the byte ranges [ptr, end()) (conservative).
+// Source admission and output resolution before an adapter allocates dst. No device access.
+Status resolve_output(const ResizeRequest& req, kf_resize_ref::Size2& out);
 Status normalize(const ResizeRequest& req, Normalized& out);
 
 // Shared layout/range validator; geometry and supported depth stay operator-owned.

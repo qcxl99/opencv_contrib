@@ -106,6 +106,10 @@ struct Normalized {
     bool f32 = false;
 };
 
+// Metadata/admission used by every adapter before output allocation. No device access.
+struct Output { const CodeSpec* spec = nullptr; int rows = 0, cols = 0; };
+kf_resize_rt::Status resolve_output(const kf_resize_rt::DeviceView& src, int code, Output& out);
+
 // Pure checks. On success `out.spec` points into the static table.
 kf_resize_rt::Status normalize(const Request& req, Normalized& out);
 

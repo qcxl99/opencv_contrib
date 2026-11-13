@@ -6,6 +6,7 @@ are part of a proposal under review and may change. For a quick start see the
 module's `README.md`; this page is the full usage guide.
 
 @see @ref triton "Triton API reference".
+@see @ref tutorial_triton_h20_first_use "H20 build, install and first-use walkthrough".
 
 What it computes
 ----------------

@@ -11,7 +11,7 @@ untouched; a caller opts in by name by calling the `cv::triton::` entry.
 
 ## What it supports
 
-Common: Linux, CUDA (driver API), `sm_90` tested; ROI source and destination;
+CUDA GpuMat entries: Linux, CUDA (driver API), `sm_90` tested; ROI source and destination;
 the output is reused when it already has the right size and type. Unsupported
 arguments raise `cv::Error::StsUnsupportedFormat`; invalid layouts, in-place
 operations and overlapping src/dst are rejected as invalid arguments.
@@ -36,9 +36,8 @@ replacement for `cv::cuda::resize`, which computes a different result.
 
 ### `cv::triton::cvtColor`
 
-The native module serves **84 distinct numeric conversion codes** (enum aliases
-share a code). It is wider than the KernelForge Python experiment adapter, which
-serves four uint8 codes on contiguous tensors. Native support is:
+The module serves **84 distinct numeric conversion codes** (enum aliases
+share a code). Supported conversions are:
 
 | group | source → destination channels | depths |
 |---|---|---|
@@ -127,7 +126,7 @@ compute the user's output on the CPU.
 
 For `INTER_NEAREST` and `INTER_LINEAR` (including the `INTER_AREA` alias), what it computes is OpenCV's CPU
 `cv::warpAffine` on its **vector path**, and this needs stating because that
-build is not self-consistent: its SIMD body evaluates a column's coordinate as
+build can depend on destination width: its SIMD body evaluates a column's coordinate as
 `v_fma(M0, x, (float)(y*M1 + M2))` (fused only on the selected FMA path) and its scalar tail as `x*M0 + y*M1 + M2`,
 one ulp apart, and the tail's length depends on the destination width. Two
 destination widths therefore disagree on the region they share — under
@@ -159,23 +158,38 @@ compatibility cost. Do not read this entry as "a drop-in match for
 
 ## Building
 
+Use the normal OpenCV out-of-source build with this contrib checkout:
+
 ```bash
-cmake -DOPENCV_EXTRA_MODULES_PATH=<opencv_contrib>/modules \
-      -DBUILD_opencv_triton=ON -DWITH_CUDA=ON \
-      -DTRITON_PYTHON_EXECUTABLE=<python that can import triton> \
-      -DTRITON_PYTHONPATH=<where triton is, if not on its default path> \
-      <opencv>
+cmake -S <opencv> -B <build> \
+      -DOPENCV_EXTRA_MODULES_PATH=<opencv_contrib>/modules \
+      -DCMAKE_INSTALL_PREFIX=<private-install> \
+      -DBUILD_opencv_triton=ON -DWITH_CUDA=ON -DTRITON_BACKEND=cuda \
+      -DTRITON_PYTHON_EXECUTABLE=<python-that-imports-triton>
+cmake --build <build> --parallel 8
+cmake --install <build>
 ```
 
-An ordinary build needs no Python, Triton or PyTorch: with the module off, none
-of them is involved. An enabled build never needs PyTorch. **Verified against
-Triton 3.6.0 on CUDA 12.8**; the compile key carries the compiler version, so
-artifacts from another Triton are not reused. The launcher currently accepts
-only the validated Triton 3.6.0 ABI; other compiler versions are rejected.
+Replace the path placeholders. For a complete Ubuntu/H20 walkthrough, including
+Python development files/bindings, explicit `sm_90`, tests, samples, actual import
+identity and cold/hot cache checks, see [H20 first use](doc/h20-first-use.markdown).
+Enable `BUILD_TESTS`, `BUILD_PERF_TESTS` and `BUILD_EXAMPLES` when those targets
+are required; `INSTALL_TESTS=ON` installs test programs. Python bindings use
+OpenCV's standard `python3` / `python_bindings_generator` build configuration;
+`TRITON_PYTHON_EXECUTABLE` independently selects the cold-path compiler process.
+`TRITON_PYTHONPATH` is optional when that interpreter imports the intended Triton
+without an extra search path.
 
-A cold cache needs Python and Triton, which the module runs in a separate,
-Torch-free helper process. The hot path — cache lookup and kernel launch — is
-C++ and never enters an interpreter.
+With this module off, it adds no Python, Triton or PyTorch requirement; other
+OpenCV modules retain their own dependencies. An enabled module does not require
+PyTorch. **Verified compiler ABI: Triton 3.6.0, with CUDA 12.8 / sm_90 as the
+recorded CUDA target.** Compiler version participates in the compile key; the
+launcher rejects unvalidated ABIs rather than reusing incompatible artifacts.
+
+A cold artifact cache needs Python and Triton in a separate Torch-free helper.
+The hot path is C++ and does not enter an interpreter. A writable cache is needed
+at runtime; `OPENCV_TRITON_CACHE_DIR` selects an isolated location. See the
+[resize guide](doc/resize.markdown) for resources, compiler overrides and errors.
 
 ### HIP backend (Hygon BW1000 / gfx936, DTK)
 
@@ -263,7 +277,7 @@ alive until the work completes.
 
 ## Samples
 
-Three buildable examples, `samples/resize.cpp`, `samples/cvtcolor.cpp` and
+Three CUDA buildable examples, `samples/resize.cpp`, `samples/cvtcolor.cpp` and
 `samples/warpaffine.cpp`; all are
 built by `-DBUILD_EXAMPLES=ON` and need a Triton backend at run time:
 
@@ -271,10 +285,13 @@ built by `-DBUILD_EXAMPLES=ON` and need a Triton backend at run time:
 ./bin/example_triton_cvtcolor input.png gray.png     # BGR -> GRAY
 ./bin/example_triton_cvtcolor                        # synthetic input
 ./bin/example_triton_resize input.png out.png        # half size, INTER_LINEAR
+./bin/example_triton_warpaffine                      # synthetic input
 ```
 
 ## Further reading
 
+- [H20 first use](doc/h20-first-use.markdown) — standard source build/install,
+  C++ and Python use, native tests and deployment checks on Ubuntu/H20
 - [resize guide](doc/resize.markdown) — resize in depth: dependencies, the JIT
   and its cache, the numerical contract, streams, limitations and troubleshooting.
   Everything except the resize-specific sections applies to `cvtColor` and
@@ -298,3 +315,18 @@ Proposed for opencv_contrib; not yet merged. The public API and build switches
 are part of the proposal and may change during review. The HIP backend has scoped verification on one
 platform (Hygon BW1000, gfx936, DTK 26.04, flagtree 3.6.0); its routes are the CUDA backend's
 (all four resize modes, and all three warpAffine modes).
+
+## Backend integration boundary
+
+The current CUDA API and Python calls are unchanged. Private output resolution,
+request validation and error mapping are shared by adapters; CUDA owns GpuMat
+allocation and verifies buffer/stream context ownership. Kernels, runtime JIT,
+cache identities and numerical contracts are unchanged by this refactoring.
+
+Tests and Triton candidate perf cases use private backend support described in
+[validation/README.md](validation/README.md). Existing CUDA-specific compatibility
+and lifecycle tests remain. This supplies a reuse boundary for other platforms;
+it does not claim a unified public DeviceMat/Stream API or HIP acceptance.
+Future UMat/non-CPU HAL integration would provide another thin adapter after
+OpenCV finalizes its extension interfaces. This module does not modify or
+intercept standard `cv::*` calls; unsupported inputs raise rather than fall back.

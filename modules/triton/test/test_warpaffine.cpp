@@ -96,18 +96,7 @@ static Mat gpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int bord
 static Mat cpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int border,
                    const Scalar& bv = Scalar())
 {
-    Mat out;
-    // OpenCV 5.x order: (src, dst, M, dsize, ...). Passing M where dst belongs makes the
-    // fixed-size matrix the output target and create() rejects it.
-    if ((flags & INTER_MAX) == INTER_CUBIC)
-    {
-        cv::warpAffine(src, out, M, dsize, flags, border, bv);
-        return out;
-    }
-    Mat wide;
-    const int wide_w = ((dsize.width + 128 + 127) / 128) * 128;
-    cv::warpAffine(src, wide, M, Size(wide_w, dsize.height), flags, border, bv);
-    return wide(Rect(0, 0, dsize.width, dsize.height)).clone();
+    return warpReference(src, M, dsize, flags, border, bv);
 }
 
 /** The user-visible result at exactly `dsize`, for the one test that documents the divergence. */
@@ -130,11 +119,7 @@ static Mat cpuWarpNatural(const Mat& src, const Mat& M, Size dsize, int flags, i
  */
 static double f32Tol(double ref_value)
 {
-    // Exactly the contract's number, not a convenient power of two near it. This used to be
-    // exp2(-14) = 6.10e-5, which is 22% more permissive than the stated 5e-5 -- a bound the
-    // tests passed under while the contract said something stricter.
-    const double kRel = 5.0e-5;
-    return std::min(kRel * std::max(std::abs(ref_value), 1.0), 1.0e-4);
+    return warpF32Tolerance(ref_value);
 }
 
 /** What one accuracy comparison observed -- the contract's reporting_rule, in one struct.

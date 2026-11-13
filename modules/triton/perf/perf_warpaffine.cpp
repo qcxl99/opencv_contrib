@@ -25,7 +25,7 @@
 
 namespace opencv_test { namespace {
 
-DEF_PARAM_TEST(Sz_Interp_Dtype, cv::Size, int, int, int);
+typedef ::perf::TestBaseWithParam<testing::tuple<cv::Size, int, int, int>> Sz_Interp_Dtype;
 
 // Three geometries, chosen for different cost structures rather than to be exhaustive:
 // identity-translate (memory-bandwidth bound, the cheapest mapping), a half-pixel translate
@@ -63,7 +63,7 @@ PERF_TEST_P(Sz_Interp_Dtype, TritonWarpAffine, testing::Combine(
     const int geom      = GET_PARAM(1);
     const int depth     = GET_PARAM(2);
 
-    if (!cv::triton::haveBackend())
+    if (!triton_validation::available())
         throw SkipTestException("no Triton backend available");
 
     const int type = CV_MAKETYPE(depth, 3);
@@ -71,26 +71,28 @@ PERF_TEST_P(Sz_Interp_Dtype, TritonWarpAffine, testing::Combine(
     declare.in(host, WARMUP_RNG);
     const cv::Mat M = toMat(kGeoms[geom].M);
 
-    const cv::cuda::GpuMat src(host);
-    cv::cuda::GpuMat dst(size, type);   // preallocated: reused, excluded from the cycle
+    triton_validation::Image src; src.upload(host);
+    triton_validation::Stream stream(true);
+    triton_validation::Image dst(size, type);   // preallocated: reused, excluded from the cycle
 
     for (int i = 0; i < 20; ++i)
-        cv::triton::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE);
-    cv::cuda::Stream::Null().waitForCompletion();
+        triton_validation::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE, cv::Scalar(), stream);
+    stream.wait();
 
     TEST_CYCLE()
     {
-        cv::triton::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE);
-        cv::cuda::Stream::Null().waitForCompletion();
+        triton_validation::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE, cv::Scalar(), stream);
+        stream.wait();
     }
 
-    CUDA_SANITY_CHECK(dst, 1e-10);
+    const cv::Mat result = dst.download();
+    SANITY_CHECK(result, 1e-10);
 }
 
 // AREA aliases LINEAR. Transparent reads existing dst, so these routes have their
 // own rows rather than implying an equivalent native CUDA comparison. The initial
 // background is defined before warmup; subsequent calls reuse its current contents.
-DEF_PARAM_TEST(Sz_Interp_Border_Type, cv::Size, int, int, int);
+typedef ::perf::TestBaseWithParam<testing::tuple<cv::Size, int, int, int>> Sz_Interp_Border_Type;
 
 PERF_TEST_P(Sz_Interp_Border_Type, TritonWarpAffineAreaTransparent, testing::Combine(
     testing::Values(cv::Size(1920, 1080), cv::Size(3840, 2160)),
@@ -100,24 +102,26 @@ PERF_TEST_P(Sz_Interp_Border_Type, TritonWarpAffineAreaTransparent, testing::Com
 {
     const cv::Size size = GET_PARAM(0);
     const int interp = GET_PARAM(1), border = GET_PARAM(2), type = GET_PARAM(3);
-    if (!cv::triton::haveBackend())
+    if (!triton_validation::available())
         throw SkipTestException("no Triton backend available");
 
     cv::Mat host(size, type);
     declare.in(host, WARMUP_RNG);
     const cv::Mat M = toMat(kGeoms[2].M);
-    const cv::cuda::GpuMat src(host);
-    cv::cuda::GpuMat dst(host);
+    triton_validation::Image src; src.upload(host);
+    triton_validation::Stream stream(true);
+    triton_validation::Image dst; dst.upload(host);
     for (int i = 0; i < 20; ++i)
-        cv::triton::warpAffine(src, dst, M, size, interp, border);
-    cv::cuda::Stream::Null().waitForCompletion();
+        triton_validation::warpAffine(src, dst, M, size, interp, border, cv::Scalar(), stream);
+    stream.wait();
 
     TEST_CYCLE()
     {
-        cv::triton::warpAffine(src, dst, M, size, interp, border);
-        cv::cuda::Stream::Null().waitForCompletion();
+        triton_validation::warpAffine(src, dst, M, size, interp, border, cv::Scalar(), stream);
+        stream.wait();
     }
-    CUDA_SANITY_CHECK(dst, 1e-10);
+    const cv::Mat result = dst.download();
+    SANITY_CHECK(result, 1e-10);
 }
 
 #ifdef OPENCV_TRITON_PERF_HAVE_CUDAWARPING

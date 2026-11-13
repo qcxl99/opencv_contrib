@@ -70,6 +70,9 @@ struct Normalized {
     bool fused = true;
 };
 
+// Source/options admission before dst allocation; no device work or reference calibration.
+kf_resize_rt::Status validate_source(const Request& req);
+
 // Pure checks. Fills every field of `out` including the sampling matrix and the block shape.
 kf_resize_rt::Status normalize(const Request& req, Normalized& out);
 

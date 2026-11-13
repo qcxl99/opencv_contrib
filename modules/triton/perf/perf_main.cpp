@@ -3,4 +3,4 @@
 // of this distribution and at http://opencv.org/license.html.
 
 #include "perf_precomp.hpp"
-CV_PERF_TEST_CUDA_MAIN(triton)
+CV_PERF_TEST_MAIN(triton)

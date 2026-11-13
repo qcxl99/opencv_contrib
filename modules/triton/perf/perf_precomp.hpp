@@ -5,8 +5,12 @@
 #ifndef OPENCV_TRITON_PERF_PRECOMP_HPP
 #define OPENCV_TRITON_PERF_PRECOMP_HPP
 #include "opencv2/ts.hpp"
+#include "opencv2/ts/ts_perf.hpp"
+#include "../validation/device.hpp"
+#if defined(OPENCV_TRITON_PERF_HAVE_CUDAWARPING) || defined(OPENCV_TRITON_PERF_HAVE_CUDAIMGPROC)
 #include "opencv2/ts/cuda_perf.hpp"
-#include "opencv2/triton.hpp"
+#endif
+#include "opencv2/imgproc.hpp"
 
 // cv::cuda::resize is only a labelled timing baseline, and cudawarping is an OPTIONAL dependency
 // of perf/ (see CMakeLists.txt). Without this guard a build that has triton but not cudawarping
