@@ -9,8 +9,9 @@ PyTorch is not required.
 The module is disabled by default. Enable it with `BUILD_opencv_triton=ON`.
 Calls use explicit `cv::triton` entry points and do not replace OpenCV functions.
 Unsupported requests raise an exception without a CPU or `cv::cuda` fallback.
-Operations are asynchronous on the supplied stream. Keep source and destination
-allocations alive until the stream completes.
+Operations are asynchronous on the supplied stream. HIP device objects manage
+allocation lifetime and cross-stream image dependencies. With CUDA GpuMat or the
+raw device-buffer API, retain source and destination allocations until completion.
 
 ## Supported operations
 
@@ -123,13 +124,31 @@ gray = cv.triton.cvtColor(small, cv.COLOR_BGR2GRAY)
 result = gray.download()
 ```
 
-HIP applications use the caller-owned device-buffer entries in
+HIP Python applications use `cv.triton.HipImage` and `cv.triton.HipStream`:
+
+```python
+import cv2 as cv
+
+src = cv.triton.HipImage(device=0)
+src.upload(image)  # Blocking NumPy convenience transfer.
+stream = cv.triton.HipStream(device=0)
+small = cv.triton.resize(src, (640, 360), stream=stream)
+gray = cv.triton.cvtColor(small, cv.COLOR_BGR2GRAY, stream=stream)
+result = gray.download()  # Waits for pending work and returns a NumPy array.
+```
+
+The operators return device images and accept an optional `dst` for output
+reuse. Device objects retain shared ROI storage and order image reads and writes
+across streams. `stream=None` selects the source device's default stream. See
+[HIP Python](doc/hip_python.markdown) for transfers, streams and supported layouts.
+The same owning classes are available in C++ through `opencv2/triton/hip.hpp`.
+
+HIP applications can also use caller-owned device-buffer entries in
 `opencv2/triton/device.hpp`: `resizeDevice`, `cvtColorDevice` and
-`warpAffineDevice`. They do not allocate output storage or synchronize.
+`warpAffineDevice`. These entries do not allocate output storage or synchronize.
 The scale-aware resize overload accepts empty `dsize` with `fx`/`fy`; the caller
-must preallocate the resolved destination size. GpuMat operations are unavailable
-on HIP and raise `StsNotImplemented`, including Python calls with omitted or
-`None` streams. Backend queries remain available in Python.
+must preallocate the resolved destination size. GpuMat calls on HIP raise
+`StsNotImplemented`.
 
 On DTK, allocation device/range, active context generation and stream context
 are checked. The SDK does not expose allocation context through
@@ -141,8 +160,9 @@ ownership cannot be checked through that attribute.
 Enable `BUILD_EXAMPLES`, `BUILD_TESTS` and `BUILD_PERF_TESTS` as needed.
 CUDA samples are `example_triton_resize`, `example_triton_cvtcolor` and
 `example_triton_warpaffine`. HIP uses
-`example_triton_device [resize|warp|cvtcolor]`. Each sample demonstrates explicit
-stream use and result download.
+`example_triton_device [resize|warp|cvtcolor]` for caller-owned C++ buffers and
+[samples/hip/device.py](samples/hip/device.py) for Python device objects. The
+Python sample chains all three operators on device and downloads the result.
 
 `opencv_test_triton` runs common accuracy tests through the selected backend.
 CUDA builds include CUDA lifecycle tests; HIP additionally provides

@@ -15,7 +15,7 @@ void resizeForPython(const cuda::GpuMat& src, cuda::GpuMat& dst, Size dsize,
     CV_UNUSED(src); CV_UNUSED(dst); CV_UNUSED(dsize); CV_UNUSED(fx); CV_UNUSED(fy);
     CV_UNUSED(interpolation); CV_UNUSED(stream);
     CV_Error(Error::StsNotImplemented,
-             "cv::triton::resize: this HIP build serves C++ device buffers; the Python GpuMat adapter needs CUDA");
+             "cv::triton::resize: the GpuMat adapter requires CUDA; use HipImage on the HIP backend");
 #endif
 }
 
@@ -27,7 +27,7 @@ void cvtColorForPython(const cuda::GpuMat& src, cuda::GpuMat& dst, int code,
 #else
     CV_UNUSED(src); CV_UNUSED(dst); CV_UNUSED(code); CV_UNUSED(stream);
     CV_Error(Error::StsNotImplemented,
-             "cv::triton::cvtColor: this HIP build serves C++ device buffers; the Python GpuMat adapter needs CUDA");
+             "cv::triton::cvtColor: the GpuMat adapter requires CUDA; use HipImage on the HIP backend");
 #endif
 }
 
@@ -40,7 +40,7 @@ void warpAffineForPython(const cuda::GpuMat& src, cuda::GpuMat& dst, InputArray 
     CV_UNUSED(src); CV_UNUSED(dst); CV_UNUSED(M); CV_UNUSED(dsize); CV_UNUSED(flags);
     CV_UNUSED(borderMode); CV_UNUSED(borderValue); CV_UNUSED(stream);
     CV_Error(Error::StsNotImplemented,
-             "cv::triton::warpAffine: this HIP build serves C++ device buffers; the Python GpuMat adapter needs CUDA");
+             "cv::triton::warpAffine: the GpuMat adapter requires CUDA; use HipImage on the HIP backend");
 #endif
 }
 

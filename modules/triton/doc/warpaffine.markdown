@@ -92,11 +92,25 @@ CUDA uses `1×256` tiles for NEAREST and `2×64` for LINEAR/CUBIC, including ARE
 HIP uses backend-specific launch shapes with small/narrow-image and C3 NEAREST
 conditions. These choices do not change sampling semantics.
 
-CUDA uses GpuMat and Python bindings; HIP uses the public `warpAffineDevice`
-entry in `opencv2/triton/device.hpp`. GpuMat calls on HIP raise a catchable
-`StsNotImplemented`. Calls are asynchronous on the supplied stream. Retain
-allocations until completion and follow the graph-resource lifetime rules in
-cv::triton::releaseGraphResources().
+CUDA uses GpuMat and Python bindings. HIP Python accepts `cv2.triton.HipImage`
+and an optional `cv2.triton.HipStream`:
+
+```python
+warped = cv.triton.warpAffine(src, M, (width, height),
+                             flags=cv.INTER_LINEAR,
+                             borderMode=cv.BORDER_REPLICATE, stream=stream)
+```
+
+The returned image stays on device. For TRANSPARENT, pass an initialized `dst`
+of the required size and type; an empty or mismatched destination is rejected.
+HIP device objects manage storage lifetime and cross-stream image dependencies.
+See @ref tutorial_triton_hip_python.
+
+The public `warpAffineDevice` entry in `opencv2/triton/device.hpp` accepts
+caller-owned buffers and a native stream. GpuMat calls on HIP raise
+`StsNotImplemented`. GpuMat and raw-buffer callers retain allocations until
+completion and follow cv::triton::releaseGraphResources() for captured graphs.
+The owning HipImage API does not support graph capture.
 
 Performance tests warm the kernels and include public submission plus stream
 completion. The AREA/TRANSPARENT cases initialize and reuse destination storage;

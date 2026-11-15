@@ -43,21 +43,34 @@ An unidentified profile retains the fused/scaled path and is explicitly not
 qualified for the additional absolute cap. Copy paths remain exact.
 
 
-CUDA uses GpuMat and the public Python bindings. HIP uses the C++ DeviceImage
-entries in `opencv2/triton/device.hpp`; `example_triton_device cvtcolor` shows
-allocation, upload, explicit stream submission, synchronization and comparison.
-All three Python GpuMat adapters (resize, cvtColor and warpAffine) return
-catchable StsNotImplemented on HIP, including default/None streams.
+CUDA uses GpuMat and the public Python bindings. HIP Python accepts
+`cv2.triton.HipImage` and an optional `cv2.triton.HipStream`:
 
-Calls are asynchronous. Callers retain their images and order producers and
-consumers. Compiled modules and HSV/Lab/Luv tables use the runtime's stream and
-in-flight retention machinery. Warm operations support graph capture. After graphs can no longer be replayed,
-call cv::triton::releaseGraphResources() as documented in the API reference.
+```python
+gray = cv.triton.cvtColor(src, cv.COLOR_BGR2GRAY, stream=stream)
+```
+
+The code determines the device output's size and type. Pass `dst` to reuse
+matching storage; source and destination must not overlap. Device objects
+manage allocation lifetime and cross-stream image dependencies. See
+@ref tutorial_triton_hip_python for transfers and a device pipeline.
+
+HIP C++ also provides raw DeviceImage entries in `opencv2/triton/device.hpp`;
+`example_triton_device cvtcolor` demonstrates caller-owned storage and native
+streams. GpuMat calls on HIP raise `StsNotImplemented`.
+
+Calls are asynchronous. GpuMat and raw-buffer callers retain their images and
+order producers and consumers. Compiled modules and HSV/Lab/Luv tables use the
+runtime's stream and in-flight retention machinery. Warm GpuMat and raw-buffer
+operations support graph capture; the owning HipImage API does not. After graphs
+can no longer be replayed, call cv::triton::releaseGraphResources() as documented
+in the API reference.
 
 Accuracy tests cover every admitted code/depth pair, boundary colours, short
 axes and SIMD/block-boundary widths, pitched ROIs, output guards, refusals and
 lookup-table stream/capture lifetime. CUDA Python numerical tests require an
-actual CUDA build; HIP binding tests check the documented safe refusals.
+actual CUDA build. HIP Python tests cover device-image operations, transfers,
+output reuse, ROIs, streams and validation errors.
 OpenCV performance tests provide representative family/depth cases with warmup;
 compilation and allocation are excluded. Public-call wall time includes host
 submission and synchronization; it is not isolated kernel or graph time.

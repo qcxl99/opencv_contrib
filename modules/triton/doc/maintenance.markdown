@@ -45,7 +45,11 @@ when testing an installation or a relocated prefix.
 
 `opencv_test_triton` uses the common backend cases. CUDA builds add CUDA
 lifecycle tests; HIP also provides `opencv_test_triton_hip`. Use the standard
-OpenCV list/filter/XML options and review failures and skipped tests.
+OpenCV list/filter/XML options and review failures and skipped tests. Python
+tests in `misc/python/test/test_triton.py` exercise CUDA GpuMat and HIP GpuMat
+refusals. `misc/python/test/test_triton_hip.py` covers HIP owning device objects,
+including NumPy transfers, output reuse, shared ROIs and asynchronous stream
+dependencies.
 
 `opencv_perf_triton` measures warmed public calls with stream completion.
 Generated performance sanity data checks repeatability; independent accuracy
