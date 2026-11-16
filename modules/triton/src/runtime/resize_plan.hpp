@@ -29,7 +29,8 @@ struct RouteInfo {
 RouteInfo route(int src_h, int src_w, int dst_h, int dst_w, double inv_y, double inv_x, int interp);
 
 // One axis of the separable path: source offsets, float32 coefficients [dst x ksize],
-// and (horizontal axis) the xmin/xmax border markers.
+// and horizontal destination-index boundaries [xmin, xmax). Outside this range
+// the sampling window reaches a source border and requires edge handling.
 struct Axis {
     std::vector<int> ofs;
     std::vector<float> coeffs;
@@ -39,7 +40,8 @@ Axis generic_axis(int dst, int src, double inv_scale, int ksize, bool area_mode,
 // saturate_cast<short>(c * INTER_RESIZE_COEF_SCALE)
 std::vector<int> fixed_coeffs(const std::vector<float>& coeffs);
 
-// computeResizeAreaTab, padded to the longest tap list.
+// Rectangular storage for variable-length AREA tap lists. Each destination uses
+// count[d] entries; remaining src_index/alpha slots are zero-filled.
 struct AreaTab {
     int taps = 0;                 // K
     std::vector<int> src_index;   // [dst x K]

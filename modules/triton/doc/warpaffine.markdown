@@ -26,7 +26,12 @@ and overlapping storage are unsupported. Nonfinite matrices or border values
 are rejected. The planner bounds affine terms over the destination rectangle
 to avoid float32 intermediate overflow. NEAREST/LINEAR/AREA must fit the safe
 int32 sampling range; CUBIC clamps finite coordinates before integer conversion.
-The conservative affine bound may reject large terms that would cancel.
+The conservative affine bound may reject large terms that would cancel. For
+example, for a destination-to-source row `sx = 1e10*x - 1e10*y`, the terms
+cancel when x = y. A 2 x 2 destination is still rejected for NEAREST/LINEAR/AREA:
+the absolute-term bound is `2e10`, above the safe int32 range, and the off-diagonal
+pixels do not benefit from that cancellation. The check covers the whole
+destination rectangle, not only pixels where terms cancel.
 
 Transparent borders
 -------------------

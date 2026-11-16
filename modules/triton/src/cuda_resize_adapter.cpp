@@ -165,7 +165,8 @@ void resize(InputArray input, OutputArray output, Size dsize,
     const auto context = currentIdentity();
     const auto source = deviceView(src, context);
     const auto info = detail::resizeOutput(source, dsize, fx, fy, interpolation);
-    rejectOverlap(src, output, "resize");  // before create can conceal an alias
+    // Check the existing output before create can replace its storage and hide overlap.
+    rejectOverlap(src, output, "resize");
     const cuda::GpuMat dst = prepareDestination(output, info);
     const auto native = reinterpret_cast<std::uintptr_t>(cuda::StreamAccessor::getStream(stream));
     // Preserve original fx/fy when dsize was omitted; do not derive them from rounded sizes.

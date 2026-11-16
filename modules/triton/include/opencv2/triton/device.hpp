@@ -28,7 +28,7 @@ struct CV_EXPORTS DeviceImage
     std::uintptr_t ptr = 0;   //!< device address of element (0, 0)
     int rows = 0, cols = 0;
     int type = 0;             //!< OpenCV type, e.g. CV_8UC3
-    std::size_t step = 0;     //!< row pitch in bytes
+    std::size_t step = 0;     //!< row pitch in bytes; must cover a full packed row (zero is invalid)
 };
 
 /** @brief Return whether device is usable on the configured backend.

@@ -1,5 +1,5 @@
 # Generated HIP resize kernels; regenerate with tools/make_kernels_cpu_hip.py.
-# source_sha256: 15547783bb2e8f0bd3787aa15e538612640a360131712c2254818fd0c3afe433
+# source_sha256: 5d341b487bda349cee7e8118faf23a28e06ffda9a59ef220cfa502f8e71e7cd5
 # This file is part of OpenCV project.
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
@@ -56,20 +56,15 @@ def _cpu_tile(dst_h, W, cn: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.con
     return rows, px, rows < dst_h, px < dst_w, dst_w
 
 
-# The compile key is explicit. The
-# channel count is a constexpr (`cn: tl.constexpr`), and every other runtime argument,
-# pointers included, is do_not_specialize, so Triton adds no implicit ==1 / %16 /
-# 16-byte-alignment keys. A C++ runtime can compute this key; it cannot portably
-# reproduce Triton's implicit one. Runtime-argument lists are unchanged by the
-# pixel-major layout; the grid's second axis counts
-# pixels instead of channel values.
-# Row-sliding kernels (nearest, separable): one program owns BLOCK_W consecutive output
-# elements (channel values, element-major) over BLOCK_H consecutive output rows and
-# walks those rows in order; the per-element tables are loaded once per program. The source-row offset is uniform across the program, so
-# when it repeats or advances by one the horizontal results already in registers are
-# reused or shifted instead of reloaded and recomputed -- OpenCV's CPU resize keeps
-# the same ring of horizontally resized rows. Each output value is computed from the
-# same terms in the same order to preserve floating-point rounding.
+# Compile identity: cn and tile dimensions are explicit constexprs. Runtime
+# arguments, including pointers, are do_not_specialize, so the C++ runtime need
+# not reproduce implicit Triton value/alignment specialization keys.
+#
+# Tile layout: area kernels count output pixels on grid axis 1; nearest and
+# separable kernels count channel values. Both use BLOCK_H output rows.
+# Row-sliding nearest/separable kernels reuse per-element tables and horizontal
+# results when the source row repeats or advances by one. Terms retain the CPU
+# evaluation order to preserve float32 rounding.
 @triton.jit(do_not_specialize=['src', 'dst', 'xofs', 'yofs', 'dst_h', 'W', 'src_rs', 'dst_rs', 'src_bs', 'dst_bs'])
 def _resize_cpu_nearest_kernel(src, dst, xofs, yofs, dst_h, W, cn: tl.constexpr,
                         src_rs, dst_rs, src_bs, dst_bs,
@@ -369,9 +364,8 @@ def _resize_cpu_area_fast_kernel(src, dst, src_h, src_w, dst_h, W, cn: tl.conste
 
     Tiles wholly inside the full-window region (every window in the image, column
     below dwidth1) take an unmasked branch; only edge tiles evaluate the
-    count-based formula and its division. The window is walked with RUNTIME
-    loops: unrolling it (static_range over IX*IY) put a compile cliff in this
-    kernel -- 1.4s at 8x8, 7s at 12x12, 31s at 16x16 -- for no gain.
+    count-based formula and its division. Runtime loops walk the window to
+    avoid expanding generated code in proportion to IX*IY for large windows.
     """
     rows, px, rm, pm, dst_w = _cpu_tile(dst_h, W, cn, BLOCK_H, BLOCK_W)
     m = rm & pm

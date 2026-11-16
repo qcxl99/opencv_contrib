@@ -21,13 +21,15 @@ outside the runtime integer indexing range are refused.
 
 Integer conversions and float channel copies compare exactly against the
 linked OpenCV CPU implementation. Finite float gray/YUV/YCrCb arithmetic uses
-`8 * 2^-24 * max(1, abs(ref), max(abs(input channels at this pixel)))` as the
-absolute error bound for each output element. Another pixel's magnitude does
-not increase the allowance. IPP or custom HAL substitutions can change CPU results.
+`8 * 2^-24 * max(1, abs(ref), input_scale)` as the absolute error bound for
+each output element. Here, `input_scale` is the largest absolute input-channel
+value at the corresponding pixel. Another pixel's magnitude does not increase
+the allowance. IPP or custom HAL substitutions can change CPU results.
 
-For the identified separate-rounding/four-lane CPU arithmetic profile, the native
-runtime additionally selects `F32_CPU_SEPARATE4` and the accuracy suite requires
-absolute error at most `1e-4` as well as the scaled bound. Identification executes
+When the linked CPU implementation rounds multiplication and addition separately
+and processes groups of four values, the runtime selects matching GPU arithmetic.
+The accuracy suite then requires absolute error at most `1e-4` as well as the
+scaled bound. Identification executes
 small directed fixtures against the actual linked `cv::cvtColor`; it never sends
 user images to CPU or substitutes probe output for user output. The process-local
 cache distinguishes optimization, IPP/exactness and floating rounding controls;
@@ -50,9 +52,12 @@ All three Python GpuMat adapters (resize, cvtColor and warpAffine) return
 catchable StsNotImplemented on HIP, including default/None streams.
 
 Calls are asynchronous. Callers retain their images and order producers and
-consumers. Compiled modules and HSV/Lab/Luv tables use the runtime's stream and
-in-flight retention machinery. Warm operations support graph capture. After graphs can no longer be replayed,
-call cv::triton::releaseGraphResources() as documented in the API reference.
+consumers. The runtime keeps compiled modules and HSV/Lab/Luv tables alive
+until submitted work finishes.
+
+Warm operations support graph capture. After all graphs using these resources
+are destroyed or will never be replayed again, call
+cv::triton::releaseGraphResources() as documented in the API reference.
 
 Accuracy tests cover every admitted code/depth pair, boundary colours, short
 axes and SIMD/block-boundary widths, pitched ROIs, output guards, refusals and

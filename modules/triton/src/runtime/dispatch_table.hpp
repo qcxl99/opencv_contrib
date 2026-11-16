@@ -23,6 +23,8 @@ constexpr int DISPATCH_DEFAULT_NUM_STAGES = 3;
 // _CPU_MIN_PROGRAMS: _cpu_parallel's floor on the program count.
 constexpr int DISPATCH_MIN_PROGRAMS = 512;
 
+// Columns: route, channels, float32, vertical direction, exact-2x2 AREA,
+//          block height, block width, warp count. Block width units follow the route.
 inline constexpr DispatchRow DISPATCH_TABLE[] = {
     {"nearest", 1, false, "down", false, 2, 512, 4},
     {"nearest", 1, false, "up", false, 8, 512, 2},

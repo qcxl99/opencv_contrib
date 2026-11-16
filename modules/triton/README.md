@@ -93,7 +93,9 @@ builds do not require Python or Triton on behalf of this module.
 
 A cache miss needs Python and Triton. The writable artifact cache defaults to
 `~/.cache/opencv/triton`; override it with `OPENCV_TRITON_CACHE_DIR`. Cached
-kernels run without the compiler interpreter. Shared installations resolve kernel resources relative to the module library.
+kernels run without the compiler interpreter.
+
+Shared installations resolve kernel resources relative to the module library.
 Static installations use the configured resource prefix; set
 `OPENCV_TRITON_RESOURCES` when relocating a static SDK. The [resize guide](doc/resize.markdown)
 describes cache validation and resource overrides.

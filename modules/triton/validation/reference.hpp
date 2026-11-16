@@ -92,7 +92,11 @@ inline ::testing::AssertionResult meetsContract(const Mat& got, const Mat& ref_,
 }
 
 
-// Selected CPU reference, bound to this linked build. It is not a cross-ISA guarantee.
+// Selected CPU reference, bound to this linked build. CUBIC uses natural width;
+// other modes add at least 128 columns and round up to a multiple of 128, then
+// crop. The extra width keeps compared pixels away from scalar-tail sampling.
+// This deliberately selects the vector-path result, not natural-width equivalence
+// or a cross-ISA guarantee.
 inline Mat warpReference(const Mat& src, const Mat& matrix, Size size, int flags, int border,
                          const Scalar& value = Scalar())
 {

@@ -260,7 +260,9 @@ LaunchConfig default_config(const Normalized& n, const Target* target) {
         cfg.block_w = DISPATCH_FALLBACK_BLOCK_W;
         cfg.num_warps = DISPATCH_FALLBACK_NUM_WARPS;
     }
-    // HIP uses backend-specific defaults. CUDA keeps the table above.
+    // HIP uses these launch defaults for the listed route/layout classes. They
+    // apply to every HIP target, not an architecture-specific optimum; benchmark
+    // the actual device before carrying over a performance claim. CUDA uses the table.
     if (target && target->backend == "hip" && static_cast<long long>(n.dst_h) * n.dst_w >= 65536) {
         const bool f32 = n.type == ElemType::F32;
         const double sy = 1.0 / n.inv_y, sx = 1.0 / n.inv_x;
@@ -369,9 +371,8 @@ LaunchShape launch_shape(const Normalized& n, const LaunchConfig& requested, con
         }
     }
     std::sort(c.begin(), c.end());
-    // Grid axis 1 counts the tile's second dimension, which the kernels agree on with
-    // The pixel-major area kernels tile BLOCK_W output PIXELS, the
-    // element-major (row-sliding) nearest and separable ones tile BLOCK_W channel values.
+    // Grid axis 1 follows the kernel's tile unit: BLOCK_W output pixels for
+    // area kernels, or BLOCK_W channel values for nearest and separable kernels.
     const long long W = static_cast<long long>(n.dst_w) * n.channels;
     const long long axis1 = (r == ref::ROUTE_AREA || r == ref::ROUTE_AREA_FAST) ? n.dst_w : W;
     ls.grid[0] = static_cast<unsigned>((n.dst_h + cfg.block_h - 1) / cfg.block_h);

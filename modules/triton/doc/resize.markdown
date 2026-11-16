@@ -87,10 +87,14 @@ settings override configured defaults:
 
 Installation places resources under `share/opencv5/triton`, resolved relative
 to the module library. A disk-cache hit runs without the compiler interpreter;
-a cache miss with no usable compiler raises a toolchain error. An empty module artifact cache
-does not imply that the compiler's own cache is empty.
+a cache miss with no usable compiler raises a toolchain error.
 
-Warm operations can be captured into device graphs. After graphs using module
+The module and compiler have separate caches. Clearing
+`OPENCV_TRITON_CACHE_DIR` forces a module-cache miss, but the compiler can still
+reuse its own cached output. To measure compilation from scratch, also select
+an empty compiler cache and record both cache locations.
+
+For applications that use device graphs, warm operations can be captured. After graphs using module
 resources are destroyed or can no longer be replayed, call
 cv::triton::releaseGraphResources(). Do not release those resources while a
 graph can still use them.

@@ -132,7 +132,7 @@ struct LabLuvTables {
     std::vector<int> gamma;       // 256:     sRGBGammaTab_b (or linearGammaTab_b, identical scale)
     std::vector<int> cbrt;        // 3072:    LabCbrtTab_b
     std::vector<int> yf;          // 512:     LabToYF_b, 2 per L
-    std::vector<int> abxz;        // 11264:   abToXZ_b, already shifted to start at index 0
+    std::vector<int> abxz;        // 36864:   abToXZ_b, already shifted to start at index 0
     std::vector<int> invgamma;    // 4096:    sRGBInvGammaTab_b
     std::vector<int> lu;          // 65536:   LuToUp_b
     std::vector<int> lv;          // 65536:   LvToVp_b

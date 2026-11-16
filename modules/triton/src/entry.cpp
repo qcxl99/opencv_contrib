@@ -11,6 +11,8 @@ void requireStatus(const cv_triton_runtime::Status& s, const char* operation, bo
     using cv_triton_runtime::Reason;
     const String what = cv::format("cv::triton::%s: %s (%s)", operation,
                                   s.message.c_str(), cv_triton_runtime::reason_name(s.reason));
+    // Unsupported types/modes map to StsUnsupportedFormat; malformed request
+    // geometry, layout and ownership map to StsBadArg. Execution failures use StsError.
     if (s.code == cv_triton_runtime::Code::Unsupported)
     {
         switch (s.reason)

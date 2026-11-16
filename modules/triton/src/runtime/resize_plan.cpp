@@ -197,6 +197,8 @@ AreaTab area_tab(int src, int dst, double scale) {  // area_tab + padded_area_ta
     }
     AreaTab a;
     for (auto& t : tab) a.taps = std::max<int>(a.taps, static_cast<int>(t.size()));
+    // Use a fixed row width for GPU table indexing; count masks unused taps.
+    // Zero-filled coefficients and safe source index 0 cover the padded slots.
     a.src_index.assign(static_cast<std::size_t>(dst) * a.taps, 0);
     a.alpha.assign(static_cast<std::size_t>(dst) * a.taps, 0.0f);
     a.count.resize(dst);

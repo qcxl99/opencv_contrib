@@ -28,6 +28,9 @@
 namespace cv_triton_runtime {
 
 // ------------------------------------------------------------------ sha256
+// Standard SHA-256, implemented locally without a crypto-library dependency.
+// test/cpu/test_protocol.cpp checks a known digest; the hashes bind cache
+// content, not an authenticated publisher or a trusted signature.
 
 namespace {
 
@@ -330,6 +333,7 @@ bool verify_artifact(const std::string& dir, const std::string& expected_key_tex
     if (!read_file(dir + "/manifest.json", text)) { why = "no manifest.json"; return false; }
     Json j;
     if (!json_parse(text, j, err)) { why = "manifest.json does not parse: " + err; return false; }
+    // Validate protocol and reconstruct the exact requested compile identity.
     const std::string* p = get_str(j, "protocol");
     if (!p || *p != COMPILE_PROTOCOL) { why = "manifest protocol is not " + std::string(COMPILE_PROTOCOL); return false; }
     m.protocol = *p;
@@ -347,6 +351,7 @@ bool verify_artifact(const std::string& dir, const std::string& expected_key_tex
     if (dir.substr(slash == std::string::npos ? 0 : slash + 1) != *kd) { why = "artifact directory is not named by the key digest"; return false; }
     m.key_text = *kt; m.key_digest = *kd; m.function = *fn;
 
+    // Bind the selected binary bytes and size to the manifest.
     const std::string *bf = get_str(*bin, "file"), *bh = get_str(*bin, "sha256"), *fmt = get_str(*bin, "format");
     long long bytes;
     if (!bf || !bh || !fmt || !get_int(*bin, "bytes", bytes) || bf->find('/') != std::string::npos) { why = "manifest.binary: bad field"; return false; }
@@ -356,6 +361,8 @@ bool verify_artifact(const std::string& dir, const std::string& expected_key_tex
     if (got != *bh || static_cast<long long>(got_bytes) != bytes) { why = "binary does not match the manifest's hash"; return false; }
     m.binary_file = *bf; m.binary_sha256 = *bh; m.binary_bytes = got_bytes; m.format = *fmt;
 
+    // Match ordered ABI arguments to the signature; extra arguments must be
+    // explicitly recorded null pointers. launch_abi_ok checks launcher support.
     const Json* sig = key->get("signature");
     std::size_t i = 0;
     for (const Json& a : abi->arr) {
@@ -378,6 +385,8 @@ bool verify_artifact(const std::string& dir, const std::string& expected_key_tex
     }
     if (i < sig->arr.size()) { why = "abi shorter than the signature"; return false; }
 
+    // Launch geometry must agree with the key; retain scratch requirements for
+    // the separate launcher-compatibility check.
     long long tpb, nw, ws, nc, sh, knw, kws;
     if (!get_int(*launch, "threads_per_block", tpb) || !get_int(*launch, "num_warps", nw) || !get_int(*launch, "warp_size", ws) ||
         !get_int(*launch, "num_ctas", nc) || !get_int(*launch, "shared_bytes", sh) || !get_int(*key, "num_warps", knw) ||
@@ -556,7 +565,9 @@ CompileOutcome run_request(const HelperCommand& cmd, const std::string& request)
         return o;
     }
     if (o.exit_code == 127) return failed(Reason::ToolchainUnavailable, "toolchain_unavailable", "cannot execute " + cmd.python);
-    std::string last;  // the response is the last non-empty stdout line
+    // Compiler diagnostics may precede the response. The helper writes its JSON
+    // response last; preceding stdout lines are not parsed as protocol messages.
+    std::string last;
     std::istringstream lines(text);
     for (std::string l; std::getline(lines, l);) if (!l.empty()) last = l;
     o.response = last;

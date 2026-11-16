@@ -28,10 +28,14 @@ cmake --build <build> --parallel
 cmake --install <build>
 ```
 
-Select an available device with the platform's visibility setting before
-running an application. Avoid combining visibility filters that would filter
-the selected devices twice. Device indices passed to the API refer to the
-visible device set.
+Select an available device before running an application. For example, set
+`HIP_VISIBLE_DEVICES=2` to expose physical device 2; the application then selects
+logical device 0. HIP runtimes can also honor `ROCR_VISIBLE_DEVICES`, and CUDA
+compatibility layers can honor `CUDA_VISIBLE_DEVICES`. Support and filter order
+depend on the installed runtime. Use one supported selector and unset inherited
+selectors unless their combined behavior has been verified. Conflicting filters
+can leave no visible device or select a different card. Confirm the visible
+device identity before running tests.
 
 Use and test
 ------------
