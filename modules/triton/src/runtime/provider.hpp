@@ -185,8 +185,8 @@ LaunchShape launch_shape(const Normalized& n, const LaunchConfig& cfg, const Tar
 
 // ------------------------------------------------------- device service
 
-// Private interface for device-specific memory, event, module and launch services.
-// Backend implementations remain internal to the module.
+// Private service abstraction; the current CUDA/HIP runtimes call their driver APIs
+// directly rather than implementing this interface. It is not the runtime lifecycle API.
 struct DeviceBuffer { ContextId ctx; std::uintptr_t ptr = 0; std::size_t bytes = 0; };
 struct Event { std::uintptr_t handle = 0; };
 struct Module { ContextId ctx; std::uintptr_t handle = 0; std::uintptr_t function = 0; int shared_bytes = 0; };
@@ -194,21 +194,34 @@ struct Module { ContextId ctx; std::uintptr_t handle = 0; std::uintptr_t functio
 class DeviceService {
 public:
     virtual ~DeviceService() = default;
+    // Identify the active device context and its lifetime; do not infer identity from an ordinal.
     virtual Status current_context(int device, ContextId& out) = 0;
+    // Allocate in ctx. The returned buffer belongs to the caller until free().
     virtual Status alloc(const ContextId& ctx, std::size_t bytes, DeviceBuffer& out) = 0;
+    // The caller must establish that no queued work still uses this buffer.
     virtual void free(const DeviceBuffer& b) = 0;
+    // Submit on ex.stream; dst must belong to ex.ctx and have at least bytes of storage.
     // `host` must stay valid until `done` has completed; the caller holds it in a lease.
     virtual Status upload_async(const ExecContext& ex, const DeviceBuffer& dst, const void* host,
                                 std::size_t bytes, Event& done) = 0;
+    // Record completion of preceding work on ex.stream; the caller owns the event.
     virtual Status record(const ExecContext& ex, Event& out) = 0;
-    virtual Status wait(const ExecContext& ex, const Event& e) = 0;   // stream waits on event
+    // Add a device-side dependency to ex.stream, without waiting on the host.
+    virtual Status wait(const ExecContext& ex, const Event& e) = 0;
+    // Nonblocking completion query. This legacy bool cannot distinguish not-ready from
+    // driver failure; current runtimes use lifetime.hpp's tri-state decisions instead.
     virtual bool completed(const Event& e) = 0;
+    // Destroy an event only after no queued dependency or host query needs it.
     virtual void release(const Event& e) = 0;
+    // Load the named entry from binary in ctx; the caller owns the resulting module.
     virtual Status load(const ContextId& ctx, const std::vector<std::uint8_t>& binary,
                         const std::string& function, Module& out) = 0;
+    // The caller must establish that no queued work still uses this module.
     virtual void unload(const Module& m) = 0;
+    // Submit a launch on ex.stream in m.ctx; args must follow the module's verified ABI.
     virtual Status launch(const ExecContext& ex, const Module& m, const unsigned grid[3],
                           unsigned threads, void** args) = 0;
+    // Submit a device-to-device copy; both views and ex.stream must belong to ex.ctx.
     virtual Status copy2d_async(const ExecContext& ex, const DeviceView& dst, const DeviceView& src) = 0;
 };
 

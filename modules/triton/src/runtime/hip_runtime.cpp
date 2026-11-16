@@ -1356,6 +1356,18 @@ Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std:
                       {"E0", spec.k[0]}, {"E1", spec.k[1]}, {"E2", spec.k[2]},
                       {"E3", spec.k[3]}, {"E4", spec.k[4]}, {"E5", spec.k[5]},
                       {"E6", spec.k[6]}, {"E7", spec.k[7]}, {"E8", spec.k[8]}};
+    const bool packed = dev.arch == 936 && !n.u16 && !n.f32 && n.cols >= 1024 && n.cols % 4 == 0 &&
+        req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 &&
+        req.src.step % 4 == 0 && req.dst.step % 4 == 0 &&
+        spec.code == 6 && n.n >= (1LL << 19);
+    if (packed)
+    {
+        key.kernel = "_cvtcolor_hip_packed";
+        key.signature = "src:*u8, dst:*u8, cols:i32, src_rs:i32, dst_rs:i32";
+        key.cfg.block_w = n.n < (1LL << 22) ? 1024 : 512;
+        key.cfg.num_warps = n.n < (1LL << 22) ? 4 : 2;
+        key.constexprs = {{"BLOCK", key.cfg.block_w}};
+    }
     std::sort(key.constexprs.begin(), key.constexprs.end());
 
     std::shared_ptr<ModuleRes> mod = moduleFor(key, ctx, gen, st, c.cvt_kernels);
@@ -1408,6 +1420,11 @@ Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std:
 
     unsigned grid[3];
     cv_triton_color::grid(n, key.cfg.block_w, grid);
+    if (packed)
+    {
+        // A lane covers four complete pixels; row pitches stay independent.
+        grid[1] = static_cast<unsigned>((n.cols / 4 + key.cfg.block_w - 1) / key.cfg.block_w);
+    }
     st = launch(*mod, a, grid, stream);
     if (!st.ok()) return st;
 

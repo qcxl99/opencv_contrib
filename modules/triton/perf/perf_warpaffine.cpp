@@ -15,10 +15,9 @@ namespace opencv_test { namespace {
 
 typedef ::perf::TestBaseWithParam<testing::tuple<cv::Size, int, int, int>> Sz_Interp_Dtype;
 
-// Three geometries, chosen for different cost structures rather than to be exhaustive:
-// identity-translate (memory-bandwidth bound, the cheapest mapping), a half-pixel translate
-// (every LINEAR tap is fractional, the most expensive weight path), and a rotate+scale (the
-// gather pattern is non-monotonic, so the load stream is not sequential).
+// Three representative geometries: identity, half-pixel translation and rotation/scale.
+// They vary coordinate weights and source access patterns without claiming a measured
+// bandwidth/instruction bottleneck or exhaustive transform coverage.
 struct WaGeometry
 {
     const char* name;
@@ -43,7 +42,7 @@ static cv::Mat toMat(const double m[6])
 // than a range, because a perf row should answer one question.
 PERF_TEST_P(Sz_Interp_Dtype, TritonWarpAffine, testing::Combine(
     testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
-    testing::Values(0, 1, 2),          // index into kGeoms, so the name is visible in output
+    testing::Values(0, 1, 2),          // index into kGeoms; this numeric index appears in output
     testing::Values(CV_8U, CV_16U, CV_32F),
     testing::Values((int)cv::INTER_NEAREST, (int)cv::INTER_LINEAR, (int)cv::INTER_CUBIC)))
 {

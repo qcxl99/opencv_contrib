@@ -92,7 +92,7 @@ inline Request parse(const Json& root)
     (void)text(c, "id");
     r.op = text(root, "op");
     require(r.op == "resize" || r.op == "warpaffine" || r.op == "cvtcolor", "unknown operator");
-    // borderValue is deliberately NOT supported by this exploratory benchmark.
+    // This helper supports the default zero border value only.
     // Reject even zero/null values rather than claim to measure an ignored field.
     require(!c.get("borderValue"), "borderValue is unsupported");
     r.rows = number(c, "src_h");

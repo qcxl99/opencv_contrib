@@ -103,7 +103,9 @@ CV_EXPORTS void cvtColor(InputArray src, OutputArray dst, int code,
 CV_EXPORTS void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, int code,
                          cuda::Stream& stream = cuda::Stream::Null());
 
-/** @brief Convert a CUDA GpuMat; see cvtColor for supported inputs and conversions. */
+/** @brief Convert a CUDA GpuMat; see cvtColor for supported inputs and conversions.
+ * The Python adapter accepts Ptr<cuda::Stream> so an omitted stream can select the default.
+ */
 CV_EXPORTS_AS(cvtColor) void cvtColorForPython(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
                                              int code, Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
 
@@ -150,13 +152,17 @@ CV_EXPORTS void warpAffine(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
                              const Scalar& borderValue = Scalar(),
                              cuda::Stream& stream = cuda::Stream::Null());
 
-/** @brief Resize a CUDA GpuMat; see resize for supported inputs and interpolation. */
+/** @brief Resize a CUDA GpuMat; see resize for supported inputs and interpolation.
+ * The Python adapter accepts Ptr<cuda::Stream> so an omitted stream can select the default.
+ */
 CV_EXPORTS_AS(resize) void resizeForPython(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, Size dsize,
                                          double fx = 0, double fy = 0,
                                          int interpolation = INTER_LINEAR,
                                          Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
 
-/** @brief Transform a CUDA GpuMat; see warpAffine for sampling and border behavior. */
+/** @brief Transform a CUDA GpuMat; see warpAffine for sampling and border behavior.
+ * The Python adapter accepts Ptr<cuda::Stream> so an omitted stream can select the default.
+ */
 CV_EXPORTS_AS(warpAffine) void warpAffineForPython(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
                                                  InputArray M, Size dsize,
                                                  int flags = INTER_LINEAR,

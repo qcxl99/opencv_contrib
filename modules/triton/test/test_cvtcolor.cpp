@@ -6,9 +6,9 @@
 // runtime JIT) against OpenCV's CPU cv::cvtColor.
 //
 // The comparison target is this build's own cv::cvtColor. That is a definite reference, not a
-// claim that every build computes the same numbers: integer arithmetic makes a pixel's result
-// independent of its position in the row (no reduction, no SIMD width), but that is a property
-// of THIS implementation, and a build routed through IPP or a custom HAL is a different one.
+// claim that every build computes the same numbers. Integer/copy paths require exact results;
+// float arithmetic uses the documented per-pixel bound. IPP, HAL and CPU dispatch can change
+// the linked reference arithmetic, so the actual build is part of the evidence.
 // ReferenceBuildIsCharacterised below records that configuration by value; it does not claim to
 // prove which code executed. The codes whose CPU result is not even self-consistent (HSV2BGR,
 // HLS -- float32, SIMD body vs scalar tail) are refused by the module and absent from this file.

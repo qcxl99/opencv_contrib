@@ -15,9 +15,9 @@ static void ownershipChecks(hipStream_t stream)
     const double identity[6] = {1, 0, 0, 0, 1, 0};
     auto call = [&](int operation, const tr::DeviceImage& src, const tr::DeviceImage& dst) {
         const auto handle = reinterpret_cast<std::uintptr_t>(stream);
-        if (operation == 0) tr::resizeDevice(src, dst, {16, 16}, cv::INTER_NEAREST, 0, handle);
-        else if (operation == 1) tr::cvtColorDevice(src, dst, cv::COLOR_BGR2RGB, 0, handle);
-        else tr::warpAffineDevice(src, dst, identity, cv::INTER_NEAREST | cv::WARP_INVERSE_MAP,
+        if (operation == 0) tr::resize(src, dst, {16, 16}, cv::INTER_NEAREST, 0, handle);
+        else if (operation == 1) tr::cvtColor(src, dst, cv::COLOR_BGR2RGB, 0, handle);
+        else tr::warpAffine(src, dst, identity, cv::INTER_NEAREST | cv::WARP_INVERSE_MAP,
                                   cv::BORDER_REPLICATE, cv::Scalar(), 0, handle);
     };
     for (int operation = 0; operation < 3; ++operation)

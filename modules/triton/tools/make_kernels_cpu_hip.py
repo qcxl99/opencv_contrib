@@ -11,7 +11,8 @@ that the checked-in files match the current sources and this generator.
 The source kernels use libdevice operations to preserve floating-point rounding.
 The HIP libdevice implementation does not provide every operation, so this tool
 substitutes the shims below. Kernels without those imports can be used directly.
-Resize also includes the module's HIP-specific complete-window area kernels.
+Resize appends kernels/resize_hip_fast.py; cvtColor appends kernels/cvtcolor_hip_fast.py.
+Edit those maintained sources, not their copies in generated files.
 
 Each generated file records the digest of its local source for traceability.
 """
@@ -153,6 +154,9 @@ def derive(op):
     if op == "resize":
         fast = os.path.join(KERNELS, "resize_hip_fast.py")
         body += "\n\n# HIP-specific complete-window area kernels.\n" + open(fast, encoding="utf-8").read()
+    elif op == "cvtcolor":
+        fast = os.path.join(KERNELS, "cvtcolor_hip_fast.py")
+        body += "\n\n# HIP-specific aligned colour kernels.\n" + open(fast, encoding="utf-8").read()
     return header + body
 
 

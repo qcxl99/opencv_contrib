@@ -44,9 +44,12 @@ using cv_triton_runtime::Status;
 
 namespace {
 
-// perm[]: source channel for each destination channel; -1 means "write 255".
+// Leading columns: name, code, op, scn, dcn, blue, inverse, hrange, perm[].
+// Trailing family-specific fields use CodeSpec defaults when omitted; labels on
+// long rows are reading aids, not C++ designated initializers.
+// perm[] selects source channels; -1 writes opaque alpha (255, 65535 or 1 by depth).
 const CodeSpec TABLE[] = {
-    // ---- channel permutes (scn, dcn, blue, inverse, perm)
+    // ---- channel permutes
     {"BGR2BGRA",     0,  Op::Permute, 3, 4, 0, false, 180, {0, 1, 2, -1}},
     {"BGRA2BGR",     1,  Op::Permute, 4, 3, 0, false, 180, {0, 1, 2, -1}},
     {"BGR2RGBA",     2,  Op::Permute, 3, 4, 0, false, 180, {2, 1, 0, -1}},
@@ -60,7 +63,7 @@ const CodeSpec TABLE[] = {
     // distinguish them. Two rows cover the four names.
     //
     // Op::Permute, not Op::Gray: the permute body already does "copy source channel I(k), or
-    // write 255 when I(k) is -1", and with scn=1 every I(k)=0 reads the single gray byte. Op::Gray
+    // write opaque alpha when I(k) is -1", and with scn=1 every I(k)=0 reads the gray value. Op::Gray
     // would load three channels and compute a luma sum, which is the opposite direction.
     //
     // Not served, and why: the CPU lets dstCn override the code (cvtColor(g,m,COLOR_GRAY2BGR,4)

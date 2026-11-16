@@ -40,8 +40,9 @@ device identity before running tests.
 Use and test
 ------------
 
-HIP applications call `resizeDevice`, `cvtColorDevice` and `warpAffineDevice`
-from `opencv2/triton/device.hpp`. The caller owns device storage and passes a
+HIP applications call the `DeviceImage` overloads of `cv::triton::resize`,
+`cv::triton::cvtColor` and `cv::triton::warpAffine` from
+`opencv2/triton/device.hpp`. The caller owns device storage and passes a
 native stream handle. The three modes of `example_triton_device` demonstrate
 allocation, upload, submission, synchronization and CPU comparison:
 

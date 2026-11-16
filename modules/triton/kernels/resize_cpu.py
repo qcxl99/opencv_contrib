@@ -56,7 +56,11 @@ def _resize_cpu_nearest_kernel(src, dst, xofs, yofs, dst_h, W, cn: tl.constexpr,
 
 @triton.jit
 def _cpu_hlin(rp, o0, o1, a0, a1, inside, m, U8: tl.constexpr):
-    """HResizeLinear for one source row (o0/o1: tap offsets incl. channel)."""
+    """Horizontal LINEAR sum for one source row; o0/o1 include channel offsets.
+
+    inside selects the two-tap region; beyond it the clamped value is copied.
+    U8 retains coefficients scaled by 2048; float operations round separately.
+    """
     v0 = tl.load(rp + o0, mask=m, other=0)
     v1 = tl.load(rp + o1, mask=m, other=0)
     if U8:
@@ -71,7 +75,11 @@ def _cpu_hlin(rp, o0, o1, a0, a1, inside, m, U8: tl.constexpr):
 
 @triton.jit
 def _cpu_hcub(rp, c0, c1, c2, c3, a0, a1, a2, a3, m, U8: tl.constexpr):
-    """HResizeCubic for one source row: taps clamped, ((t0 + t1) + t2) + t3."""
+    """Horizontal CUBIC sum over four clamped taps of one source row.
+
+    U8 keeps the integer coefficient scale for the vertical pass; float sums
+    round separately in the CPU order ((t0 + t1) + t2) + t3.
+    """
     v0 = tl.load(rp + c0, mask=m, other=0)
     v1 = tl.load(rp + c1, mask=m, other=0)
     v2 = tl.load(rp + c2, mask=m, other=0)

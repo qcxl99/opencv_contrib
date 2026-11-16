@@ -2,10 +2,11 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Steady-state timing of the full operator through the runtime JIT, with the native CUDA path
-// as a same-card timing baseline. cv::cuda::resize computes a DIFFERENT result (this module
-// follows CPU cv::resize), so a ratio here compares two computations, not two implementations
-// of one. Compile and first-load costs are excluded by warming up before the measured cycle.
+// Warmed public-call timing, including submission and stream completion, not isolated
+// kernel or graph time. Compilation, first load and reusable output allocation precede
+// the timed cycle. Native CUDA comparison rows are optional and absent on HIP.
+// cv::cuda::resize can use different sampling/rounding from this module's CPU reference;
+// a timing comparison therefore does not establish numerical equivalence.
 
 #include "perf_precomp.hpp"
 

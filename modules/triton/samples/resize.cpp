@@ -2,7 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Minimal buildable example: upload -> cv::triton::resize -> download.
+// CUDA GpuMat example: upload -> cv::triton::resize -> download.
 #include <iostream>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -18,7 +18,7 @@ int main(int argc, char** argv)
     std::cout << "backend: " << cv::triton::backendName() << "\n";
 
     // Supported subset: CV_8U or CV_32F, C1/C3/C4, explicit dsize or fx/fy,
-    // the routes copy, nearest, linear, cubic, integer and fractional area -- see opencv2/triton.hpp's module doc comment.
+    // copy, nearest, linear, cubic, integer and fractional area -- see doc/resize.markdown.
     cv::Mat host = (argc > 1) ? cv::imread(argv[1], cv::IMREAD_COLOR)
                               : cv::Mat(720, 1280, CV_8UC3, cv::Scalar(64, 128, 192));
     if (host.empty()) { std::cerr << "failed to read input\n"; return 1; }

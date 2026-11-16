@@ -65,8 +65,9 @@ cv_triton_runtime::DeviceView view(const DeviceImage& m, int device)
     // device/range, and obtain the active context's real lifetime identity.
     std::uintptr_t native = 0;
     std::uint64_t lifetime = 0;
-    detail::requireStatus(runtime::contextIdentity(device,native,lifetime),"HIP context identity");
-    current=reinterpret_cast<hipCtx_t>(native);generation=lifetime;
+    detail::requireStatus(runtime::contextIdentity(device, native, lifetime), "HIP context identity");
+    current = reinterpret_cast<hipCtx_t>(native);
+    generation = lifetime;
     if (hipCtxGetDevice(&actual) != hipSuccess || actual != device ||
         hipPointerGetAttributes(&attributes, reinterpret_cast<void*>(m.ptr)) != hipSuccess ||
         attributes.device != device || allocationMemoryType(attributes,0) != hipMemoryTypeDevice ||
@@ -144,16 +145,16 @@ bool haveDevice(int device)
     return runtime::deviceAvailable(device);
 }
 
-void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
-                  int interpolation, int device, std::uintptr_t stream)
+void resize(const DeviceImage& src, const DeviceImage& dst, Size dsize,
+            int interpolation, int device, std::uintptr_t stream)
 {
     if (dsize.width <= 0 || dsize.height <= 0)
         CV_Error(Error::StsBadArg, "cv::triton::resize: dsize must be explicit and non-empty");
-    resizeDevice(src, dst, dsize, 0.0, 0.0, interpolation, device, stream);
+    resize(src, dst, dsize, 0.0, 0.0, interpolation, device, stream);
 }
 
-void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
-                  double fx, double fy, int interpolation, int device, std::uintptr_t stream)
+void resize(const DeviceImage& src, const DeviceImage& dst, Size dsize,
+            double fx, double fy, int interpolation, int device, std::uintptr_t stream)
 {
     const auto source = view(src, device);
     const auto output = detail::resizeOutput(source, dsize, fx, fy, interpolation);
@@ -165,8 +166,8 @@ void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
     detail::resizeDevice(source, view(dst, device), dsize, fx, fy, interpolation, device, stream);
 }
 
-void cvtColorDevice(const DeviceImage& src, const DeviceImage& dst, int code,
-                    int device, std::uintptr_t stream)
+void cvtColor(const DeviceImage& src, const DeviceImage& dst, int code,
+              int device, std::uintptr_t stream)
 {
     const auto source = view(src, device);
     const auto output = detail::cvtColorOutput(source, code);
@@ -183,9 +184,9 @@ void cvtColorDevice(const DeviceImage& src, const DeviceImage& dst, int code,
     detail::cvtColorDevice(req, device, stream);
 }
 
-void warpAffineDevice(const DeviceImage& src, const DeviceImage& dst, const double M[6],
-                      int flags, int borderMode, const Scalar& borderValue,
-                      int device, std::uintptr_t stream)
+void warpAffine(const DeviceImage& src, const DeviceImage& dst, const double M[6],
+                int flags, int borderMode, const Scalar& borderValue,
+                int device, std::uintptr_t stream)
 {
     if (flags & ~(INTER_MAX | WARP_INVERSE_MAP))
         CV_Error(Error::StsUnsupportedFormat, "cv::triton::warpAffine: unsupported flags");

@@ -56,14 +56,14 @@ static void cvtRuntimeChecks(hipStream_t stream)
         // The runtime clamps a zero limit to one; replace that last table
         // with an unrelated resize plan before requesting a fresh color family.
         detail::setCacheLimits(1, 1);
-        tr::resizeDevice(sourceB.view(), scratch.view(), {31, 23}, cv::INTER_NEAREST, 0,
+        tr::resize(sourceB.view(), scratch.view(), {31, 23}, cv::INTER_NEAREST, 0,
                          reinterpret_cast<std::uintptr_t>(stream));
         HIPOK(hipStreamSynchronize(stream));
         detail::setCacheLimits(64, 256);
         const auto before = detail::runtimeStats();
-        tr::cvtColorDevice(sourceA.view(), outputA.view(), code, 0,
+        tr::cvtColor(sourceA.view(), outputA.view(), code, 0,
                            reinterpret_cast<std::uintptr_t>(stream));
-        tr::cvtColorDevice(sourceB.view(), outputB.view(), code, 0,
+        tr::cvtColor(sourceB.view(), outputB.view(), code, 0,
                            reinterpret_cast<std::uintptr_t>(other));
         HIPOK(hipStreamSynchronize(stream));
         HIPOK(hipStreamSynchronize(other));
@@ -76,16 +76,16 @@ static void cvtRuntimeChecks(hipStream_t stream)
 
     // Warm both complete table closures on the capture stream. In particular,
     // Luv forward owns the large 33^3 LUT as well as its small family tables.
-    tr::cvtColorDevice(sourceA.view(), outputA.view(), cv::COLOR_BGR2Luv, 0,
+    tr::cvtColor(sourceA.view(), outputA.view(), cv::COLOR_BGR2Luv, 0,
                        reinterpret_cast<std::uintptr_t>(stream));
-    tr::cvtColorDevice(sourceA.view(), outputB.view(), cv::COLOR_BGR2HSV, 0,
+    tr::cvtColor(sourceA.view(), outputB.view(), cv::COLOR_BGR2HSV, 0,
                        reinterpret_cast<std::uintptr_t>(stream));
     HIPOK(hipStreamSynchronize(stream));
     const auto beforeCapture = detail::runtimeStats();
     HIPOK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
-    tr::cvtColorDevice(sourceA.view(), outputA.view(), cv::COLOR_BGR2Luv, 0,
+    tr::cvtColor(sourceA.view(), outputA.view(), cv::COLOR_BGR2Luv, 0,
                        reinterpret_cast<std::uintptr_t>(stream));
-    tr::cvtColorDevice(sourceA.view(), outputB.view(), cv::COLOR_BGR2HSV, 0,
+    tr::cvtColor(sourceA.view(), outputB.view(), cv::COLOR_BGR2HSV, 0,
                        reinterpret_cast<std::uintptr_t>(stream));
     HIPOK(hipStreamEndCapture(stream, &restore.graph));
     HIPOK(hipGraphInstantiate(&restore.executable, restore.graph, nullptr, nullptr, 0));
@@ -95,7 +95,7 @@ static void cvtRuntimeChecks(hipStream_t stream)
     // different resize module/table through that last slot too, so BOTH
     // captured conversions are genuinely evicted rather than merely shrunk.
     detail::setCacheLimits(1, 1);
-    tr::resizeDevice(sourceB.view(), scratch.view(), {31, 23}, cv::INTER_NEAREST, 0,
+    tr::resize(sourceB.view(), scratch.view(), {31, 23}, cv::INTER_NEAREST, 0,
                      reinterpret_cast<std::uintptr_t>(stream));
     HIPOK(hipStreamSynchronize(stream));
     const auto evicted = detail::runtimeStats();

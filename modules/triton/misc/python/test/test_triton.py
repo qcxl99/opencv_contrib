@@ -14,7 +14,8 @@ from tests_common import NewOpenCVTests, unittest
 #
 #   1. The binding exists and is callable, returns the requested shape, dtype and
 #      channel count, and raises on unsupported inputs. This holds on ANY
-#      build that has a Triton backend -- it needs no particular CPU build.
+#      CUDA build with a usable Triton backend; no particular CPU build is required.
+#      HIP's Python GpuMat refusal path is checked separately below.
 #   2. The numbers match CPU cv::resize of the PINNED reference configuration
 #      (OpenCV 5.0.0 generic resize.cpp path, SSE3 baseline, no IPP, no custom
 #      HAL). cv::resize of an arbitrary build is that reference only if the
@@ -333,7 +334,7 @@ def _cvt_cpu_separate4():
 
 
 class triton_cvtcolor_test(_TritonBase):
-    """The cvtColor binding, against this build's own integer CPU path."""
+    """CUDA cvtColor bindings against the linked CPU reference, per supported depth."""
 
     def _check_integer_matrix(self, cases, dtype):
         rng = np.random.RandomState(3)
@@ -437,7 +438,7 @@ class triton_cvtcolor_test(_TritonBase):
 
     def test_rejected_codes_raise(self):
         img = np.zeros((32, 32, 3), np.uint8)
-        # The float32 conversions: refused by name rather than served under a tolerance.
+        # Reverse HSV and HLS are unsupported conversion families, even at uint8.
         for code in (cv.COLOR_HSV2BGR, cv.COLOR_BGR2HLS):
             with self.assertRaises(cv.error):
                 cv.triton.cvtColor(cv.cuda_GpuMat(img), code)
@@ -535,8 +536,9 @@ class triton_warpaffine_binding_test(_TritonBase):
                     self.assertEqual(got.dtype, img.dtype)
 
     def test_matrix_accepts_float32_and_float64(self):
-        # cv::warpAffine takes either; the module narrows to double internally, so both must give
-        # the same result. A binding that forwarded the Mat blindly would handle one of them.
+        # Both matrix depths are accepted and converted to double before sampling.
+        # This fixture compares their outputs; it does not promise that arbitrary
+        # coefficients rounded to float32 preserve float64 sampling boundaries.
         rng = np.random.RandomState(1)
         img = rng.randint(0, 256, (37, 53, 3)).astype(np.uint8)
         g = cv.cuda_GpuMat(img)

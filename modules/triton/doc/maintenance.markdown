@@ -11,6 +11,17 @@ from the CPU output evaluator under `test/`; tests also compare against the
 linked OpenCV CPU implementations where documented. Keep algorithmic source
 attribution and license notices with the relevant implementation.
 
+For a first source read, follow one call through these layers:
+
+| Layer | Start here | Responsibility |
+|---|---|---|
+| Public API | `include/opencv2/triton.hpp`, `include/opencv2/triton/device.hpp` | Input/output types, supported options and asynchronous ownership |
+| Entry validation | `src/cuda_resize_adapter.cpp`, `src/device_entries.cpp` | Output metadata, actual device views, overlap and stream admission |
+| Operation plan | `src/runtime/provider.cpp`, `cvtcolor.cpp`, `warpaffine.cpp` | Sampling rules, kernel choice, compile key and launch shape |
+| Backend runtime | `src/runtime/cuda_runtime.cpp` and its generated HIP counterpart | Compile/load, stream submission, caches and resource retention |
+| Device computation | `kernels/` | The arithmetic and memory accesses executed on the GPU |
+| Validation | `validation/`, `test/`, `perf/` | Shared cases, numerical references, lifecycle checks and timing |
+
 `validation/` contains private shared accuracy/performance support. CMake
 selects `device_cuda.cpp` or `device_hip.cpp`; each calls its backend's public
 module entry points. These test helpers are not installed. Backend lifecycle
@@ -29,10 +40,12 @@ python3 tools/make_kernels_cpu_hip.py --check
 python3 tools/port_hip_runtime.py --check
 ```
 
-The first generator derives HIP kernel sources, including the HIP resize fast
-paths from `kernels/resize_hip_fast.py`. The second derives the HIP runtime from
-`src/runtime/cuda_runtime.cpp`. Preserve layout and alignment guards in the
-resize planner. Configure checks reject stale generated files.
+The first generator derives HIP kernel sources, including the fast paths in
+`kernels/resize_hip_fast.py` and `kernels/cvtcolor_hip_fast.py`. The second derives
+the HIP runtime from `src/runtime/cuda_runtime.cpp` and the HIP-specific substitutions
+in `tools/port_hip_runtime.py`. Edit these sources rather than generated files.
+Preserve layout and alignment guards in the planners and runtime.
+Configure checks reject stale generated files.
 
 Build and test
 --------------
@@ -81,37 +94,46 @@ to the library; both forms support the explicit override.
 Asynchronous cleanup and context ownership
 -----------------------------------------
 
-Completion queries distinguish success, not-ready and error. Capture submission
-skips event reclamation entirely. A query error is observable through a failed
-runtime submission/reap, a diagnostic and private cleanup counters; the resource
-is not released on an unknown completion status. Last-owner cleanup failures
-retain the entire module/table owner, including upload host bytes, in a private
-process-lifetime retirement queue. Noncapturing submissions and explicit noncapturing reaps
-retry completion checks without synchronizing the normal path. An unknown outcome
-of free/unload/event-destruction is not retried as the same irreversible call; that
-owner remains held until its context is known destroyed. A successful device-side wait
-alone does not release upload host memory. A failed/unrecorded completion marker
-is retained until context destruction can be established; persistent driver
-errors can therefore retain resources until process exit. Counters/diagnostics
-must be inspected rather than treating this as successful cleanup. Known-destroyed
-contexts release host ownership without querying old events or switching to them.
-Unknown context errors retain ownership rather than guessing destruction.
-While resources with failed cleanup remain held, later submissions and explicit
-cleanup calls report an error instead of silently accumulating more resources; recovery requires proven
-completion/context destruction, or process restart for persistent driver failure.
+An in-flight call retains its modules, device tables and upload host bytes until
+completion is proven. The decisions in `src/runtime/lifetime.hpp` distinguish
+unfinished work from failed cleanup:
 
-A runtime-created primary context has one deliberate process-lifetime retain per
-device. Host threads borrow that owner, including after SetCurrent failure; they
-do not add retains per invocation/thread. HIP context identification through `hipCtxGetId`, when available, and the
-fallback that retains a primary context share the same resource owner. The fallback registry adds identity metadata, not
-another retain. This keeps module/table caches valid. The module deliberately does
-not release that owner during static teardown after the driver may be gone.
-Arbitrary primary-context resets and private contexts are unsupported by this fallback.
+| Condition | Cleanup behavior |
+|---|---|
+| Stream capture is active | Skip completion queries and reclamation, including failed-event metadata reaping. |
+| Context is known destroyed | Release host ownership without querying old events or switching to that context. |
+| Context state is unknown | Retain ownership and report an error; do not infer destruction. |
+| Completion query succeeds | Release references for the completed operation and attempt event cleanup. |
+| Completion query is not-ready | Retain resources for a later noncapturing check. A device-side wait alone does not prove upload host bytes can be released. |
+| Completion query fails | Retain resources and report the error through submission/reap status, diagnostics and private counters. |
+| Upload started without a valid recorded completion marker | Retain ownership until context destruction is established. |
 
-If destruction of a completion event fails AFTER completion was proven, the
-retained references to the completed operation's modules and tables may be released. The call still reports the failure;
-its event handle/context identity are retained as failed metadata without retrying
-that irreversible destroy. Metadata is dropped only when context destruction is
-known, or at process exit. This completed-event case does not imply unfinished GPU
-work and does not block later unrelated calls; the `RuntimeStats::retired_resources` counter includes
-those retained event handles. Capture skips even this metadata reaping.
+If last-owner cleanup fails, a private process-lifetime retirement queue holds
+the entire module/table owner, including upload host bytes. Noncapturing
+submissions and explicit reaps retry eligible completion checks without adding
+normal-path synchronization. An unknown result from free, unload or event
+destruction is not retried as the same irreversible call; that owner remains
+held until its context is known destroyed.
+
+While failed resource cleanup remains unresolved, later submissions and explicit
+cleanup calls report an error rather than silently accumulating resources.
+Recovery requires proven completion/context destruction, or a process restart
+for persistent driver failure. Inspect diagnostics and counters; retention until
+process exit is not successful cleanup.
+
+There is a distinct completed-event case: if event destruction fails after
+completion was proven, module/table references may be released. The failure is
+still reported, and the event handle/context identity remain as failed metadata
+until context destruction is known or the process exits. That irreversible
+destroy is not retried. No unfinished work is implied, so this metadata does not
+block unrelated calls. `RuntimeStats::retired_resources` includes these handles.
+
+Primary-context ownership follows these rules:
+
+- The runtime retains one primary context per device for its process-lifetime caches.
+- Host threads borrow it, including after `SetCurrent` failure; calls and short-lived
+  threads do not add retains.
+- HIP's `hipCtxGetId` path and its fallback share that owner. The fallback registry
+  adds identity metadata, not another retain.
+- Static teardown does not release the owner after the driver may be gone.
+  Arbitrary primary-context resets and private contexts are unsupported by this fallback.

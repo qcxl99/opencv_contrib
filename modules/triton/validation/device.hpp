@@ -3,7 +3,8 @@
 // of this distribution and at http://opencv.org/license.html.
 
 // Test/perf support only; never installed or linked into the production module.
-// Backend source is selected once by CMake. Calls must go through the PUBLIC operator API.
+// Backend source is selected once by CMake. Calls go through the public operator API:
+// GpuMat overloads on CUDA and DeviceImage overloads on HIP.
 #ifndef OPENCV_TRITON_VALIDATION_DEVICE_HPP
 #define OPENCV_TRITON_VALIDATION_DEVICE_HPP
 #include <memory>
@@ -18,7 +19,9 @@ class Stream
 public:
     struct Impl;
     explicit Stream(bool useDefault = false);
+    // Wait on the host for this stream to complete.
     void wait() const;
+    // Add a device-side dependency; the host does not wait for the producer.
     void waitFor(const Stream& producer) const;
     std::shared_ptr<Impl> impl;
 };
@@ -28,9 +31,11 @@ public:
     struct Impl;
     Image();
     Image(cv::Size size, int type);
-    Image(const Image& parent, cv::Rect roi);
+    Image(const Image& parent, cv::Rect roi);  // shared allocation, independent view/pitch
+    // Blocking transfers used for setup/checking, outside performance cycles.
     void upload(const cv::Mat& host);
     cv::Mat download() const;
+    // Reuse matching storage; otherwise allocate the requested size/type.
     void create(cv::Size size, int type);
     cv::Size size() const;
     int type() const;

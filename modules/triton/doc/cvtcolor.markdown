@@ -2,6 +2,7 @@ Triton cvtColor {#tutorial_triton_cvtcolor}
 ===============
 
 The optional Triton module provides explicit `cv::triton::cvtColor` calls.
+CUDA callers pass `GpuMat`; HIP callers pass caller-owned `DeviceImage` views.
 The table below lists every supported conversion. The native
 code table contains 84 distinct numeric codes at CV_8U, 20 at CV_16U and 20 at
 CV_32F. Enum aliases share a row. A supported code at one depth does not imply
@@ -18,6 +19,29 @@ single row-pitched CV_8UC1 image with an even width and a height divisible by 3:
 its first H rows are luma, followed by H/2 rows of interleaved chroma; output is
 H by W. ROI pitch is respected for both planes. Invalid geometry and offsets
 outside the runtime integer indexing range are refused.
+
+Calling the function
+--------------------
+
+The following CUDA example converts a host BGR image to device-resident gray:
+
+```cpp
+#include <opencv2/triton.hpp>
+
+cv::cuda::GpuMat src(host), gray;  // host is a CV_8UC3 cv::Mat
+cv::cuda::Stream stream;
+cv::triton::cvtColor(src, gray, cv::COLOR_BGR2GRAY, stream);
+stream.waitForCompletion();
+```
+
+The destination is allocated or reused. Calls are asynchronous; retain both
+allocations until the stream completes. HIP uses the `DeviceImage` overload
+from `opencv2/triton/device.hpp`, with preallocated output and a native stream
+handle. The complete allocation/upload/download example is
+`samples/hip/device.cpp` (`example_triton_device cvtcolor`).
+
+Numerical behavior
+------------------
 
 Integer conversions and float channel copies compare exactly against the
 linked OpenCV CPU implementation. Finite float gray/YUV/YCrCb arithmetic uses
@@ -45,11 +69,9 @@ An unidentified profile retains the fused/scaled path and is explicitly not
 qualified for the additional absolute cap. Copy paths remain exact.
 
 
-CUDA uses GpuMat and the public Python bindings. HIP uses the C++ DeviceImage
-entries in `opencv2/triton/device.hpp`; `example_triton_device cvtcolor` shows
-allocation, upload, explicit stream submission, synchronization and comparison.
+CUDA provides GpuMat Python bindings. The HIP `DeviceImage` overload is C++ only.
 All three Python GpuMat adapters (resize, cvtColor and warpAffine) return
-catchable StsNotImplemented on HIP, including default/None streams.
+catchable `StsNotImplemented` on HIP, including default/`None` streams.
 
 Calls are asynchronous. Callers retain their images and order producers and
 consumers. The runtime keeps compiled modules and HSV/Lab/Luv tables alive

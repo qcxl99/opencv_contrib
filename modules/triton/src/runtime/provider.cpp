@@ -260,8 +260,10 @@ LaunchConfig default_config(const Normalized& n, const Target* target) {
         cfg.block_w = DISPATCH_FALLBACK_BLOCK_W;
         cfg.num_warps = DISPATCH_FALLBACK_NUM_WARPS;
     }
-    // HIP uses these launch defaults for the listed route/layout classes. They
-    // apply to every HIP target, not an architecture-specific optimum; benchmark
+    // HIP uses launch defaults by route, channel layout and scale direction;
+    // BLOCK_W counts channel elements for nearest/separable kernels, pixels for AREA.
+    // These are tuning choices, not sampling rules or proven hardware mechanisms.
+    // They apply to every HIP target, not an architecture-specific optimum; benchmark
     // the actual device before carrying over a performance claim. CUDA uses the table.
     if (target && target->backend == "hip" && static_cast<long long>(n.dst_h) * n.dst_w >= 65536) {
         const bool f32 = n.type == ElemType::F32;
@@ -270,12 +272,15 @@ LaunchConfig default_config(const Normalized& n, const Target* target) {
             std::max(n.src_h,n.src_w) < (1 << 23) && sy >= 1 && sx >= 1 &&
             sy == std::floor(sy) && sx == std::floor(sx) && std::fmod(sy,2.0) == 1 && std::fmod(sx,2.0) == 1;
         if (f32 && n.dst_h <= n.src_h && n.dst_w <= n.src_w) {
+            // Aligned C1 nearest and C3 linear downscales use distinct row/width tiles.
             if (look.kind == ref::ROUTE_NEAREST && n.channels == 1 && n.src_w % 128 == 0 && n.dst_w % 128 == 0)
                 { cfg.block_h=2; cfg.block_w=512; cfg.num_warps=2; }
             else if (look.kind == ref::ROUTE_LINEAR && n.channels == 3)
                 { cfg.block_h=4; cfg.block_w=256; cfg.num_warps=1; }
         }
         if (!f32) {
+            // Odd-integer LINEAR ratios select a point sample; exact 2x2 windows
+            // have dedicated channel layouts. Other LINEAR rows distinguish up/downscale.
             if (point) { cfg.block_h=1; cfg.block_w=512; cfg.num_warps=4; }
             else if (two && n.channels == 1) { cfg.block_h=1; cfg.block_w=1024; cfg.num_warps=4; }
             else if (two && n.channels == 4) { cfg.block_h=1; cfg.block_w=512; cfg.num_warps=8; }

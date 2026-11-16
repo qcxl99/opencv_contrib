@@ -1,98 +1,128 @@
 # Internal HIP graph metric
 
-This optional internal helper measures warmed production `DeviceImage` calls
-captured repeatedly on one fixed nondefault stream. It uses the production
-dispatch and kernels and has no Torch dependency.
+This optional helper measures warmed production `DeviceImage` calls captured
+repeatedly on one fixed nondefault stream. It uses production dispatch and
+kernels, with no Torch dependency. It measures the Triton implementation only:
+`baseline_status: BASELINE_UNAVAILABLE` means there is no baseline latency or
+speedup ratio. Graph timing does not establish ordinary-call performance or
+complete application qualification.
 
-For an enabled HIP OpenCV module build, set `BUILD_PERF_TESTS=ON` and
-`TRITON_BUILD_HIP_GRAPH_BENCH=ON` to build `opencv_perf_triton_hip_graph`. The option
-is OFF by default and respects the selected perf module list. Inputs are private
-benchmark requests in JSON: `op`, `case`,
-`input_path`/`input_sha256`, `changed_path`/`changed_sha256`, `captured_calls` and
-`samples`. Input files hold contiguous array bytes identified by file hashes;
-only the helper's independently allocated pitched buffers are passed to production calls.
-No runtime pointer is accepted from the request. The request must declare safe
-positive dimensions/depths and at most 250 captured calls; the number of timed
-replays is fixed at 10.
+## Build and request
 
-Confirm the selected device is idle and follow the host's device-use requirements.
-The `--primitive-control` option captures a 64-byte asynchronous memory fill and
-checks three replays, overwriting the destination before each replay to verify
-that the graph performs the expected writes. First validate a tiny warmed production
-request before increasing scope. Do not run archived binaries or infer another
-platform's capture support. API/device errors stop the process without reset or
-blind retries. The helper deliberately leaves unknown-completion resources to
-supervised process exit instead of freeing potentially in-flight storage.
+For an enabled HIP module build, set `BUILD_PERF_TESTS=ON` and
+`TRITON_BUILD_HIP_GRAPH_BENCH=ON` to build `opencv_perf_triton_hip_graph`.
+The latter option is OFF by default and respects the selected perf module list.
 
-Before capture: allocate input/output storage with surrounding guard bytes to
-detect out-of-bounds writes; resolve the actual public dispatch, JIT compilation
-and table uploads; execute 20 warmup calls and synchronize. Capture N
-identical production calls, end capture, inspect nodes and instantiate. No helper
-compile/module load/table upload may occur inside capture. Never choose a binary
-by filename or bypass the real entry. The recorded production key/route and
-verified hashes of the compiled binary and its metadata file identify that path;
-graph kernel node parameters
-record actual functions/grid/block/shared geometry and work counts.
+Each JSON request supplies:
 
-Correctness checks include full ordinary-versus-graph equality, the existing
-independent numerical reference, source mutation with newly computed reference,
-two destination fill patterns, unchanged input/output guard bytes and multiple
-replays. A host-side record of buffer addresses, alignment, types, shapes, row
-pitches and operator parameters is checked before graph submission; mismatches
-are rejected. The helper does not cache a graph across requests.
-Each request also evicts entries from the least-recently-used runtime cache and
-replays while retained references keep the graph's modules and tables alive,
-then performs a second construct/replay/destroy cycle.
+| Field | Meaning |
+|---|---|
+| `op`, `case` | Operator and its dimensions, depth, channels and supported options |
+| `input_path`, `input_sha256` | Contiguous input bytes and their file hash |
+| `changed_path`, `changed_sha256` | A second input whose expected output differs |
+| `captured_calls` | Calls per graph, from 1 to 250; default 250 |
+| `samples` | Timed replays, fixed at 10 |
+| `roi` | Use a pitched ROI; boolean or exact integer 0/1 |
 
-Timing: the fixed workload uses N = 250 production calls per graph and 10 timed
-replays. Each sample is `hipEventElapsedTime(start,stop)/N` for one graph launch
-on the same explicit stream; report raw total/per-call samples and median/p10/p90/range.
-No minimum selection or L2 flush is inserted into the graph. Inputs/outputs are
-reused, so this is a warm repeated-buffer graph metric, not ordinary caller
-submission latency or isolated kernel latency. Host-side buffer and parameter
-checks are outside the timed bracket. The interval still includes graph launch/device scheduling
-costs. Host wall times for capture, instantiation, warmup and the first production
-call are reported separately. Another measurement executes 250 ordinary calls
-and reports both GPU-event time per call and host wall time per completed call. The raw field
-`first_compile_call_wall_ms` measures the first production request in that process,
-including conditional JIT/cache lookup/load. This is not isolated compiler time,
-nor does it prove that compilation occurred. Use binary creation records to distinguish
-new compilation from reuse of an existing compiled binary.
+The helper allocates its own pitched device buffers. It never accepts runtime
+pointers from requests. Dimensions, allocation products and options are validated
+before GPU allocation. Validation also checks:
 
-Before freeing: synchronize successful work; destroy graphExec then graph; release
-the references retaining graph modules and tables only after all graphs are
-destroyed; reclaim resources from completed launches;
-then destroy events, free storage and destroy the stream. Input/output/stream and
-context stay live throughout. Unknown completion never grants early release.
+- Strings, booleans and all six matrix entries have the required types; numeric
+  values are finite and integer fields fit their declared ranges.
+- Duplicate and unknown fields are refused. `case.id` is an optional string.
+- Only the parser's listed interpolation aliases and borders are accepted.
+  Colour conversions have no interpolation mode; their declared output size
+  must match the actual conversion output.
+- Any `case.borderValue` field is refused, including zero or null. This helper
+  uses the default zero border value; production operator support is unchanged.
+- Same-size resize copies are refused here because they have no compiled-kernel
+  manifest identity. Production copy support is unchanged.
+- Float input files contain finite values, and both input hashes match their bytes.
 
-Results label the measurement `graph_replay` and preserve raw observations for
-each case. This helper measures the Triton implementation only and does not run
-a reference implementation for performance comparison. Its
-`baseline_status: BASELINE_UNAVAILABLE` output therefore means that no baseline
-latency or speedup ratio is available. Graph replay timings do not establish
-ordinary-call performance or satisfy an application's correctness and performance
-acceptance requirements.
+`request_sha256` identifies the accepted JSON. `executed_parameters` records the
+normalized options and defaults, so an omitted field cannot hide a changed
+matrix, interpolation, shape or border setting.
 
-Request validation is strict and runs before GPU allocation. Dimensions, channels,
-budgets and ROI flags are checked without narrowing; strings, booleans and all
-six matrix entries must have the stated types and finite values. Only the listed
-mode aliases/borders are accepted. `roi` accepts a boolean or an exact
-integer 0/1. Duplicate/unknown fields are refused. `case.id` is an optional string.
-Any `case.borderValue` field is explicitly refused, including zero/null; this
-exploratory tool currently measures the default zero border value only. Production
-operator support is unchanged. Destination dimensions for colour conversion must
-match its actual output dimensions. Requests cannot silently change matrix,
-interpolation, shape or border settings; `request_sha256` identifies the exact
-accepted JSON, including its explicit options and deterministic defaults.
+## Prepare and capture
 
-This optional helper reports timings for the Triton implementation. CPU parser
-tests do not establish HIP graph execution, and a result on one HIP architecture
-does not establish support on another.
+1. Confirm the selected device is idle and follow the host's device-use rules.
+   Use the current build; do not infer capture support from another platform.
+2. Run `--primitive-control`. It captures a 64-byte asynchronous fill and checks
+   three replays, overwriting the destination before each replay.
+3. Validate a tiny production request before increasing scope.
+4. Warm JIT compilation, module load and table uploads with 20 calls on the
+   capture stream, then synchronize.
+5. Capture N identical production calls, end capture, inspect nodes and instantiate.
+   Compilation, module load and table upload must not occur inside capture.
 
-Run `tools/check_source.py` for request-validation and error-handling checks
-without allocating GPU resources. Check actual graph execution on the intended
-HIP device.
+The helper records the actual production key/route and verifies hashes of the
+compiled binary and metadata. Kernel-node parameters record actual functions,
+grid/block/shared-memory geometry and work counts. It does not select a binary
+by filename or bypass the public entry.
 
-Same-size resize copies are explicitly refused by this graph tool because they
-have no compiled-kernel manifest identity. Production same-size copy support is
-unchanged. Float input files must contain finite values.
+## Correctness and lifetime controls
+
+Each request checks:
+
+- Ordinary output against the independent numerical reference, then full
+  ordinary-versus-graph equality.
+- Changed input against a newly computed reference, with two destination fill
+  patterns and repeated replays to detect empty or stale work.
+- Unchanged input and output guard bytes around the valid views.
+- Buffer addresses, alignment, types, shapes, pitches and parameter identity
+  before submission; changed bindings are rejected.
+- Replay after entries are evicted from the runtime's least-recently-used cache.
+  Retained references must keep graph modules and tables alive.
+- A second construct/replay/destroy cycle, separate from the timing population.
+
+Graphs are not cached across requests. CPU parser tests establish request
+validation, not HIP capture/replay support.
+
+## Timing
+
+For the default workload, N is 250 production calls per graph. Smaller controls
+may request 1..250 calls. The helper collects 10 samples:
+
+1. Record a start event on the graph's explicit stream.
+2. Launch the graph once and record a stop event on the same stream.
+3. Wait for the stop event and compute `hipEventElapsedTime(start, stop) / N`.
+4. Retain both total-graph and per-call samples; report median, p10, p90 and range.
+
+No minimum selection or L2 flush is inserted. Buffers are reused, so this is a
+warm repeated-buffer metric, not ordinary submission or isolated kernel latency.
+Host-side binding checks are outside the timed bracket. Graph launch/device
+scheduling costs remain inside it.
+
+Other measurements remain separate:
+
+| Measurement | Boundary |
+|---|---|
+| First production call | Host wall, including conditional JIT/cache lookup/load |
+| Warmup | Host wall for 20 calls and completion |
+| Capture and instantiation | Separate host wall costs |
+| Ordinary calls | GPU-event time and completion wall, each divided by 250 calls |
+
+The raw field `first_compile_call_wall_ms` names the first production request
+in that process. It is not isolated compiler time and does not prove compilation
+occurred. Use binary creation records to distinguish compilation from cache reuse.
+
+## Cleanup and errors
+
+After successful work:
+
+1. Synchronize the stream.
+2. Destroy the graph executable, then the graph.
+3. Release graph-retained module/table references only after all graphs are destroyed.
+4. Reclaim resources from completed launches.
+5. Destroy events, free storage and destroy the stream.
+
+Buffers, stream and context stay live throughout. API/device errors stop the
+process without reset or blind retries. Unknown completion never permits early
+release: the helper leaves potentially in-flight resources to supervised process
+exit rather than retrying unsafe cleanup.
+
+Run `tools/check_source.py` for CPU request-validation and error-handling controls.
+Check actual graph execution on the intended HIP device; a result on one
+architecture does not establish support on another. Results use `graph_replay`
+and preserve raw observations for each case.

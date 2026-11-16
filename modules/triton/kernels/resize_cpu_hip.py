@@ -1,5 +1,5 @@
 # Generated HIP resize kernels; regenerate with tools/make_kernels_cpu_hip.py.
-# source_sha256: 5d341b487bda349cee7e8118faf23a28e06ffda9a59ef220cfa502f8e71e7cd5
+# source_sha256: 788652ff361fa460b948f5622bd50ec7a8d2d47c751a15cf09d78869c1ff90ff
 # This file is part of OpenCV project.
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
@@ -89,7 +89,11 @@ def _resize_cpu_nearest_kernel(src, dst, xofs, yofs, dst_h, W, cn: tl.constexpr,
 
 @triton.jit
 def _cpu_hlin(rp, o0, o1, a0, a1, inside, m, U8: tl.constexpr):
-    """HResizeLinear for one source row (o0/o1: tap offsets incl. channel)."""
+    """Horizontal LINEAR sum for one source row; o0/o1 include channel offsets.
+
+    inside selects the two-tap region; beyond it the clamped value is copied.
+    U8 retains coefficients scaled by 2048; float operations round separately.
+    """
     v0 = tl.load(rp + o0, mask=m, other=0)
     v1 = tl.load(rp + o1, mask=m, other=0)
     if U8:
@@ -104,7 +108,11 @@ def _cpu_hlin(rp, o0, o1, a0, a1, inside, m, U8: tl.constexpr):
 
 @triton.jit
 def _cpu_hcub(rp, c0, c1, c2, c3, a0, a1, a2, a3, m, U8: tl.constexpr):
-    """HResizeCubic for one source row: taps clamped, ((t0 + t1) + t2) + t3."""
+    """Horizontal CUBIC sum over four clamped taps of one source row.
+
+    U8 keeps the integer coefficient scale for the vertical pass; float sums
+    round separately in the CPU order ((t0 + t1) + t2) + t3.
+    """
     v0 = tl.load(rp + c0, mask=m, other=0)
     v1 = tl.load(rp + c1, mask=m, other=0)
     v2 = tl.load(rp + c2, mask=m, other=0)
@@ -613,14 +621,19 @@ def _hip_area2_packed(src, dst, dst_h, dst_w, src_rs, dst_rs, src_bs, dst_bs,
     c = tl.load(sp + src_rs // 4, mask, 0)
     d = tl.load(sp + src_rs // 4 + 1, mask, 0)
     if C1:
+        # Separate byte positions into 16-bit lanes; each lane sums one 2x2 window.
         ac = (a & 0x00ff00ff) + ((a >> 8) & 0x00ff00ff) + (c & 0x00ff00ff) + ((c >> 8) & 0x00ff00ff)
         bd = (b & 0x00ff00ff) + ((b >> 8) & 0x00ff00ff) + (d & 0x00ff00ff) + ((d >> 8) & 0x00ff00ff)
+        # Add the integer rounding bias to each lane, then divide each sum by four.
         ac = (ac + 0x00020002) >> 2
         bd = (bd + 0x00020002) >> 2
+        # Repack the four averaged grayscale pixels into their output byte order.
         value = (ac & 255) | ((ac >> 8) & 0xff00) | ((bd & 255) << 16) | ((bd & 0xff0000) << 8)
     else:
+        # C4 keeps channels independent: average even/odd bytes in separate lanes.
         lo = ((a & 0x00ff00ff) + (b & 0x00ff00ff) + (c & 0x00ff00ff) + (d & 0x00ff00ff) + 0x00020002) >> 2
         hi = (((a >> 8) & 0x00ff00ff) + ((b >> 8) & 0x00ff00ff) + ((c >> 8) & 0x00ff00ff) + ((d >> 8) & 0x00ff00ff) + 0x00020002) >> 2
+        # Interleave the averaged channels into one four-channel output pixel.
         value = (lo & 0x00ff00ff) | ((hi & 0x00ff00ff) << 8)
     tl.store(dp, value, mask)
 

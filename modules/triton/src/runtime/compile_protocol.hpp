@@ -98,6 +98,7 @@ struct Manifest {
     std::size_t binary_bytes = 0;
     std::vector<ManifestParam> abi;            // every PTX entry parameter, in order
     int threads_per_block = 0, num_warps = 0, warp_size = 0, num_ctas = 0, shared_bytes = 0;
+    // -1 means absent/unknown metadata; only an explicit zero permits a null scratch pointer.
     long long global_scratch_bytes = -1, profile_scratch_bytes = -1;
     std::string compiler;                      // key.compiler: whose ABI the parameter list follows
 };

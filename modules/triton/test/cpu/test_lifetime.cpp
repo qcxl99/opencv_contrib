@@ -1,6 +1,9 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
+// CPU-only decisions and ownership controls using injected callbacks, not real GPU faults.
+// Run through tools/check_source.py; driver-bound code is checked separately by
+// check_native_lifetime.py.
 #include "lifetime.hpp"
 #include <atomic>
 #include <cassert>
@@ -38,13 +41,28 @@ int main()
                                                              ++query;
                                                              return result;
                                                          });
-                assert(query - before == (!capture && life == ContextLife::Alive ? 1 : 0));
-                assert(decision == (capture                     ? Reclaim::Hold
+                const int expectedQueries = !capture && life == ContextLife::Alive ? 1 : 0;
+                const auto expected = capture                     ? Reclaim::Hold
                                     : life == ContextLife::Gone ? Reclaim::Release
                                     : life == ContextLife::Unknown || result == Completion::Error
                                         ? Reclaim::Error
                                     : result == Completion::Complete ? Reclaim::Release
-                                                                     : Reclaim::Hold));
+                                                                     : Reclaim::Hold;
+                if (query - before != expectedQueries || decision != expected)
+                {
+                    const char* contextName = life == ContextLife::Alive ? "Alive"
+                                              : life == ContextLife::Gone ? "Gone" : "Unknown";
+                    const char* completionName = result == Completion::Complete ? "Complete"
+                                                 : result == Completion::NotReady ? "NotReady" : "Error";
+                    std::cerr << "completionDecision: capture=" << capture
+                              << " context=" << contextName
+                              << " completion=" << completionName
+                              << " queries=" << query - before << " expectedQueries=" << expectedQueries
+                              << " decision=" << static_cast<int>(decision)
+                              << " expected=" << static_cast<int>(expected) << '\n';
+                }
+                assert(query - before == expectedQueries);
+                assert(decision == expected);
             }
     int waits = 0, frees = 0, destroys = 0;
     bool waitSucceeds = false;

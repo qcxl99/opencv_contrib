@@ -428,7 +428,8 @@ TEST(Triton_Runtime, ArtifactIntegrity)
 // A graph recorded under capture refers to the module
 // binary and the table buffers by handle, and it is launched later -- possibly after the caches
 // have evicted both. The runtime therefore pins them at capture time (finishLaunch) and releases
-// them only on releaseCapturePins(). The scenario below forces the eviction explicitly:
+// them through the public releaseGraphResources() call after graph use. The scenario below
+// forces the eviction explicitly:
 //
 //   capture -> shrink the caches to 1/1 and load other keys so the entries are really gone
 //           -> replay twice with DIFFERENT inputs and check both answers

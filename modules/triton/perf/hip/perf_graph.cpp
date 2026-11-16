@@ -141,9 +141,9 @@ struct Operation {
     std::string op;int interpolation=0,code=0,flags=0,border=0;cv::Size size;cv::Mat matrix;cv::Scalar borderValue;
     void call(const Pitched& src,const Pitched& dst,hipStream_t stream) const {
         auto handle=reinterpret_cast<std::uintptr_t>(stream);
-        if(op=="resize")cv::triton::resizeDevice(src.image,dst.image,size,interpolation,0,handle);
-        else if(op=="cvtcolor")cv::triton::cvtColorDevice(src.image,dst.image,code,0,handle);
-        else cv::triton::warpAffineDevice(src.image,dst.image,matrix.ptr<double>(),flags,border,borderValue,0,handle);
+        if(op=="resize")cv::triton::resize(src.image,dst.image,size,interpolation,0,handle);
+        else if(op=="cvtcolor")cv::triton::cvtColor(src.image,dst.image,code,0,handle);
+        else cv::triton::warpAffine(src.image,dst.image,matrix.ptr<double>(),flags,border,borderValue,0,handle);
     }
     cv::Mat reference(const cv::Mat& host) const {
         cv::Mat result;

@@ -8,11 +8,11 @@
     port_hip_runtime.py            write src/runtime/hip_runtime.cpp
     port_hip_runtime.py --check    exit 1 if the checked-in file is not what this would write
 
-The CUDA file is the source: the HIP runtime is the same code with the driver API renamed and
-the few calls whose signature differs rewritten (allocation into void*, the 2-D copy, the module
-load and launch, the per-device target query). Every substitution is an exact-count
-replacement, so a CUDA edit this script does not know fails the port instead of leaving CUDA
-code -- or a silently different HIP runtime -- in the generated file.
+The CUDA file is the common source. This generator owns the HIP differences:
+driver signatures, target queries, context identification and guarded colour dispatch.
+Checked replacement anchors/counts and the final CUDA-token scan detect source changes
+that need porting updates. Run --check after editing either owner; do not edit the
+generated runtime directly. This check proves reproducible derivation, not GPU behavior.
 """
 import re, sys
 from pathlib import Path
@@ -336,6 +336,33 @@ code_left = [t for t in left if t != "CUDA_VISIBLE_DEVICES" and
              any(t in line and not line.lstrip().startswith("//") for line in out.splitlines())]
 if code_left:
     sys.exit(f"CUDA tokens left in code: {code_left}")
+
+# HIP colour vectorization keeps the CUDA runtime's generic route unchanged.
+sub('''    std::sort(key.constexprs.begin(), key.constexprs.end());
+
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, ctx, gen, st, c.cvt_kernels);''',
+'''    const bool packed = dev.arch == 936 && !n.u16 && !n.f32 && n.cols >= 1024 && n.cols % 4 == 0 &&
+        req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 &&
+        req.src.step % 4 == 0 && req.dst.step % 4 == 0 &&
+        spec.code == 6 && n.n >= (1LL << 19);
+    if (packed)
+    {
+        key.kernel = "_cvtcolor_hip_packed";
+        key.signature = "src:*u8, dst:*u8, cols:i32, src_rs:i32, dst_rs:i32";
+        key.cfg.block_w = n.n < (1LL << 22) ? 1024 : 512;
+        key.cfg.num_warps = n.n < (1LL << 22) ? 4 : 2;
+        key.constexprs = {{"BLOCK", key.cfg.block_w}};
+    }
+    std::sort(key.constexprs.begin(), key.constexprs.end());
+
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, ctx, gen, st, c.cvt_kernels);''', 1)
+sub('''    cv_triton_color::grid(n, key.cfg.block_w, grid);''',
+'''    cv_triton_color::grid(n, key.cfg.block_w, grid);
+    if (packed)
+    {
+        // A lane covers four complete pixels; row pitches stay independent.
+        grid[1] = static_cast<unsigned>((n.cols / 4 + key.cfg.block_w - 1) / key.cfg.block_w);
+    }''', 1)
 
 dst = HERE / "src/runtime/hip_runtime.cpp"
 if "--check" in sys.argv[1:]:

@@ -30,14 +30,19 @@ def _hip_area2_packed(src, dst, dst_h, dst_w, src_rs, dst_rs, src_bs, dst_bs,
     c = tl.load(sp + src_rs // 4, mask, 0)
     d = tl.load(sp + src_rs // 4 + 1, mask, 0)
     if C1:
+        # Separate byte positions into 16-bit lanes; each lane sums one 2x2 window.
         ac = (a & 0x00ff00ff) + ((a >> 8) & 0x00ff00ff) + (c & 0x00ff00ff) + ((c >> 8) & 0x00ff00ff)
         bd = (b & 0x00ff00ff) + ((b >> 8) & 0x00ff00ff) + (d & 0x00ff00ff) + ((d >> 8) & 0x00ff00ff)
+        # Add the integer rounding bias to each lane, then divide each sum by four.
         ac = (ac + 0x00020002) >> 2
         bd = (bd + 0x00020002) >> 2
+        # Repack the four averaged grayscale pixels into their output byte order.
         value = (ac & 255) | ((ac >> 8) & 0xff00) | ((bd & 255) << 16) | ((bd & 0xff0000) << 8)
     else:
+        # C4 keeps channels independent: average even/odd bytes in separate lanes.
         lo = ((a & 0x00ff00ff) + (b & 0x00ff00ff) + (c & 0x00ff00ff) + (d & 0x00ff00ff) + 0x00020002) >> 2
         hi = (((a >> 8) & 0x00ff00ff) + ((b >> 8) & 0x00ff00ff) + ((c >> 8) & 0x00ff00ff) + ((d >> 8) & 0x00ff00ff) + 0x00020002) >> 2
+        # Interleave the averaged channels into one four-channel output pixel.
         value = (lo & 0x00ff00ff) | ((hi & 0x00ff00ff) << 8)
     tl.store(dp, value, mask)
 

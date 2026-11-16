@@ -7,6 +7,8 @@ Triton warpAffine {#tutorial_triton_warpaffine}
 Supported inputs
 ----------------
 
+CUDA callers pass `GpuMat`; HIP callers pass caller-owned `DeviceImage` views.
+
 | Parameter | Supported values |
 |---|---|
 | Depth | `CV_8U`, `CV_16U`, `CV_32F` |
@@ -16,8 +18,10 @@ Supported inputs
 | Matrix | 2×3 `CV_32F` or `CV_64F`; forward map or `WARP_INVERSE_MAP` |
 | Layout | Pitched source/destination ROIs, output reuse, nonoverlapping storage |
 
-An empty destination size means the source size. A forward matrix is inverted
-internally. Integer border components are rounded and saturated to the output
+For the GpuMat overload, an empty destination size means the source size.
+DeviceImage callers preallocate the destination, whose dimensions determine
+the output size. A forward matrix is inverted internally.
+Integer border components are rounded and saturated to the output
 depth; float borders preserve fractional values. `Scalar(v)` specifies
 `(v, 0, 0, 0)`, rather than applying `v` to every channel.
 
@@ -32,6 +36,28 @@ cancel when x = y. A 2 x 2 destination is still rejected for NEAREST/LINEAR/AREA
 the absolute-term bound is `2e10`, above the safe int32 range, and the off-diagonal
 pixels do not benefit from that cancellation. The check covers the whole
 destination rectangle, not only pixels where terms cancel.
+
+Calling the function
+--------------------
+
+The following CUDA example translates a host image:
+
+```cpp
+#include <opencv2/triton.hpp>
+
+cv::cuda::GpuMat src(host), dst;  // host is a cv::Mat
+cv::cuda::Stream stream;
+const cv::Matx23d matrix(1, 0, 8, 0, 1, 4);
+cv::triton::warpAffine(src, dst, matrix, host.size(), cv::INTER_LINEAR,
+                       cv::BORDER_REPLICATE, cv::Scalar(), stream);
+stream.waitForCompletion();
+```
+
+The destination is allocated or reused. Calls are asynchronous; retain both
+allocations until the stream completes. HIP uses the `DeviceImage` overload in
+`opencv2/triton/device.hpp`, with preallocated output, six row-major matrix
+coefficients and a native stream handle. See `samples/hip/device.cpp`
+(`example_triton_device warp`) for allocation and data transfers.
 
 Transparent borders
 -------------------
@@ -97,11 +123,9 @@ CUDA uses `1×256` tiles for NEAREST and `2×64` for LINEAR/CUBIC, including ARE
 HIP uses backend-specific launch shapes with small/narrow-image and C3 NEAREST
 conditions. These choices do not change sampling semantics.
 
-CUDA uses GpuMat and Python bindings; HIP uses the public `warpAffineDevice`
-entry in `opencv2/triton/device.hpp`. GpuMat calls on HIP raise a catchable
-`StsNotImplemented`. Calls are asynchronous on the supplied stream. Retain
-allocations until completion and follow the graph-resource lifetime rules in
-cv::triton::releaseGraphResources().
+CUDA provides GpuMat Python bindings. The HIP `DeviceImage` overload is C++ only;
+GpuMat calls on HIP raise a catchable `StsNotImplemented`. For captured calls,
+follow the graph-resource lifetime rules in cv::triton::releaseGraphResources().
 
 Performance tests warm the kernels and include public submission plus stream
 completion. The AREA/TRANSPARENT cases initialize and reuse destination storage;

@@ -2,8 +2,8 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Steady-state timing of cv::triton::cvtColor through the runtime JIT, with the native CUDA
-// path as a same-card timing baseline.
+// Warmed public-call timing with optional same-device native CUDA comparisons.
+// Native comparison rows are absent on HIP.
 //
 // Selected and extended rows cover only their named conversions and depths.
 // The optional cv::cuda baseline is identified separately; its presence does not
@@ -131,9 +131,8 @@ PERF_TEST_P(Sz_ExtendedCvt, TritonCvtColorExtended, testing::Combine(
 #ifdef OPENCV_TRITON_PERF_HAVE_CUDAIMGPROC
 // The native implementation on the same card and harness. cudaimgproc is an OPTIONAL
 // dependency of perf/ only -- the module itself never uses it -- so a build without it simply
-// omits this baseline. The codes restricted to what cv::cuda::cvtColor actually serves: it
-// has no BGRA2GRAY and no pure channel permute in the CV_8U path, so those rows are absent
-// rather than reported as a failure.
+// omits this baseline. The four selected codes form a comparison subset, not a complete
+// inventory of cv::cuda::cvtColor support. Codes absent here are not classified as unsupported.
 PERF_TEST_P(Sz_Code, NativeCudaCvtColor_Reference, testing::Combine(
     testing::Values(cv::Size(640, 480), cv::Size(1920, 1080), cv::Size(3840, 2160)),
     testing::Values((int)cv::COLOR_BGR2GRAY, (int)cv::COLOR_BGR2YUV,

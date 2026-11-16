@@ -125,9 +125,9 @@ gray = cv.triton.cvtColor(small, cv.COLOR_BGR2GRAY)
 result = gray.download()
 ```
 
-HIP applications use the caller-owned device-buffer entries in
-`opencv2/triton/device.hpp`: `resizeDevice`, `cvtColorDevice` and
-`warpAffineDevice`. They do not allocate output storage or synchronize.
+HIP applications use the caller-owned `DeviceImage` overloads in
+`opencv2/triton/device.hpp`: `resize`, `cvtColor` and
+`warpAffine`. They do not allocate output storage or synchronize.
 The scale-aware resize overload accepts empty `dsize` with `fx`/`fy`; the caller
 must preallocate the resolved destination size. GpuMat operations are unavailable
 on HIP and raise `StsNotImplemented`, including Python calls with omitted or

@@ -45,8 +45,8 @@ CV_EXPORTS bool haveDevice(int device);
  * @param stream Native hipStream_t/CUstream encoded as an integer; 0 selects the default.
  * Retain image storage until stream completion.
  */
-CV_EXPORTS void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
-                             int interpolation, int device, std::uintptr_t stream);
+CV_EXPORTS void resize(const DeviceImage& src, const DeviceImage& dst, Size dsize,
+                       int interpolation, int device, std::uintptr_t stream);
 
 /** @brief Resize using explicit size or scale factors.
  * @param src Source image; supported types match cv::triton::resize.
@@ -58,8 +58,8 @@ CV_EXPORTS void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Siz
  * @param device Backend device index owning both images and stream.
  * @param stream Native stream handle; 0 selects the default. Retain storage until completion.
  */
-CV_EXPORTS void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Size dsize,
-                             double fx, double fy, int interpolation, int device, std::uintptr_t stream);
+CV_EXPORTS void resize(const DeviceImage& src, const DeviceImage& dst, Size dsize,
+                       double fx, double fy, int interpolation, int device, std::uintptr_t stream);
 
 /** @brief Convert a device image between colour spaces.
  * @param src Source image with the code's required depth and channels.
@@ -69,8 +69,8 @@ CV_EXPORTS void resizeDevice(const DeviceImage& src, const DeviceImage& dst, Siz
  * @param device Backend device index owning both images and stream.
  * @param stream Native stream handle; 0 selects the default. Retain storage until completion.
  */
-CV_EXPORTS void cvtColorDevice(const DeviceImage& src, const DeviceImage& dst, int code,
-                               int device, std::uintptr_t stream);
+CV_EXPORTS void cvtColor(const DeviceImage& src, const DeviceImage& dst, int code,
+                         int device, std::uintptr_t stream);
 
 /** @brief Apply an affine transformation to a device image.
  * @param src Source image; supported types match cv::triton::warpAffine.
@@ -83,9 +83,9 @@ CV_EXPORTS void cvtColorDevice(const DeviceImage& src, const DeviceImage& dst, i
  * @param device Backend device index owning both images and stream.
  * @param stream Native stream handle; 0 selects the default. Retain storage until completion.
  */
-CV_EXPORTS void warpAffineDevice(const DeviceImage& src, const DeviceImage& dst, const double M[6],
-                                 int flags, int borderMode, const Scalar& borderValue,
-                                 int device, std::uintptr_t stream);
+CV_EXPORTS void warpAffine(const DeviceImage& src, const DeviceImage& dst, const double M[6],
+                           int flags, int borderMode, const Scalar& borderValue,
+                           int device, std::uintptr_t stream);
 
 //! @}
 

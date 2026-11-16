@@ -2,11 +2,11 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Minimal buildable example: upload -> cv::triton::cvtColor -> download.
+// CUDA GpuMat example: upload -> cv::triton::cvtColor -> download.
 //
-// The conversion codes this module serves are listed in opencv2/triton.hpp. Anything outside
-// that list (HSV2BGR, HLS, CV_32F) raises cv::Error::StsUnsupportedFormat rather than falling
-// back, so an unsupported request is a visible error, not a silent change of result.
+// Supported code/depth combinations are listed in doc/cvtcolor.markdown; support for
+// one code at CV_8U does not imply support at CV_16U or CV_32F. Unsupported requests
+// raise cv::Error::StsUnsupportedFormat without fallback.
 #include <iostream>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>

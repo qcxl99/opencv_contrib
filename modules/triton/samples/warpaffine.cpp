@@ -2,12 +2,12 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Minimal buildable example: upload -> cv::triton::warpAffine -> download.
+// CUDA GpuMat example: upload -> cv::triton::warpAffine -> download.
 //
 // The 2x3 matrix is interpreted exactly as cv::warpAffine interprets it: the forward map,
 // inverted internally, unless cv::WARP_INVERSE_MAP is set. The interpolation flags, dtypes and
-// border modes this module serves are listed in opencv2/triton.hpp -- INTER_NEAREST,
-// INTER_LINEAR and INTER_CUBIC, CV_8U / CV_16U / CV_32F, channels 1/3/4 -- and anything outside
+// border modes are listed in doc/warpaffine.markdown -- INTER_NEAREST, INTER_LINEAR,
+// INTER_CUBIC and INTER_AREA (LINEAR alias), CV_8U / CV_16U / CV_32F, channels 1/3/4. Inputs outside
 // that list (INTER_LANCZOS4, other depths) raises cv::Error::StsUnsupportedFormat rather than
 // falling back, so an unsupported request is a visible error, not a silent change of result.
 #include <cmath>

@@ -49,7 +49,7 @@ struct CodeSpec {
     int blue;              // blue index: 0 for a BGR-order source, 2 for an RGB-order one
     bool inverse;          // direction: YUV/YCrCb inverse, and Packed decode (2ch -> colour)
     int hrange;            // Hsv only: 180 for HSV, 256 for HSV_FULL (h += h<0 ? hrange : 0)
-    int perm[4];           // Permute only: source channel for each dst channel, -1 = 255
+    int perm[4];           // Permute only: source channel for each dst channel; -1 = opaque alpha
     // Packed only: green-bit count, the CPU's own discriminator between the two formats
     // (color.hpp greenBits(): 6 for every BGR565 code, 5 for every BGR555 code). It is a
     // field rather than something derived from the code value because the CPU decides by

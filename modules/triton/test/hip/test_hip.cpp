@@ -2,26 +2,26 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// HIP (BW1000 / gfx936) accuracy test for the device entries (opencv2/triton/device.hpp).
+// Supplemental HIP accuracy/lifecycle checks through the public DeviceImage overloads.
 //
-// The module's own tests in test/ are written against cuda::GpuMat, cuda::Stream and the CUDA
-// driver API, so they cannot run on a HIP build. This is their counterpart for the entries a
-// HIP build serves: it allocates HIP device buffers, calls the public device entries
-// (-> runtime -> compile helper -> hsaco load -> launch) and checks every result against the
-// same references and bounds the CUDA tests use:
+// Standard shared cases run in opencv_test_triton on either backend. CUDA-specific fixtures
+// also use GpuMat/driver APIs; this separate executable exercises HIP allocations, streams
+// and lifecycle boundaries without gtest/opencv_ts. Calls use the production runtime JIT
+// and the same numerical-reference owners as the shared tests:
 //   resize      the portable CPU oracle (test/resize_reference.cpp, compiled into this
 //               binary as a separate source); CV_8U bit-exact, CV_32F within f32Atol;
-//   cvtColor    this build's cv::cvtColor (the integer codes the module serves); bit-exact;
+//   cvtColor    linked cv::cvtColor; integer/copy paths exact, float arithmetic per-pixel bound;
 //   warpAffine  cv::warpAffine's vector path cropped to dsize (NEAREST/LINEAR) or the natural
-//               call (CUBIC), as test/test_warpaffine.cpp defines it; CV_8U/CV_16U bit-exact,
-//               CV_32F within min(5e-5 * max(|ref|, 1), 1e-4).
+//               call (CUBIC), as test/test_warpaffine.cpp defines it. This supplemental
+//               integer fixture requires exact results (stricter than the public 16U
+//               one-level bound); CV_32F uses min(5e-5 * max(|ref|, 1), 1e-4).
 // Each accepted case also checks that only dst was written: the destination is a ROI of a
 // padded parent whose border bytes must be unchanged. A refused case must raise the documented
 // error and leave dst untouched. Scalar bounds use validation/numerics.hpp, the
 // same owner as the standard fixtures, without requiring gtest / opencv_ts.
 //
-// Plain main, no gtest: the target builds in a minimal core,imgproc,triton tree. It accepts the
-// gtest-style filters select five registered group tests, not individual inner checks.
+// Plain main, no gtest: the target builds in a minimal core,imgproc,triton tree.
+// Its gtest-style filters select five registered group tests, not individual inner checks.
 // Each group runs only when selected. XML lists those same group names and records
 // the inner-check count separately. Exit is 0 for passing nonempty execution, 1 on
 // failed checks, 2 on invalid/empty selection, and 77 when no usable device exists.
@@ -323,7 +323,7 @@ static void resizeCase(cv::Size ssz, cv::Size dsz, int type, int interp, hipStre
         int code = 0;
         try
         {
-            tr::resizeDevice(s.view(), d.view(), dsz, interp, 0, reinterpret_cast<std::uintptr_t>(stream));
+            tr::resize(s.view(), d.view(), dsz, interp, 0, reinterpret_cast<std::uintptr_t>(stream));
             HIPOK(hipStreamSynchronize(stream));
         }
         catch (const cv::Exception& e) { code = e.code; }
@@ -339,7 +339,7 @@ static void resizeCase(cv::Size ssz, cv::Size dsz, int type, int interp, hipStre
     }
     try
     {
-        tr::resizeDevice(s.view(), d.view(), dsz, interp, 0, reinterpret_cast<std::uintptr_t>(stream));
+        tr::resize(s.view(), d.view(), dsz, interp, 0, reinterpret_cast<std::uintptr_t>(stream));
         HIPOK(hipStreamSynchronize(stream));
     }
     catch (const cv::Exception& e) { report(false, name + ": " + e.what()); return; }
@@ -354,7 +354,8 @@ static void resizeCase(cv::Size ssz, cv::Size dsz, int type, int interp, hipStre
 // ------------------------------------------------------------------------- cvtColor
 
 static void cvtCase(cv::Size sz, const cv_triton_color::CodeSpec& spec, int depth,
-                    hipStream_t stream, uint64 seed, bool boundaries = false)
+                    hipStream_t stream, uint64 seed, bool boundaries = false,
+                    int sourcePad = 1, int destinationPad = 2)
 {
     const unsigned char fill = 0x5A;
     const int sourceHeight = spec.op == cv_triton_color::Op::Yuv420 ? sz.height / 2 * 3 : sz.height;
@@ -377,14 +378,14 @@ static void cvtCase(cv::Size sz, const cv_triton_color::CodeSpec& spec, int dept
             for (int x = 0; x < host.cols; x += 3)
                 for (int c = 0; c < spec.scn; ++c) host.ptr<float>(y)[x*spec.scn+c] *= 32767.5f;
     DevImg src, dst;
-    alloc(src, sourceHeight, sz.width, host.type(), 1, 0xC3);
-    alloc(dst, sz.height, sz.width, CV_MAKETYPE(depth, spec.dcn), 2, fill);
+    alloc(src, sourceHeight, sz.width, host.type(), sourcePad, 0xC3);
+    alloc(dst, sz.height, sz.width, CV_MAKETYPE(depth, spec.dcn), destinationPad, fill);
     upload(src, host);
     const std::string name = cv::format("cvtColor %s depth=%d %dx%d%s", spec.name, depth,
                                         sz.width, sz.height, boundaries ? " boundaries" : "");
     try
     {
-        tr::cvtColorDevice(src.view(), dst.view(), spec.code, 0, reinterpret_cast<std::uintptr_t>(stream));
+        tr::cvtColor(src.view(), dst.view(), spec.code, 0, reinterpret_cast<std::uintptr_t>(stream));
         HIPOK(hipStreamSynchronize(stream));
     }
     catch (const cv::Exception& e) { report(false, name + ": " + e.what()); return; }
@@ -476,7 +477,7 @@ static void warpCase(cv::Size ssz, cv::Size dsz, int type, int flags, int border
                                         dsz.width, dsz.height, cv::typeToString(type).c_str(), flags, border);
     try
     {
-        tr::warpAffineDevice(s.view(), d.view(), m, flags, border, bv, 0, reinterpret_cast<std::uintptr_t>(stream));
+        tr::warpAffine(s.view(), d.view(), m, flags, border, bv, 0, reinterpret_cast<std::uintptr_t>(stream));
         HIPOK(hipStreamSynchronize(stream));
     }
     catch (const cv::Exception& e) { report(false, name + ": " + e.what()); return; }
@@ -517,7 +518,7 @@ static void warpTransparentCase(cv::Size size, int type, int flags, const double
         size.width, size.height, cv::typeToString(type).c_str(), flags, geometry);
     try
     {
-        tr::warpAffineDevice(s.view(), d.view(), m, flags, cv::BORDER_TRANSPARENT, cv::Scalar(),
+        tr::warpAffine(s.view(), d.view(), m, flags, cv::BORDER_TRANSPARENT, cv::Scalar(),
                               0, reinterpret_cast<std::uintptr_t>(stream));
         HIPOK(hipStreamSynchronize(stream));
     }
@@ -549,9 +550,9 @@ static void warpAreaAliasCase(int type, int border, int inverse, hipStream_t str
         cv::typeToString(type).c_str(), border, inverse);
     try
     {
-        tr::warpAffineDevice(s.view(), linear.view(), m, cv::INTER_LINEAR | inverse, border,
+        tr::warpAffine(s.view(), linear.view(), m, cv::INTER_LINEAR | inverse, border,
                               cv::Scalar(), 0, reinterpret_cast<std::uintptr_t>(stream));
-        tr::warpAffineDevice(s.view(), area.view(), m, cv::INTER_AREA | inverse, border,
+        tr::warpAffine(s.view(), area.view(), m, cv::INTER_AREA | inverse, border,
                               cv::Scalar(), 0, reinterpret_cast<std::uintptr_t>(stream));
         HIPOK(hipStreamSynchronize(stream));
     }
@@ -582,7 +583,7 @@ static void refusal(const std::string& name, int expect_code, F call)
     }
 }
 
-// Shared-runtime integration: both operators in one process, with real async
+// Shared-runtime integration: resize and cvtColor in one process, with real async
 // uploads, LRU eviction and a captured graph replayed after input mutation.
 static void runtimeChecks(hipStream_t stream)
 {
@@ -598,8 +599,8 @@ static void runtimeChecks(hipStream_t stream)
     detail::setPoisonNewTables(true);
     detail::setCacheLimits(64,256);
     const auto before=detail::runtimeStats();
-    tr::resizeDevice(src.view(),a.view(),{63,47},cv::INTER_AREA,0,reinterpret_cast<std::uintptr_t>(stream));
-    tr::resizeDevice(src.view(),b.view(),{63,47},cv::INTER_AREA,0,reinterpret_cast<std::uintptr_t>(other));
+    tr::resize(src.view(),a.view(),{63,47},cv::INTER_AREA,0,reinterpret_cast<std::uintptr_t>(stream));
+    tr::resize(src.view(),b.view(),{63,47},cv::INTER_AREA,0,reinterpret_cast<std::uintptr_t>(other));
     HIPOK(hipDeviceSynchronize());
     std::string why;
     const cv::Mat reference=resizeOracle(host,{63,47},cv::INTER_AREA);
@@ -611,7 +612,7 @@ static void runtimeChecks(hipStream_t stream)
     hipGraph_t graph=nullptr;
     hipGraphExec_t executable=nullptr;
     HIPOK(hipStreamBeginCapture(stream,hipStreamCaptureModeGlobal));
-    tr::resizeDevice(src.view(),a.view(),{63,47},cv::INTER_AREA,0,reinterpret_cast<std::uintptr_t>(stream));
+    tr::resize(src.view(),a.view(),{63,47},cv::INTER_AREA,0,reinterpret_cast<std::uintptr_t>(stream));
     HIPOK(hipStreamEndCapture(stream,&graph));
     HIPOK(hipGraphInstantiate(&executable,graph,nullptr,nullptr,0));
     detail::setCacheLimits(0,0);
@@ -699,6 +700,14 @@ int main(int argc, char** argv)
     {
     std::printf("== cvtColor all supported code/depth rows vs linked CPU reference\n");
     cvtCoverage(stream);
+    // Aligned pitched ROIs exercise the HIP vector path at its size thresholds;
+    // odd widths and an unaligned source exercise the generic fallback.
+    for (cv::Size size : {cv::Size(1024, 511), cv::Size(1024, 512),
+                         cv::Size(1028, 513), cv::Size(1025, 513)})
+        cvtCase(size, *cv_triton_color::find(cv::COLOR_BGR2GRAY), CV_8U,
+                stream, 70901, false, 4, 4);
+    cvtCase({1024, 512}, *cv_triton_color::find(cv::COLOR_BGR2GRAY), CV_8U,
+            stream, 70903, false, 1, 4);
     }
 
     g_suite = "Triton_HipWarpAffine";
@@ -770,35 +779,35 @@ int main(int argc, char** argv)
         DevImg s, d;
         alloc(s, 16, 16, CV_16UC1, 0, 0); alloc(d, 8, 8, CV_16UC1, 0, 0);
         refusal("resize CV_16U", cv::Error::StsUnsupportedFormat, [&] {
-            tr::resizeDevice(s.view(), d.view(), {8, 8}, cv::INTER_LINEAR, 0, 0); });
+            tr::resize(s.view(), d.view(), {8, 8}, cv::INTER_LINEAR, 0, 0); });
         DevImg a, b;
         alloc(a, 16, 16, CV_8UC1, 0, 0); alloc(b, 8, 8, CV_8UC1, 0, 0);
         refusal("resize LANCZOS4", cv::Error::StsUnsupportedFormat, [&] {
-            tr::resizeDevice(a.view(), b.view(), {8, 8}, cv::INTER_LANCZOS4, 0, 0); });
+            tr::resize(a.view(), b.view(), {8, 8}, cv::INTER_LANCZOS4, 0, 0); });
         refusal("resize in place", cv::Error::StsBadArg, [&] {
-            tr::resizeDevice(a.view(), a.view(), {16, 16}, cv::INTER_LINEAR, 0, 0); });
+            tr::resize(a.view(), a.view(), {16, 16}, cv::INTER_LINEAR, 0, 0); });
         DevImg c3, c1;
         alloc(c3, 16, 16, CV_8UC3, 0, 0); alloc(c1, 16, 16, CV_8UC1, 0, 0);
         refusal("cvtColor HSV2BGR (float path, refused)", cv::Error::StsUnsupportedFormat, [&] {
-            tr::cvtColorDevice(c3.view(), c3.view(), cv::COLOR_HSV2BGR, 0, 0); });
+            tr::cvtColor(c3.view(), c3.view(), cv::COLOR_HSV2BGR, 0, 0); });
         refusal("cvtColor wrong dst channels", cv::Error::StsBadArg, [&] {
-            tr::cvtColorDevice(c3.view(), c3.view(), cv::COLOR_BGR2GRAY, 0, 0); });
+            tr::cvtColor(c3.view(), c3.view(), cv::COLOR_BGR2GRAY, 0, 0); });
         const double id[6] = {1, 0, 0, 0, 1, 0};
         refusal("warpAffine LANCZOS4", cv::Error::StsUnsupportedFormat, [&] {
-            tr::warpAffineDevice(a.view(), b.view(), id, cv::INTER_LANCZOS4, cv::BORDER_CONSTANT, cv::Scalar(), 0, 0); });
+            tr::warpAffine(a.view(), b.view(), id, cv::INTER_LANCZOS4, cv::BORDER_CONSTANT, cv::Scalar(), 0, 0); });
         refusal("warpAffine in place", cv::Error::StsBadArg, [&] {
-            tr::warpAffineDevice(a.view(), a.view(), id, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(), 0, 0); });
+            tr::warpAffine(a.view(), a.view(), id, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(), 0, 0); });
         refusal("warpAffine unknown flags",cv::Error::StsUnsupportedFormat,[&] {
-            tr::warpAffineDevice(a.view(),b.view(),id,cv::INTER_LINEAR | (1<<12),cv::BORDER_REPLICATE,cv::Scalar(),0,0); });
+            tr::warpAffine(a.view(),b.view(),id,cv::INTER_LINEAR | (1<<12),cv::BORDER_REPLICATE,cv::Scalar(),0,0); });
         refusal("warpAffine null matrix",cv::Error::StsBadArg,[&] {
-            tr::warpAffineDevice(a.view(),b.view(),nullptr,cv::INTER_LINEAR,cv::BORDER_REPLICATE,cv::Scalar(),0,0); });
+            tr::warpAffine(a.view(),b.view(),nullptr,cv::INTER_LINEAR,cv::BORDER_REPLICATE,cv::Scalar(),0,0); });
         const double huge[6]={1e100,0,0,0,1,0};
         refusal("warpAffine nonrepresentable fp32 matrix",cv::Error::StsBadArg,[&] {
-            tr::warpAffineDevice(a.view(),b.view(),huge,cv::INTER_LINEAR|cv::WARP_INVERSE_MAP,
+            tr::warpAffine(a.view(),b.view(),huge,cv::INTER_LINEAR|cv::WARP_INVERSE_MAP,
                                  cv::BORDER_REPLICATE,cv::Scalar(),0,0); });
         const double overflow[6]={1e200,1e200,0,1e200,1e200,0};
         refusal("warpAffine nonfinite inverse",cv::Error::StsBadArg,[&] {
-            tr::warpAffineDevice(a.view(),b.view(),overflow,cv::INTER_LINEAR,
+            tr::warpAffine(a.view(),b.view(),overflow,cv::INTER_LINEAR,
                                  cv::BORDER_REPLICATE,cv::Scalar(),0,0); });
         for (int depth : {CV_8U, CV_16U, CV_32F})
             for (int channels : {1, 3, 4})
@@ -812,7 +821,7 @@ int main(int argc, char** argv)
                 bool refused = false;
                 try
                 {
-                    tr::warpAffineDevice(source.view(), target.view(), id, cv::INTER_CUBIC,
+                    tr::warpAffine(source.view(), target.view(), id, cv::INTER_CUBIC,
                                          cv::BORDER_TRANSPARENT, cv::Scalar(), 0,
                                          reinterpret_cast<std::uintptr_t>(stream));
                 }
@@ -855,7 +864,7 @@ int main(int argc, char** argv)
                                      (c.height/3)*2 : c.height;
             alloc(target,targetHeight,c.width,CV_MAKETYPE(c.depth,c.dcn),2,0x5A);
             bool rejected = false;
-            try { tr::cvtColorDevice(source.view(),target.view(),c.code,0,reinterpret_cast<std::uintptr_t>(stream)); }
+            try { tr::cvtColor(source.view(),target.view(),c.code,0,reinterpret_cast<std::uintptr_t>(stream)); }
             catch (const cv::Exception& e) { rejected = e.code == cv::Error::StsBadArg || e.code == cv::Error::StsUnsupportedFormat; }
             HIPOK(hipStreamSynchronize(stream));
             const cv::Mat parent = downloadParent(target);
