@@ -47,6 +47,17 @@ when testing an installation or a relocated prefix.
 lifecycle tests; HIP also provides `opencv_test_triton_hip`. Use the standard
 OpenCV list/filter/XML options and review failures and skipped tests.
 
+Accuracy tests list private reference/protocol sources explicitly in CMake and
+compile them as separate translation units. CUDA admission controls also compile
+the private colour/warp plans into the test executable, without exporting those
+functions from the module. Separate compilation is not an independent algorithmic
+oracle: numerical independence still comes from the selected references and
+checks. Keep each support source listed once per executable. Do not include a
+`.cpp` file from another `.cpp`, or add an OBJECT library merely to hide duplicate
+definitions. Check ordinary and world shared/static linking after changing this
+boundary. The plan's no-contraction option is source-local, so a world build
+does not change imgproc's floating-point compilation.
+
 `opencv_perf_triton` measures warmed public calls with stream completion.
 Generated performance sanity data checks repeatability; independent accuracy
 tests check numerical behavior. Native CUDA comparison modules are optional

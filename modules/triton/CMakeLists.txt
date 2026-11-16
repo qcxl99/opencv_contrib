@@ -121,8 +121,8 @@ else()
        "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cuda_runtime.cpp")
   set(_triton_kernel_files resize_cpu.py cvtcolor_cpu.py warpaffine_cpu.py)
 endif()
-# Installed headers: only the public umbrella. src/core.hpp is deliberately NOT here -- it is a
-# raw device-pointer layer the plan code shares with the GpuMat adapter, not an API for callers.
+# Install the public umbrella and caller-owned device-buffer headers below.
+# src/core.hpp remains private; no owning HIP image or stream API is installed.
 file(GLOB _triton_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton.hpp"
                        "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton/device.hpp")
 file(GLOB _triton_int_hdrs "${CMAKE_CURRENT_LIST_DIR}/src/*.hpp" "${CMAKE_CURRENT_LIST_DIR}/src/runtime/*.hpp")
@@ -221,6 +221,11 @@ install(FILES ${_triton_kernel_paths} DESTINATION "${_triton_res_install}/kernel
 install(FILES "${CMAKE_CURRENT_LIST_DIR}/tools/compile_helper.py" DESTINATION "${_triton_res_install}/tools" COMPONENT libs)
 
 # --- tests / perf / samples -------------------------------------------------------------
+# Compile private validation support as separate translation units, without
+# including implementation .cpp files or exporting private production symbols.
+set(_triton_test_support_sources
+    "${CMAKE_CURRENT_LIST_DIR}/src/runtime/provider.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/runtime/compile_protocol.cpp")
 set(_triton_reference_sources
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/resize_plan.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/test/resize_reference.cpp")
@@ -231,12 +236,10 @@ if(_triton_backend STREQUAL "cuda")
                                      "${CMAKE_CURRENT_LIST_DIR}/test/*.hpp")
   # The evaluator and table builder are compiled explicitly below.
   list(REMOVE_ITEM _triton_cuda_test_sources "${CMAKE_CURRENT_LIST_DIR}/test/resize_reference.cpp")
-  ocv_add_accuracy_tests(FILES "Src" ${_triton_cuda_test_sources})
-  if(TARGET opencv_test_triton)
-    target_sources(opencv_test_triton PRIVATE
+  ocv_add_accuracy_tests(FILES "Src" ${_triton_cuda_test_sources}
+      ${_triton_test_support_sources}
       "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cvtcolor.cpp"
       "${CMAKE_CURRENT_LIST_DIR}/src/runtime/warpaffine.cpp")
-  endif()
   # Select top-level perf sources only; future backend support is selected here.
   file(GLOB _triton_common_perf_sources "${CMAKE_CURRENT_LIST_DIR}/perf/*.cpp"
                                        "${CMAKE_CURRENT_LIST_DIR}/perf/*.hpp")
@@ -291,7 +294,7 @@ else()
       "${CMAKE_CURRENT_LIST_DIR}/test/test_main.cpp"
       "${CMAKE_CURRENT_LIST_DIR}/test/test_common.cpp"
       "${CMAKE_CURRENT_LIST_DIR}/test/test_resize_reference.cpp"
-      "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp")
+      ${_triton_test_support_sources})
   file(GLOB _triton_common_perf_sources "${CMAKE_CURRENT_LIST_DIR}/perf/*.cpp"
                                       "${CMAKE_CURRENT_LIST_DIR}/perf/*.hpp")
   ocv_add_perf_tests(FILES "Src" ${_triton_common_perf_sources})
@@ -300,7 +303,7 @@ else()
       target_sources(${_target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/validation/device_hip.cpp" ${_triton_reference_sources})
       # Perf also compares against the test-only CPU reference.
       if(_target STREQUAL "opencv_perf_triton")
-        target_sources(${_target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp")
+        target_sources(${_target} PRIVATE ${_triton_test_support_sources})
       endif()
       target_include_directories(${_target} SYSTEM PRIVATE "${TRITON_HIP_INCLUDE_DIR}")
       target_compile_definitions(${_target} PRIVATE __HIP_PLATFORM_AMD__=1)
@@ -350,7 +353,7 @@ else()
     set(_t opencv_test_triton_hip)
     set(_triton_hip_test_sources
       "${CMAKE_CURRENT_LIST_DIR}/test/hip/test_hip.cpp"
-      "${CMAKE_CURRENT_LIST_DIR}/test/test_oracle.cpp"
+      ${_triton_test_support_sources}
       ${_triton_reference_sources})
     ocv_add_executable(${_t} ${_triton_hip_test_sources})
     ocv_target_include_modules(${_t} opencv_core opencv_imgproc ${the_module})

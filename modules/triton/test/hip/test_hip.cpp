@@ -10,7 +10,7 @@
 // (-> runtime -> compile helper -> hsaco load -> launch) and checks every result against the
 // same references and bounds the CUDA tests use:
 //   resize      the portable CPU oracle (test/resize_reference.cpp, compiled into this
-//               binary by test/test_oracle.cpp); CV_8U bit-exact, CV_32F within f32Atol;
+//               binary as a separate source); CV_8U bit-exact, CV_32F within f32Atol;
 //   cvtColor    this build's cv::cvtColor (the integer codes the module serves); bit-exact;
 //   warpAffine  cv::warpAffine's vector path cropped to dsize (NEAREST/LINEAR) or the natural
 //               call (CUBIC), as test/test_warpaffine.cpp defines it; CV_8U/CV_16U bit-exact,

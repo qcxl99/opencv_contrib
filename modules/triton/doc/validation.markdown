@@ -9,6 +9,23 @@ changes, actual binaries and raw results. Run only the checks needed for the
 change; a skipped hardware job is not a passed hardware job. This page defines
 entry points, not new numerical or performance acceptance criteria.
 
+Private test linking and source style
+------------------------------------
+
+Changes to test-support source selection can be checked with independent build
+directories for `BUILD_SHARED_LIBS=ON/OFF` and `BUILD_opencv_world=ON/OFF`, using
+the enabled backend configuration below (include `world` in BUILD_LIST when
+enabling it). Build `opencv_test_triton` and
+`opencv_perf_triton`, then run the affected CPU-only controls with GPU visibility
+disabled. A successful link is not GPU numerical or performance acceptance.
+
+The source checker below does not check C++ style, include order or Doxygen.
+Review handwritten code against neighbouring OpenCV code, preserve include
+semantics, and inspect the diff after scoped formatting. Generated files should
+be updated through their included generators and checked for consistency rather
+than reformatted separately. Documentation generation is a separate check; state
+whether it covers the module pages or the complete OpenCV website.
+
 CPU-only source checks
 ----------------------
 
