@@ -18,6 +18,9 @@
 #include <algorithm>
 #include <cfloat>
 #include <cfenv>
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
 #include <map>
 #include <tuple>
 #include "opencv2/imgproc.hpp"
@@ -316,10 +319,14 @@ cv::Mat separate4_model(const cv::Mat& src, const CodeSpec& c) {
     return dst;
 }
 
-using FloatControls = std::tuple<bool, bool, bool, int>;
+using FloatControls = std::tuple<bool, bool, bool, int, unsigned>;
 FloatControls float_controls() {
+    unsigned fp=0;
+#if defined(__SSE__)
+    fp=_mm_getcsr() & 0xe040u;
+#endif
     return std::make_tuple(cv::useOptimized(), cv::ipp::useIPP(),
-                           cv::ipp::useIPP_NotExact(), std::fegetround());
+                           cv::ipp::useIPP_NotExact(), std::fegetround(), fp);
 }
 
 bool identify_separate4() {
@@ -361,7 +368,7 @@ bool float_cpu_separate4() {
     static std::mutex mutex;
     static std::map<FloatControls, bool> cache;
     const FloatControls before = float_controls();
-    if (std::get<3>(before) != FE_TONEAREST) return false;
+    if (std::get<3>(before) != FE_TONEAREST || std::get<4>(before) != 0) return false;
     std::lock_guard<std::mutex> lock(mutex);
     if (float_controls() != before) return false;
     const auto found = cache.find(before);

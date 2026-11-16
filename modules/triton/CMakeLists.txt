@@ -121,8 +121,8 @@ else()
        "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cuda_runtime.cpp")
   set(_triton_kernel_files resize_cpu.py cvtcolor_cpu.py warpaffine_cpu.py)
 endif()
-# Public headers are installed and parsed by the Python binding generator.
-# src/core.hpp is an implementation detail shared by the adapters.
+# Installed headers: only the public umbrella. src/core.hpp is deliberately NOT here -- it is a
+# raw device-pointer layer the plan code shares with the GpuMat adapter, not an API for callers.
 file(GLOB _triton_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton.hpp"
                        "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton/device.hpp")
 file(GLOB _triton_int_hdrs "${CMAKE_CURRENT_LIST_DIR}/src/*.hpp" "${CMAKE_CURRENT_LIST_DIR}/src/runtime/*.hpp")
@@ -374,4 +374,25 @@ else()
       install(TARGETS ${_t} RUNTIME DESTINATION "${OPENCV_TEST_INSTALL_PATH}" COMPONENT tests)
     endif()
   endif()
+  # Internal graph metric only; never replaces ordinary-call or paired primary
+  # qualification. No Torch dependency, no installed public graph owner.
+  option(TRITON_BUILD_HIP_GRAPH_BENCH "Build internal warmed production HIP graph benchmark" OFF)
+  if(TRITON_BUILD_HIP_GRAPH_BENCH AND BUILD_PERF_TESTS
+      AND (NOT DEFINED OPENCV_BUILD_PERF_TEST_MODULES_LIST
+          OR OPENCV_BUILD_PERF_TEST_MODULES_LIST STREQUAL "all"
+          OR ";${OPENCV_BUILD_PERF_TEST_MODULES_LIST};" MATCHES ";triton;"))
+    set(_graph_target opencv_perf_triton_hip_graph)
+    ocv_add_executable(${_graph_target}
+      "${CMAKE_CURRENT_LIST_DIR}/perf/hip/perf_graph.cpp"
+      "${CMAKE_CURRENT_LIST_DIR}/src/runtime/provider.cpp"
+      "${CMAKE_CURRENT_LIST_DIR}/src/runtime/compile_protocol.cpp"
+      ${_triton_reference_sources})
+    ocv_target_include_modules(${_graph_target} opencv_core opencv_imgproc ${the_module})
+    ocv_target_include_directories(${_graph_target} SYSTEM "${TRITON_HIP_INCLUDE_DIR}")
+    target_compile_definitions(${_graph_target} PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(${_graph_target} PRIVATE -ffp-contract=off)
+    ocv_target_link_libraries(${_graph_target} PRIVATE opencv_core opencv_imgproc ${the_module} "${TRITON_HIP_LIBRARY}" ${CMAKE_DL_LIBS})
+    set_target_properties(${_graph_target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
+  endif()
+
 endif()

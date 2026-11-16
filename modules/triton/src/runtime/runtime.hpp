@@ -34,6 +34,8 @@ namespace cv { namespace triton { namespace runtime {
 
 /** Is the selected device backend usable for `device`? Pure query: no allocation, no submission. */
 bool deviceAvailable(int device);
+// One private context lifetime owner for public admission and runtime keys.
+CV_EXPORTS cv_triton_runtime::Status contextIdentity(int device, std::uintptr_t& native, std::uint64_t& generation);
 const char* name();   // backend runtime identifier
 
 /** Run one resize. `req` views must belong to the context current on the calling thread.

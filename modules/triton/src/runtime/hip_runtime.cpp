@@ -164,6 +164,7 @@ HelperCommand helperCommand(const Config& c)
     const std::string path = envStr("PATH"), home = envStr("HOME");
     h.env = {"PATH=" + (path.empty() ? std::string("/usr/bin:/bin") : path), "HOME=" + (home.empty() ? std::string("/tmp") : home),
              "PYTHONPATH=" + c.pythonpath,
+             "TMPDIR=" + c.cache,
              "ROCM_PATH=" + c.rocm_path,   // the hip compiler finds clang and its device libraries through this
              "HIP_VISIBLE_DEVICES=", "ROCR_VISIBLE_DEVICES=", "CUDA_VISIBLE_DEVICES=", "LC_ALL=C"};   // no device
     return h;
@@ -200,10 +201,52 @@ struct CtxGuard
 
 // Is `c` still the context it was (`gen`, its hipCtxGetId)? A destroyed context took its modules,
 // memory and events with it, and its handle value may have come back as another context.
+
+hipError_t contextGeneration(hipCtx_t context, unsigned long long* generation)
+{
+    using GetId = hipError_t (*)(hipCtx_t, unsigned long long*);
+    static const GetId get_id = reinterpret_cast<GetId>(dlsym(RTLD_DEFAULT, "hipCtxGetId"));
+    if (get_id) return get_id(context, generation);
+    if (!context || !generation) return hipErrorInvalidContext;
+    struct Primary { hipCtx_t context; int device; unsigned long long generation; };
+    struct Registry { std::mutex mutex; std::vector<Primary> primaries; };
+    static Registry* registry = new Registry();
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    for (const auto& primary : registry->primaries)
+        if (primary.context == context)
+        {
+            unsigned int flags = 0; int active = 0;
+            const hipError_t result = hipDevicePrimaryCtxGetState(primary.device, &flags, &active);
+            if (result != hipSuccess || !active) return hipErrorInvalidContext;
+            *generation = primary.generation;
+            return hipSuccess;
+        }
+    hipCtx_t previous = nullptr;
+    hipError_t result = hipCtxGetCurrent(&previous);
+    if (result != hipSuccess || previous != context) return hipErrorInvalidContext;
+    hipDevice_t device;
+    result = hipCtxGetDevice(&device);
+    if (result != hipSuccess) return result;
+    for (const auto& primary : registry->primaries)
+        if (primary.device == static_cast<int>(device)) return hipErrorInvalidContext;
+    hipCtx_t primary = nullptr;
+    result = hipDevicePrimaryCtxRetain(&primary, device);
+    const hipError_t restored = hipCtxSetCurrent(previous);
+    if (result != hipSuccess) return result;
+    if (restored != hipSuccess) return restored;
+    // This retain lasts for the runtime's process-lifetime caches. A distinct
+    // private context is rejected before loading modules or submitting work.
+    const auto id = static_cast<unsigned long long>(registry->primaries.size()) + 1;
+    registry->primaries.push_back({primary, static_cast<int>(device), id});
+    if (context != primary) return hipErrorInvalidContext;
+    *generation = id;
+    return hipSuccess;
+}
+
 bool contextAlive(hipCtx_t c, std::uint64_t gen)
 {
     unsigned long long id = 0;
-    return c && hipCtxGetId(c, &id) == hipSuccess && id == gen;
+    return c && contextGeneration(c, &id) == hipSuccess && id == gen;
 }
 
 bool driverReady()
@@ -519,7 +562,7 @@ Status currentContext(int device, hipCtx_t& ctx, std::uint64_t& gen)
     if (hipCtxGetDevice(&cd) != hipSuccess || static_cast<int>(cd) != device)
         return error(Reason::ContextMismatch, "the current context is not on device " + std::to_string(device));
     unsigned long long id = 0;
-    if (hipCtxGetId(ctx, &id) != hipSuccess) return error(Reason::ContextMismatch, "hipCtxGetId failed");
+    if (contextGeneration(ctx, &id) != hipSuccess) return error(Reason::ContextMismatch, "hipCtxGetId failed");
     gen = id;   // unique for the context's lifetime and never reused, unlike the handle value
     Status ok;
     ok.code = Code::Prepared;
@@ -912,6 +955,14 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, hipCtx_t ctx, std::uint64_t 
 }  // namespace
 
 namespace runtime {
+
+Status contextIdentity(int device, std::uintptr_t& native, std::uint64_t& generation)
+{
+    hipCtx_t context=nullptr;
+    const Status status=currentContext(device,context,generation);
+    native=status.ok()?reinterpret_cast<std::uintptr_t>(context):0;
+    return status;
+}
 
 const char* name() { return "hip-jit"; }
 

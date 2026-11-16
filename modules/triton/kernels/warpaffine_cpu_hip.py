@@ -12,7 +12,7 @@ from triton.language.extra import libdevice
 
 
 # --- HIP/AMDGCN shims for the libdevice functions this file needs that
-# --- flagtree's hip libdevice does not provide (add_rn / mul_rn / sub_rn).
+# --- flagtree's hip libdevice does not provide (add_rn / mul_rn / sub_rn / rint).
 # --- Semantics preserved: each is a SINGLE round-to-nearest operation that the
 # --- compiler may not reassociate or fuse into a neighbouring term.
 # --- v_add_f32 v_mul_f32 v_sub_f32 are the CDNA instructions for add.f32 / mul.f32 / sub.f32; CDNA rounds to nearest-even
@@ -34,6 +34,11 @@ def _triton_mul_rn(a, b):
 def _triton_sub_rn(a, b):
     return tl.inline_asm_elementwise("v_sub_f32 $0, $1, $2", "=v,v,v", [a, b],
                                      dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _triton_rint(a):
+    return tl.inline_asm_elementwise("v_rndne_f32 $0, $1", "=v,v", [a], dtype=tl.float32, is_pure=True, pack=1)
 
 
 
@@ -126,8 +131,8 @@ def _warp_nearest(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, d
     xf = xs.to(tl.float32)
     sx, sy = _mapped_coord(xf, M00, M10, row_x, row_y, FUSED)
 
-    ix = libdevice.rint(sx).to(tl.int32)             # cvRound: half to even
-    iy = libdevice.rint(sy).to(tl.int32)
+    ix = _triton_rint(sx).to(tl.int32)             # cvRound: half to even
+    iy = _triton_rint(sy).to(tl.int32)
 
     if BORDER == 0 or TRANSPARENT:                   # BORDER_CONSTANT, or TRANSPARENT's range test
         inside = (ix >= 0) & (ix < src_w) & (iy >= 0) & (iy < src_h)
@@ -263,10 +268,10 @@ def _warp_linear(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, ds
         v1 = _fma(ax, p11 - p10, p10, FUSED)
         v = _fma(ay, v1 - v0, v0, FUSED)
         if U8:
-            v = tl.minimum(tl.maximum(libdevice.rint(v), 0.0), 255.0).to(tl.uint8)
+            v = tl.minimum(tl.maximum(_triton_rint(v), 0.0), 255.0).to(tl.uint8)
         elif U16:
             # v_pack_u(v_round(...)) = saturate_cast<ushort>(float): round, clamp, convert
-            v = tl.minimum(tl.maximum(libdevice.rint(v), 0.0), 65535.0).to(tl.uint16)
+            v = tl.minimum(tl.maximum(_triton_rint(v), 0.0), 65535.0).to(tl.uint16)
         if BORDER == 0:
             if c == 0:
                 bv = bv0
@@ -417,9 +422,9 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
                 bv = bv3
             acc = tl.where(m & all_out, tl.full(acc.shape, bv.to(tl.float32), tl.float32), acc)
         if U8:
-            out = tl.minimum(tl.maximum(libdevice.rint(acc), 0.0), 255.0).to(tl.uint8)
+            out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 255.0).to(tl.uint8)
         elif U16:
-            out = tl.minimum(tl.maximum(libdevice.rint(acc), 0.0), 65535.0).to(tl.uint16)
+            out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 65535.0).to(tl.uint16)
         else:
             out = acc
         cstore = m & ~all_out if TRANSPARENT else m

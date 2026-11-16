@@ -12,14 +12,14 @@ from triton.language.extra import libdevice
 
 
 # --- HIP/AMDGCN shims for the libdevice functions this file needs that
-# --- flagtree's hip libdevice does not provide (add_rn / mul_rn / div_rn).
+# --- flagtree's hip libdevice does not provide (add_rn / mul_rn / div_rn / rint).
 # --- Semantics preserved: each is a SINGLE round-to-nearest operation that the
-# --- compiler may not reassociate or fuse into a neighbouring term, which is
-# --- exactly why the CPU-aligned kernels spell them out instead of using `+`
-# --- and `*`. v_add_f32 / v_mul_f32 are the CDNA instructions for add.f32 /
-# --- mul.f32; CDNA's rounding is round-to-nearest-even unconditionally.
+# --- compiler may not reassociate or fuse into a neighbouring term.
+# --- v_add_f32 v_mul_f32 are the CDNA instructions for add.f32 / mul.f32; CDNA rounds to nearest-even
+# --- unconditionally.
 # --- `div_rn` has no single instruction on CDNA (the divide is a 5-instruction
 # --- sequence); plain `/` is used.
+
 @triton.jit
 def _triton_add_rn(a, b):
     return tl.inline_asm_elementwise("v_add_f32 $0, $1, $2", "=v,v,v", [a, b],
@@ -35,6 +35,10 @@ def _triton_mul_rn(a, b):
 @triton.jit
 def _triton_div_rn(a, b):
     return a / b
+
+@triton.jit
+def _triton_rint(a):
+    return tl.inline_asm_elementwise("v_rndne_f32 $0, $1", "=v,v", [a], dtype=tl.float32, is_pure=True, pack=1)
 
 
 
@@ -215,7 +219,7 @@ def _resize_cpu_sep_kernel(src, dst, xofs, ax, yofs, by, byf,
                 t2 = _triton_add_rn(_triton_mul_rn(h2.to(tl.float32), bf2), t3)
                 t1 = _triton_add_rn(_triton_mul_rn(h1.to(tl.float32), bf1), t2)
                 t0 = _triton_add_rn(_triton_mul_rn(h0.to(tl.float32), bf0), t1)
-                vf = tl.minimum(tl.maximum(libdevice.rint(t0), 0.0), 255.0).to(tl.int32)
+                vf = tl.minimum(tl.maximum(_triton_rint(t0), 0.0), 255.0).to(tl.int32)
                 # ... scalar tail: FixedPtCast<int, uchar, 22>
                 ib0 = tl.load(by + r * 4)
                 ib1 = tl.load(by + r * 4 + 1)
@@ -431,7 +435,7 @@ def _resize_cpu_area_fast_kernel(src, dst, src_h, src_w, dst_h, W, cn: tl.conste
                 for kx in tl.range(0, IX, loop_unroll_factor=4):
                     acc += tl.load(rp + kx * cn + chv[None, None, None, :], mask=okr, other=0).to(tl.int32)
             tot = tl.sum(acc, axis=0)                     # (rows, pixels, CP): rows add exactly
-            out8 = tl.minimum(tl.maximum(libdevice.rint(_triton_mul_rn(tot.to(tl.float32), scale)), 0.0), 255.0).to(tl.uint8)
+            out8 = tl.minimum(tl.maximum(_triton_rint(_triton_mul_rn(tot.to(tl.float32), scale)), 0.0), 255.0).to(tl.uint8)
             if cn == 1:
                 tl.store(dp, tl.sum(out8, axis=2))
             else:
@@ -460,14 +464,14 @@ def _resize_cpu_area_fast_kernel(src, dst, src_h, src_w, dst_h, W, cn: tl.conste
                         ok = rok & (sx0 + kx < src_w)
                         s += tl.load(rp + (sx0 + kx) * cn + c, mask=ok, other=0).to(tl.int32)
                         cnt += ok.to(tl.int32)
-                gen = tl.minimum(tl.maximum(libdevice.rint(_triton_mul_rn(s.to(tl.float32), scale)),
+                gen = tl.minimum(tl.maximum(_triton_rint(_triton_mul_rn(s.to(tl.float32), scale)),
                                             0.0), 255.0).to(tl.int32)
                 if TWO_BY_TWO & ((cn == 1) | (cn == 3) | (cn == 4)):
                     fullv = (s + 2) >> 2
                 else:
                     fullv = gen
                 q_e = _triton_div_rn(s.to(tl.float32), cnt.to(tl.float32))
-                edge = tl.where(cnt > 0, tl.minimum(tl.maximum(libdevice.rint(q_e), 0.0), 255.0).to(tl.int32), 0)
+                edge = tl.where(cnt > 0, tl.minimum(tl.maximum(_triton_rint(q_e), 0.0), 255.0).to(tl.int32), 0)
                 out = tl.where(in_img, tl.where(full, fullv, edge), 0).to(tl.uint8)
             else:
                 acc, tot, cnt = _cpu_f32_window(rp0, sx0, cn, c, IX, area, src_h, src_w, sy0, src_rs,
@@ -565,13 +569,13 @@ def _resize_cpu_area_kernel(src, dst, xs, xa, xc, ys, ya, yc, KX, KY,
             acc2 = tl.where(ylive, _triton_add_rn(acc2, _triton_mul_rn(beta, h2)), acc2)
             acc3 = tl.where(ylive, _triton_add_rn(acc3, _triton_mul_rn(beta, h3)), acc3)
     if U8:
-        tl.store(dp, tl.minimum(tl.maximum(libdevice.rint(acc0), 0.0), 255.0).to(tl.uint8), mask=m)
+        tl.store(dp, tl.minimum(tl.maximum(_triton_rint(acc0), 0.0), 255.0).to(tl.uint8), mask=m)
         if cn > 1:
-            tl.store(dp + 1, tl.minimum(tl.maximum(libdevice.rint(acc1), 0.0), 255.0).to(tl.uint8), mask=m)
+            tl.store(dp + 1, tl.minimum(tl.maximum(_triton_rint(acc1), 0.0), 255.0).to(tl.uint8), mask=m)
         if cn > 2:
-            tl.store(dp + 2, tl.minimum(tl.maximum(libdevice.rint(acc2), 0.0), 255.0).to(tl.uint8), mask=m)
+            tl.store(dp + 2, tl.minimum(tl.maximum(_triton_rint(acc2), 0.0), 255.0).to(tl.uint8), mask=m)
         if cn > 3:
-            tl.store(dp + 3, tl.minimum(tl.maximum(libdevice.rint(acc3), 0.0), 255.0).to(tl.uint8), mask=m)
+            tl.store(dp + 3, tl.minimum(tl.maximum(_triton_rint(acc3), 0.0), 255.0).to(tl.uint8), mask=m)
     else:
         tl.store(dp, acc0, mask=m)
         if cn > 1:

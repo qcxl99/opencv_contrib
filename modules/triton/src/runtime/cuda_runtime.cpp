@@ -839,6 +839,14 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, CUcontext ctx, std::uint64_t
 
 namespace runtime {
 
+Status contextIdentity(int device, std::uintptr_t& native, std::uint64_t& generation)
+{
+    CUcontext context=nullptr;
+    const Status status=currentContext(device,context,generation);
+    native=status.ok()?reinterpret_cast<std::uintptr_t>(context):0;
+    return status;
+}
+
 const char* name() { return "cuda-jit"; }
 
 bool deviceAvailable(int device)

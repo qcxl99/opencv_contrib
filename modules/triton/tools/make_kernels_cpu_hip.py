@@ -60,6 +60,12 @@ def _triton_div_rn(a, b):
 
 # Per-primitive bodies, for a kernel whose missing set differs from resize's.
 _SHIMS = {
+    "rint": """
+@triton.jit
+def _triton_rint(a):
+    return tl.inline_asm_elementwise("v_rndne_f32 $0, $1", "=v,v", [a], dtype=tl.float32, is_pure=True, pack=1)
+
+""",
     "add_rn": """
 @triton.jit
 def _triton_add_rn(a, b):
@@ -89,7 +95,7 @@ def _triton_div_rn(a, b):
 }
 
 # Fixed order: two kernels missing the same primitives derive identical text.
-MISSING_ON_HIP = ("add_rn", "mul_rn", "div_rn", "sub_rn")
+MISSING_ON_HIP = ("add_rn", "mul_rn", "div_rn", "sub_rn", "rint")
 RESIZE_SET = ("add_rn", "mul_rn", "div_rn")
 
 
@@ -104,7 +110,7 @@ def shim_for(text: str) -> str:
         return ""
     if used == RESIZE_SET:
         return _RESIZE_SHIM
-    arith = [n for n in used if n != "div_rn"]
+    arith = [n for n in used if n not in ("div_rn", "rint")]
     isa = (" ".join(f"v_{n.split('_')[0]}_f32" for n in arith) + " are the CDNA instructions for "
            + " / ".join(f"{n.split('_')[0]}.f32" for n in arith)) if arith else ""
     head = ("\n\n# --- HIP/AMDGCN shims for the libdevice functions this file needs that\n"
@@ -141,7 +147,7 @@ def derive(op):
     body = text.replace(ANCHOR, ANCHOR + shim_for(text), 1)
     for name in MISSING_ON_HIP:
         body = re.sub(rf"\blibdevice\.{name}\(", f"_triton_{name}(", body)
-    left = re.findall(r"libdevice\.(?:add_rn|mul_rn|sub_rn|div_rn)", body)
+    left = re.findall(r"libdevice\.(?:add_rn|mul_rn|sub_rn|div_rn|rint)", body)
     if left:
         sys.exit(f"unreplaced libdevice calls remain: {left[:3]}")
     if op == "resize":

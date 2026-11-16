@@ -76,6 +76,7 @@ sub('        k.compiler = envStr("OPENCV_TRITON_COMPILER");\n',
     '        k.compiler = envStr("OPENCV_TRITON_COMPILER");\n', 1)
 sub('             "PYTHONPATH=" + c.pythonpath, "CUDA_VISIBLE_DEVICES=", "LC_ALL=C"};   // the helper needs no device\n',
     '             "PYTHONPATH=" + c.pythonpath,\n'
+    '             "TMPDIR=" + c.cache,\n'
     '             "ROCM_PATH=" + c.rocm_path,   // the hip compiler finds clang and its device libraries through this\n'
     '             "HIP_VISIBLE_DEVICES=", "ROCR_VISIBLE_DEVICES=", "CUDA_VISIBLE_DEVICES=", "LC_ALL=C"};   // no device\n', 1)
 
@@ -220,6 +221,57 @@ DevInfo queryDevice(int device)
 struct State
 {
     std::map<int, DevInfo> devices;''', 1)
+
+# ROCm does not provide DTK's hipCtxGetId extension. Preserve it when exported;
+# otherwise support retained primary contexts only. No pointer-derived fake
+# generation: the retained context is pinned for this process's cache lifetime.
+# Device reset and primary-context reset are unsupported while this runtime is in use.
+context_helper = r'''
+hipError_t contextGeneration(hipCtx_t context, unsigned long long* generation)
+{
+    using GetId = hipError_t (*)(hipCtx_t, unsigned long long*);
+    static const GetId get_id = reinterpret_cast<GetId>(dlsym(RTLD_DEFAULT, "hipCtxGetId"));
+    if (get_id) return get_id(context, generation);
+    if (!context || !generation) return hipErrorInvalidContext;
+    struct Primary { hipCtx_t context; int device; unsigned long long generation; };
+    struct Registry { std::mutex mutex; std::vector<Primary> primaries; };
+    static Registry* registry = new Registry();
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    for (const auto& primary : registry->primaries)
+        if (primary.context == context)
+        {
+            unsigned int flags = 0; int active = 0;
+            const hipError_t result = hipDevicePrimaryCtxGetState(primary.device, &flags, &active);
+            if (result != hipSuccess || !active) return hipErrorInvalidContext;
+            *generation = primary.generation;
+            return hipSuccess;
+        }
+    hipCtx_t previous = nullptr;
+    hipError_t result = hipCtxGetCurrent(&previous);
+    if (result != hipSuccess || previous != context) return hipErrorInvalidContext;
+    hipDevice_t device;
+    result = hipCtxGetDevice(&device);
+    if (result != hipSuccess) return result;
+    for (const auto& primary : registry->primaries)
+        if (primary.device == static_cast<int>(device)) return hipErrorInvalidContext;
+    hipCtx_t primary = nullptr;
+    result = hipDevicePrimaryCtxRetain(&primary, device);
+    const hipError_t restored = hipCtxSetCurrent(previous);
+    if (result != hipSuccess) return result;
+    if (restored != hipSuccess) return restored;
+    // This retain lasts for the runtime's process-lifetime caches. A distinct
+    // private context is rejected before loading modules or submitting work.
+    const auto id = static_cast<unsigned long long>(registry->primaries.size()) + 1;
+    registry->primaries.push_back({primary, static_cast<int>(device), id});
+    if (context != primary) return hipErrorInvalidContext;
+    *generation = id;
+    return hipSuccess;
+}
+
+'''
+sub('bool contextAlive(CUcontext c, std::uint64_t gen)\n',
+    context_helper + 'bool contextAlive(CUcontext c, std::uint64_t gen)\n', 1)
+sub('cuCtxGetId(', 'contextGeneration(', 2)
 
 # ---- 6. plain token renames -----------------------------------------------------------
 pairs = [
