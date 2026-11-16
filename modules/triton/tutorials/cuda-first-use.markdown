@@ -1,11 +1,19 @@
-H20 first use {#tutorial_triton_h20_first_use}
-=============
+CUDA build and first use {#tutorial_triton_cuda_first_use}
+========================
 
-This guide uses Linux x86_64, NVIDIA H20 (`sm_90`), CUDA Toolkit 12.8 and Triton
-3.6.0. Follow the [OpenCV Linux installation guide](https://docs.opencv.org/4.x/d7/d9f/tutorial_linux_install.html)
-and the contrib repository build instructions for general prerequisites.
-The module adds a runtime compiler dependency on Python and Triton; it does not
-require PyTorch.
+Build the CUDA backend, run the public GpuMat entries and check the installation.
+Choose a CUDA toolkit, driver and Triton compiler that support the actual device.
+PyTorch is not required. See @ref triton_runtime_toolchain for compiler selection,
+ABI, cache and resource-location rules.
+
+@anchor tutorial_triton_h20_first_use
+
+A configuration example is Linux x86_64, NVIDIA H20 (`sm_90`), CUDA Toolkit 12.8
+and Triton 3.6.0. These values describe a build configuration, not a test result
+for every machine or source revision. Follow the
+[OpenCV Linux installation guide](https://docs.opencv.org/4.x/d7/d9f/tutorial_linux_install.html)
+for general prerequisites. Record the actual driver and loaded libraries when
+validating a build.
 
 Configure and build
 -------------------
@@ -23,8 +31,8 @@ cmake -S <opencv> -B <build> -G Ninja \
   -DOPENCV_EXTRA_MODULES_PATH=<opencv_contrib>/modules \
   -DBUILD_LIST=core,imgproc,imgcodecs,triton,python3,python_bindings_generator,ts \
   -DBUILD_opencv_triton=ON -DTRITON_BACKEND=cuda -DWITH_CUDA=ON \
-  -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-12.8 \
-  -DCUDA_ARCH_BIN=9.0 -DCUDA_ARCH_PTX= \
+  -DCUDA_TOOLKIT_ROOT_DIR=<cuda-toolkit> \
+  -DCUDA_ARCH_BIN=<compute-capability> -DCUDA_ARCH_PTX= \
   -DPYTHON3_EXECUTABLE=<venv>/bin/python \
   -DTRITON_PYTHON_EXECUTABLE=<venv>/bin/python \
   -DBUILD_EXAMPLES=ON -DBUILD_TESTS=ON -DBUILD_PERF_TESTS=ON \
@@ -33,6 +41,7 @@ cmake --build <build> --parallel
 cmake --install <build>
 ```
 
+For the H20 example, use CUDA 12.8 and `CUDA_ARCH_BIN=9.0`.
 Check the CMake summary for the selected CUDA toolkit, device architecture,
 Python headers/library and module list. `TRITON_PYTHONPATH` is optional if the
 compiler interpreter already imports the intended Triton package. Kernels are
@@ -100,18 +109,15 @@ including tests requiring a second device. Performance workloads can be chosen
 with `--gtest_filter`; warmed public-call timing includes submission and stream
 completion. It is distinct from isolated kernel or graph replay timing.
 
-Cache and installation
-----------------------
+Installation and cache checks
+-----------------------------
 
-Use a writable `OPENCV_TRITON_CACHE_DIR`. With a new directory, the first request
-needs the selected Python/Triton compiler. Subsequent processes can use persisted
-artifacts without an interpreter for matching requests. An empty cache without a
-compiler must produce a clear toolchain error. An empty module artifact cache
-does not clear the underlying compiler cache.
+Use the installed headers with `find_package(OpenCV REQUIRED COMPONENTS core imgproc triton)`
+in an independent C++ consumer. Check the selected Python extension and loaded
+OpenCV libraries, including after moving an installation to a different prefix.
 
-Installed resources are found relative to the module library. An external C++
-consumer can use `find_package(OpenCV REQUIRED COMPONENTS core imgproc triton)`
-and the installed public headers; it does not need private module headers.
-When relocating the prefix, ensure the application and Python extension load
-libraries from that prefix. See @ref tutorial_triton_resize for resource and
-compiler overrides, and @ref tutorial_triton_maintenance for source generation.
+Follow @ref triton_runtime_toolchain for separate empty-cache, persisted-cache
+without compiler, and empty-cache without compiler checks. See
+@ref tutorial_triton_validation for accuracy/performance scope and evidence
+requirements. Save results with the actual machine, device, driver, toolkit,
+compiler and source/artifact identities; this tutorial does not certify them.

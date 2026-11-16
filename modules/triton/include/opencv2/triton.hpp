@@ -21,9 +21,10 @@
  * @see @ref tutorial_triton_resize
  * @see @ref tutorial_triton_cvtcolor
  * @see @ref tutorial_triton_warpaffine
- * @see @ref tutorial_triton_h20_first_use
- * @see @ref tutorial_triton_bw1000_first_use
- * @see @ref tutorial_triton_w7900d_first_use
+ * @see @ref tutorial_triton_cuda_first_use
+ * @see @ref tutorial_triton_hip_first_use
+ * @see @ref tutorial_triton_maintenance
+ * @see @ref tutorial_triton_validation
  */
 
 namespace cv { namespace triton {

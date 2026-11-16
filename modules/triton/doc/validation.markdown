@@ -87,11 +87,9 @@ Enabled CUDA and HIP
 
 Use separate build/install directories, standard `BUILD_TESTS`,
 `BUILD_PERF_TESTS`, `BUILD_EXAMPLES`, and the corresponding backend toolkit.
-The @ref tutorial_triton_h20_first_use "H20 guide" contains the CUDA commands and installed
-Python/consumer/cache checks. The @ref tutorial_triton_bw1000_first_use "BW1000 guide"
-contains the HIP/DTK setup; @ref tutorial_triton_w7900d_first_use "W7900D"
-contains the HIP/ROCm setup. Both use C++ DeviceImage entries; results and
-performance ratios from one device do not validate the other. Include
+Use @ref tutorial_triton_cuda_first_use for CUDA build/install commands and
+@ref tutorial_triton_hip_first_use for HIP, including DTK/ROCm differences.
+Results from one machine or architecture do not validate another. Include
 `python3,python_bindings_generator,ts` in BUILD_LIST when validating wrappers
 and tests; select compatible Python development headers/library and NumPy.
 
@@ -128,7 +126,8 @@ for an independent C++ consumer. Check separate processes for a new artifact
 cache, disk cache without a compiler interpreter, and a different empty cache
 without the compiler. Existing runtime tests cover integrity and resource lifetime; select
 changed boundaries, including graph capture or cross-stream dependencies when
-applicable. First-use and deployment guides remain the command owners.
+applicable. Backend tutorials own build/install commands;
+@ref triton_runtime_toolchain owns compiler, cache and relocation rules.
 
 A hosted CPU source check, an enabled compile job and an actual run on each target device
 establish different things. The repository's general PR workflow does not by

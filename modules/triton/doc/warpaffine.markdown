@@ -2,7 +2,8 @@ Triton warpAffine {#tutorial_triton_warpaffine}
 =================
 
 @see @ref triton "Triton API reference".
-@see @ref tutorial_triton_resize "Runtime compilation, cache and streams".
+@see @ref triton_runtime_toolchain "Runtime compilation and cache".
+@see @ref triton_architecture "Streams and resource ownership".
 
 Supported inputs
 ----------------

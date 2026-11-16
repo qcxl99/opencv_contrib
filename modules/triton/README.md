@@ -68,46 +68,18 @@ implementation. Float arithmetic uses a per-pixel error bound, specified in the
 
 ## Build
 
-Use a standard OpenCV out-of-source build with this contrib checkout:
+Enable this default-off module with `BUILD_opencv_triton=ON` in a matching
+OpenCV/contrib out-of-source build. PyTorch is not required. Choose the backend
+tutorial for build, install, device selection and first-use commands:
 
-```sh
-cmake -S <opencv> -B <build> \
-  -DOPENCV_EXTRA_MODULES_PATH=<opencv_contrib>/modules \
-  -DBUILD_opencv_triton=ON -DWITH_CUDA=ON -DTRITON_BACKEND=cuda \
-  -DTRITON_PYTHON_EXECUTABLE=<python-with-triton>
-cmake --build <build> --parallel
-cmake --install <build>
-```
+- [CUDA](tutorials/cuda-first-use.markdown): GpuMat calls and Python bindings;
+  H20/CUDA is a configuration example.
+- [HIP](tutorials/hip-first-use.markdown): C++ DeviceImage calls; DTK/gfx936 and
+  ROCm/gfx1100 configuration differences are listed separately.
 
-The supported compiler ABI is Triton 3.6.0. Use the guide for the device and
-runtime being built:
-
-| Backend | Device target | Toolkit | Build guide |
-|---|---|---|---|
-| CUDA | NVIDIA H20, `sm_90` | CUDA 12.8 | [H20](doc/h20-first-use.markdown) |
-| HIP | Hygon BW1000, `gfx936`, wave64 | DTK 26.04 | [BW1000](doc/bw1000-first-use.markdown) |
-| HIP | AMD Radeon PRO W7900D, `gfx1100`, wave32 | ROCm 7.2.4 | [W7900D](doc/w7900d-first-use.markdown) |
-
-Both HIP configurations need a HIP-capable Triton 3.6.0 compiler, such as the
-matching flagtree package. They share the C++ API, not toolkit libraries or
-compiled artifacts. The runtime detects the actual target and warp size; a
-platform name does not select or validate them. Select `TRITON_BACKEND=hip`
-explicitly when CUDA is a compatibility layer. `auto` selects CUDA when OpenCV
-has CUDA support, otherwise an available HIP toolkit.
-
-`TRITON_PYTHON_EXECUTABLE` selects the runtime compiler interpreter.
-`TRITON_PYTHONPATH` supplies an optional import path. These settings are separate
-from `PYTHON3_EXECUTABLE`, which builds OpenCV's Python bindings. Disabled module
-builds do not require Python or Triton on behalf of this module.
-
-A cache miss needs Python and Triton. The writable artifact cache defaults to
-`~/.cache/opencv/triton`; override it with `OPENCV_TRITON_CACHE_DIR`. Cached
-kernels run without the compiler interpreter.
-
-Shared installations resolve kernel resources relative to the module library.
-Static installations use the configured resource prefix; set
-`OPENCV_TRITON_RESOURCES` when relocating a static SDK. The [resize guide](doc/resize.markdown)
-describes cache validation and resource overrides.
+The runtime detects the actual target; configuration examples do not certify
+other machines or revisions. Compiler/ABI, cache and relocation details are
+maintained in the [runtime toolchain section](doc/maintenance.markdown#triton_runtime_toolchain).
 
 ## Use
 
@@ -167,5 +139,6 @@ different numerical behavior and do not replace accuracy tests.
 The optional [HIP graph benchmark](perf/hip/GRAPH.md) measures warmed replay
 separately from ordinary calls.
 
-See [module maintenance](doc/maintenance.markdown) for local source generation
-and testing, and the [API header](include/opencv2/triton.hpp) for signatures.
+See [architecture and maintenance](doc/maintenance.markdown),
+[validation methods](doc/validation.markdown), and the
+[API header](include/opencv2/triton.hpp).

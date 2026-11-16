@@ -2,9 +2,8 @@ Triton resize {#tutorial_triton_resize}
 =============
 
 @see @ref triton "Triton API reference".
-@see @ref tutorial_triton_h20_first_use "CUDA build and first use".
-@see @ref tutorial_triton_bw1000_first_use "BW1000 / DTK build and first use".
-@see @ref tutorial_triton_w7900d_first_use "W7900D / ROCm build and first use".
+@see @ref tutorial_triton_cuda_first_use "CUDA build and first use".
+@see @ref tutorial_triton_hip_first_use "HIP / DTK and ROCm build and first use".
 
 Supported inputs
 ----------------
@@ -63,44 +62,10 @@ and a native stream handle. See `samples/hip/device.cpp`
 The overload with `fx`/`fy` supports scale-derived sizing; the six-argument
 form requires explicit `dsize`.
 
-Runtime compilation and cache
------------------------------
+Runtime and deployment
+----------------------
 
-The module is disabled by default and requires no PyTorch dependency when
-enabled. Nothing is compiled by Triton during the OpenCV build. On first use,
-`tools/compile_helper.py` runs in a separate Python process using the configured
-Triton 3.6.0 compiler. The C++ execution path does not embed an interpreter.
-CUDA 12.8/sm_90 and the HIP flagtree 3.6.0 toolchain are described in the
-platform guides linked above.
-
-The compile key includes source identity, kernel signature, compile-time
-parameters, launch options, target and compiler version. The runtime checks
-manifest and binary hashes before loading disk artifacts. An unsupported
-compiler launch ABI is rejected. Size-dependent coordinate and coefficient
-tables are built in C++, uploaded on the caller's stream and cached. Cross-stream
-use waits on the upload event. In-flight work retains modules and tables even
-after cache eviction.
-
-The writable cache defaults to `~/.cache/opencv/triton`. The following runtime
-settings override configured defaults:
-
-| Setting | Purpose |
-|---|---|
-| `OPENCV_TRITON_CACHE_DIR` | Artifact cache directory |
-| `OPENCV_TRITON_RESOURCES` | Kernel and helper resource directory |
-| `OPENCV_TRITON_PYTHON` | Compiler interpreter |
-| `OPENCV_TRITON_PYTHONPATH` | Compiler Python import path |
-
-Installation places resources under `share/opencv5/triton`, resolved relative
-to the module library. A disk-cache hit runs without the compiler interpreter;
-a cache miss with no usable compiler raises a toolchain error.
-
-The module and compiler have separate caches. Clearing
-`OPENCV_TRITON_CACHE_DIR` forces a module-cache miss, but the compiler can still
-reuse its own cached output. To measure compilation from scratch, also select
-an empty compiler cache and record both cache locations.
-
-For applications that use device graphs, warm operations can be captured. After graphs using module
-resources are destroyed or can no longer be replayed, call
-cv::triton::releaseGraphResources(). Do not release those resources while a
-graph can still use them.
+See @ref triton_runtime_toolchain for compiler interpreters, launch ABI, cache
+keys, persisted artifacts and resource relocation. For graph capture and
+asynchronous resource ownership, see @ref triton_architecture and
+cv::triton::releaseGraphResources().
