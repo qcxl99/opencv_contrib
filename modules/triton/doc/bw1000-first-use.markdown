@@ -23,7 +23,7 @@ cmake -S <opencv> -B <build> -G Ninja \
   -DTRITON_PYTHONPATH=<flagtree-package-directory> \
   -DPYTHON3_EXECUTABLE=<bindings-python> \
   -DBUILD_TESTS=ON -DBUILD_PERF_TESTS=ON -DBUILD_EXAMPLES=ON \
-  -DINSTALL_C_EXAMPLES=ON -DINSTALL_PYTHON_EXAMPLES=ON
+  -DINSTALL_C_EXAMPLES=ON
 cmake --build <build> --parallel
 cmake --install <build>
 ```
@@ -36,14 +36,10 @@ visible device set.
 Use and test
 ------------
 
-HIP Python applications use `cv2.triton.HipImage` and `cv2.triton.HipStream`.
-The operators keep intermediate results on device; `upload()` and `download()`
-provide blocking NumPy transfers. See @ref tutorial_triton_hip_python.
-
-C++ applications can use the owning classes in `opencv2/triton/hip.hpp` or the
-caller-owned `resizeDevice`, `cvtColorDevice` and `warpAffineDevice` entries in
-`opencv2/triton/device.hpp`. The three modes of `example_triton_device` demonstrate
-raw allocation, upload, native-stream submission, synchronization and CPU comparison:
+HIP applications call `resizeDevice`, `cvtColorDevice` and `warpAffineDevice`
+from `opencv2/triton/device.hpp`. The caller owns device storage and passes a
+native stream handle. The three modes of `example_triton_device` demonstrate
+allocation, upload, submission, synchronization and CPU comparison:
 
 ```sh
 <build>/bin/example_triton_device resize
@@ -60,17 +56,10 @@ from HIP targets. The supplemental HIP executable groups backend-specific
 checks; its XML records inner-check counts separately from registered tests.
 Use OpenCV filters to choose performance workloads and report skipped tests.
 
-Run the Python device pipeline and binding tests with the installed `cv2` on
-`PYTHONPATH` and the selected installation's libraries on the loader path:
-
-```sh
-<bindings-python> <opencv_contrib>/modules/triton/samples/hip/device.py --device 0
-<bindings-python> <opencv_contrib>/modules/triton/misc/python/test/test_triton_hip.py -v
-```
-
-The Python tests use OpenCV's test helpers; add
-`<opencv>/modules/python/test` to `PYTHONPATH` as needed. The HIP numerical API
-accepts `HipImage`, while GpuMat overloads raise `StsNotImplemented`.
+Python can import the module and use backend queries. Numerical GpuMat adapters
+are unavailable on HIP: resize, cvtColor and warpAffine raise
+`StsNotImplemented`, including omitted and `None` streams. Numerical HIP calls
+use the C++ device-buffer API.
 
 Deployment
 ----------
@@ -81,8 +70,7 @@ an older OpenCV installation is not loaded accidentally.
 
 A new `OPENCV_TRITON_CACHE_DIR` needs the compiler toolchain. Once artifacts are
 cached, the same requests can run in another process without the compiler
-interpreter. Python applications still require their Python runtime and `cv2`.
-A separate empty cache with no compiler must raise a toolchain error. See
+interpreter. A separate empty cache with no compiler must raise a toolchain error. See
 @ref tutorial_triton_resize for overrides and cache lifetime.
 
 DTK permits allocation device/range and stream-context checks, but does not

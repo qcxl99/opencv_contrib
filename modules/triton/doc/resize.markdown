@@ -4,7 +4,6 @@ Triton resize {#tutorial_triton_resize}
 @see @ref triton "Triton API reference".
 @see @ref tutorial_triton_h20_first_use "CUDA build and first use".
 @see @ref tutorial_triton_bw1000_first_use "HIP build and first use".
-@see @ref tutorial_triton_hip_python "HIP Python device images and streams".
 
 Supported inputs
 ----------------
@@ -52,19 +51,8 @@ cv::triton::resize(src, dst, cv::Size(host.cols / 2, host.rows / 2),
 stream.waitForCompletion();
 ```
 
-The GpuMat function submits work asynchronously. Retain input and output
-allocations until the stream completes. HIP Python uses device images:
-
-```python
-small = cv.triton.resize(src, (640, 360), interpolation=cv.INTER_AREA, stream=stream)
-scaled = cv.triton.resize(src, (0, 0), fx=0.5, fy=0.5, stream=stream)
-```
-
-Here `src` is a `cv.triton.HipImage` and `stream` is an optional
-`cv.triton.HipStream`. Outputs remain on device; matching `dst` storage is reused.
-See @ref tutorial_triton_hip_python for transfers and stream dependencies.
-
-HIP C++ applications can also use `resizeDevice` from
+The function submits work asynchronously. Retain input and output allocations
+until the stream completes. HIP applications use `resizeDevice` from
 `opencv2/triton/device.hpp` with preallocated output and a native stream handle.
 The overload with `fx`/`fy` supports scale-derived sizing; the six-argument
 form requires explicit `dsize`.
@@ -102,8 +90,7 @@ to the module library. A disk-cache hit runs without the compiler interpreter;
 a cache miss with no usable compiler raises a toolchain error. An empty module artifact cache
 does not imply that the compiler's own cache is empty.
 
-Warm GpuMat and raw device-buffer operations can be captured into device graphs.
-The owning HipImage API does not support graph capture. After graphs using module
+Warm operations can be captured into device graphs. After graphs using module
 resources are destroyed or can no longer be replayed, call
 cv::triton::releaseGraphResources(). Do not release those resources while a
 graph can still use them.

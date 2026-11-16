@@ -15,9 +15,7 @@
 /** @defgroup triton Triton-backed operations
  *
  * Optional GPU operations compiled on first use by Python/Triton. PyTorch is not required.
- * CUDA uses GpuMat; HIP provides HipImage and HipStream in opencv2/triton/hip.hpp
- * for C++ and Python, plus caller-owned buffers in opencv2/triton/device.hpp.
- * Device operations are asynchronous; HipImage upload/download are blocking.
+ * CUDA uses GpuMat; HIP uses opencv2/triton/device.hpp. Calls are asynchronous.
  * Unsupported inputs raise an exception without CPU or cv::cuda fallback.
  *
  * @see @ref tutorial_triton_resize
@@ -25,7 +23,6 @@
  * @see @ref tutorial_triton_warpaffine
  * @see @ref tutorial_triton_h20_first_use
  * @see @ref tutorial_triton_bw1000_first_use
- * @see @ref tutorial_triton_hip_python
  */
 
 namespace cv { namespace triton {

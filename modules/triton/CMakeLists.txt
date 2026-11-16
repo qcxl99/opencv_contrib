@@ -14,9 +14,8 @@
 #   hip   HIP on Hygon DTK / ROCm (src/runtime/hip_runtime.cpp, BW1000 = gfx936). Kernels are
 #         kernels/*_cpu_hip.py where the CUDA source needs a derivation (tools/
 #         make_kernels_cpu_hip.py; a stale copy fails the configure), else the CUDA source as
-#         written. opencv2/triton/hip.hpp provides owning C++/Python images and streams;
-#         opencv2/triton/device.hpp accepts caller-owned device buffers and native streams.
-#         The GpuMat entries raise on HIP. Common
+#         written. The entries are opencv2/triton/device.hpp (device buffers + a hip stream);
+#         the GpuMat entries exist and raise, since OpenCV has no cv::cuda here. Common
 #         accuracy/perf and HIP lifecycle tests use HIP-capable Triton and ROCM_PATH.
 #   auto  cuda where the OpenCV build has CUDA (unchanged), else hip if a HIP toolkit is found,
 #         else the module is disabled. A tree whose CUDA is a compatibility layer (WITH_CUDA=ON
@@ -104,7 +103,6 @@ set(_triton_srcs
     "${CMAKE_CURRENT_LIST_DIR}/src/entry.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/device_entries.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/python_entries.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/src/hip_objects.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/resize_plan.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/provider.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/runtime/cvtcolor.cpp"
@@ -126,8 +124,7 @@ endif()
 # Public headers are installed and parsed by the Python binding generator.
 # src/core.hpp is an implementation detail shared by the adapters.
 file(GLOB _triton_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton.hpp"
-                       "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton/device.hpp"
-                       "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton/hip.hpp")
+                       "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton/device.hpp")
 file(GLOB _triton_int_hdrs "${CMAKE_CURRENT_LIST_DIR}/src/*.hpp" "${CMAKE_CURRENT_LIST_DIR}/src/runtime/*.hpp")
 
 # imgproc: the interpolation enums. cudawarping is not a dependency of the implementation; it is
@@ -342,10 +339,6 @@ else()
   # Source installation is independent of whether example binaries are built.
   if(INSTALL_C_EXAMPLES)
     install(FILES "${_triton_sample}"
-      DESTINATION "${OPENCV_SAMPLES_SRC_INSTALL_PATH}/triton/hip" COMPONENT samples)
-  endif()
-  if(INSTALL_PYTHON_EXAMPLES)
-    install(FILES "${CMAKE_CURRENT_LIST_DIR}/samples/hip/device.py"
       DESTINATION "${OPENCV_SAMPLES_SRC_INSTALL_PATH}/triton/hip" COMPONENT samples)
   endif()
 

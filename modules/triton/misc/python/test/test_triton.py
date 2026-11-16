@@ -45,14 +45,6 @@ def _is_reference_build(info=None, version=None, optimized=None):
 
 
 class _TritonBase(NewOpenCVTests):
-    @staticmethod
-    def _upload(host):
-        return cv.cuda_GpuMat(host)
-
-    @staticmethod
-    def _stream():
-        return cv.cuda_Stream()
-
     def setUp(self):
         super(_TritonBase, self).setUp()
         if not cv.cuda.getCudaEnabledDeviceCount():
@@ -101,7 +93,7 @@ class triton_binding_test(_TritonBase):
             for img in (rng.randint(0, 256, shape).astype(np.uint8),
                         (rng.rand(*shape) * 4 - 2).astype(np.float32)):
                 for dsize in ((40, 30), (120, 90)):
-                    got = cv.triton.resize(self._upload(img), dsize,
+                    got = cv.triton.resize(cv.cuda_GpuMat(img), dsize,
                                            interpolation=cv.INTER_LINEAR).download()
                     expect = ((dsize[1], dsize[0]) if channels == 1
                               else (dsize[1], dsize[0], channels))
@@ -112,7 +104,7 @@ class triton_binding_test(_TritonBase):
         u8 = np.zeros((32, 32, 3), np.uint8)
         for interp in (cv.INTER_LANCZOS4,):
             with self.assertRaises(cv.error):
-                cv.triton.resize(self._upload(u8), (16, 16), interpolation=interp)
+                cv.triton.resize(cv.cuda_GpuMat(u8), (16, 16), interpolation=interp)
 
 
 class triton_numeric_test(_TritonBase):
@@ -125,7 +117,7 @@ class triton_numeric_test(_TritonBase):
                           "the C++ suite compares against the portable oracle instead")
 
     def _check(self, np_mat, dsize, interp):
-        src = self._upload(np_mat)
+        src = cv.cuda_GpuMat(np_mat)
         got = cv.triton.resize(src, dsize, interpolation=interp).download()
         ref = cv.resize(np_mat, dsize, interpolation=interp)
         self.assertEqual(got.shape, ref.shape)
@@ -350,7 +342,7 @@ class triton_cvtcolor_test(_TritonBase):
                 with self.subTest(code=code, dtype=dtype, size=(h, w)):
                     source_h = h * 3 // 2 if code in {c[0] for c in _CVT_420} else h
                     img = _cvt_input(rng, dtype, source_h, w, scn)
-                    got = cv.triton.cvtColor(self._upload(img), code).download()
+                    got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
                     ref = cv.cvtColor(img, code)
                     self.assertEqual((h, w, dcn) if dcn > 1 else (h, w), got.shape)
                     self.assertEqual(got.dtype, dtype)
@@ -370,7 +362,7 @@ class triton_cvtcolor_test(_TritonBase):
             for code, scn, dcn in _CVT_BAYER:
                 for h, w in ((1, 1), (1, 7), (7, 1)):
                     img = _cvt_input(rng, dtype, h, w, scn)
-                    got = cv.triton.cvtColor(self._upload(img), code).download()
+                    got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
                     np.testing.assert_array_equal(got, cv.cvtColor(img, code))
                     self.assertEqual((h, w, dcn) if dcn > 1 else (h, w), got.shape)
 
@@ -392,8 +384,8 @@ class triton_cvtcolor_test(_TritonBase):
                     shape = (3, w) if scn == 1 else (3, w, scn)
                     img = rng.uniform(-2.0, 2.0, shape).astype(np.float32)
                     img[:, ::3] *= np.float32(32767.5)
-                    stream = self._stream()
-                    src_gpu = self._upload(img)
+                    stream = cv.cuda_Stream()
+                    src_gpu = cv.cuda_GpuMat(img)
                     got_gpu = cv.triton.cvtColor(src_gpu, code, stream=stream)
                     stream.waitForCompletion()
                     got = got_gpu.download()
@@ -419,7 +411,7 @@ class triton_cvtcolor_test(_TritonBase):
                         rng = np.random.RandomState(1921 + width)
                         img = rng.uniform(-2, 2, (5,width,scn)).astype(np.float32)
                         img[:, 1::3] *= np.float32(65535)
-                        got = cv.triton.cvtColor(self._upload(img), code).download()
+                        got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
                         ref = cv.cvtColor(img, code)
                         error = np.abs(got.astype(np.float64) - ref)
                         self.assertTrue(np.isfinite(error).all())
@@ -433,14 +425,14 @@ class triton_cvtcolor_test(_TritonBase):
                      cv.COLOR_YUV2BGR_YUY2, cv.COLOR_YUV2RGB_YUY2,
                      cv.COLOR_YUV2BGR_YVYU, cv.COLOR_YUV2RGB_YVYU):
             with self.assertRaises(cv.error):
-                cv.triton.cvtColor(self._upload(np.zeros((1, 3, 2), np.uint8)), code)
+                cv.triton.cvtColor(cv.cuda_GpuMat(np.zeros((1, 3, 2), np.uint8)), code)
         for code, _, _ in _CVT_420:
             for shape in ((24, 31), (23, 32)):
                 with self.assertRaises(cv.error):
-                    cv.triton.cvtColor(self._upload(np.zeros(shape, np.uint8)), code)
+                    cv.triton.cvtColor(cv.cuda_GpuMat(np.zeros(shape, np.uint8)), code)
         img = np.arange(6, dtype=np.uint8).reshape(1, 3, 2)
         for code, _, _ in _CVT_422_GRAY:
-            got = cv.triton.cvtColor(self._upload(img), code).download()
+            got = cv.triton.cvtColor(cv.cuda_GpuMat(img), code).download()
             np.testing.assert_array_equal(got, cv.cvtColor(img, code))
 
     def test_rejected_codes_raise(self):
@@ -448,18 +440,18 @@ class triton_cvtcolor_test(_TritonBase):
         # The float32 conversions: refused by name rather than served under a tolerance.
         for code in (cv.COLOR_HSV2BGR, cv.COLOR_BGR2HLS):
             with self.assertRaises(cv.error):
-                cv.triton.cvtColor(self._upload(img), code)
+                cv.triton.cvtColor(cv.cuda_GpuMat(img), code)
         # CV_32F is served only for supported conversion families: the bit-copy codes and
         # the three arithmetic families (colour->gray, YCrCb, YUV). Everything else at 32F is
         # refused. Supported arithmetic uses the documented per-pixel floating-point bound.
         f32 = np.random.RandomState(5).uniform(0.0, 1.0, (32, 32, 3)).astype(np.float32)
         for code in (cv.COLOR_BGR2XYZ, cv.COLOR_BGR2HSV, cv.COLOR_BGR2Lab):
             with self.assertRaises(cv.error):
-                cv.triton.cvtColor(self._upload(f32), code)
+                cv.triton.cvtColor(cv.cuda_GpuMat(f32), code)
         # ...and the arithmetic ones really are served, within the documented bound rather than
         # exactly: the CPU has several 32F answers (fused body W>=16, fused tail W<16, unfused
         # build), so equality is not the criterion here.
-        got = cv.triton.cvtColor(self._upload(f32), cv.COLOR_BGR2GRAY).download()
+        got = cv.triton.cvtColor(cv.cuda_GpuMat(f32), cv.COLOR_BGR2GRAY).download()
         want = cv.cvtColor(f32, cv.COLOR_BGR2GRAY)
         self.assertEqual(got.dtype, np.float32)
         k = 8.0 * 2.0 ** -24
@@ -474,10 +466,10 @@ class triton_cvtcolor_test(_TritonBase):
             with self.assertRaises(cv.error):
                 cv.cvtColor(f32_extract, code)
             with self.assertRaises(cv.error):
-                cv.triton.cvtColor(self._upload(f32_extract), code)
+                cv.triton.cvtColor(cv.cuda_GpuMat(f32_extract), code)
         # A source whose channel count does not match the code.
         with self.assertRaises(cv.error):
-            cv.triton.cvtColor(self._upload(np.zeros((32, 32), np.uint8)),
+            cv.triton.cvtColor(cv.cuda_GpuMat(np.zeros((32, 32), np.uint8)),
                                cv.COLOR_BGR2GRAY)
 
 
@@ -536,7 +528,7 @@ class triton_warpaffine_binding_test(_TritonBase):
                         rng.randint(0, 65536, shape).astype(np.uint16),
                         (rng.rand(*shape) * 4 - 2).astype(np.float32)):
                 for dsize in ((53, 37), (80, 60)):
-                    got = cv.triton.warpAffine(self._upload(img), M, dsize).download()
+                    got = cv.triton.warpAffine(cv.cuda_GpuMat(img), M, dsize).download()
                     expect = ((dsize[1], dsize[0]) if channels == 1
                               else (dsize[1], dsize[0], channels))
                     self.assertEqual(got.shape, expect)
@@ -547,7 +539,7 @@ class triton_warpaffine_binding_test(_TritonBase):
         # the same result. A binding that forwarded the Mat blindly would handle one of them.
         rng = np.random.RandomState(1)
         img = rng.randint(0, 256, (37, 53, 3)).astype(np.uint8)
-        g = self._upload(img)
+        g = cv.cuda_GpuMat(img)
         ref = None
         for dt in (np.float32, np.float64):
             M = np.array(_WA_GEOMS[2][1], dt)
@@ -564,7 +556,7 @@ class triton_warpaffine_binding_test(_TritonBase):
         img = np.zeros((9, 7, 3), np.uint8)
         M = np.array([[1.0, 0.0, -1000.0], [0.0, 1.0, -1000.0]])    # everything outside
         for bv, want in (((10, 20, 30), (10, 20, 30)), (77, (77, 0, 0))):
-            got = cv.triton.warpAffine(self._upload(img), M, (7, 9),
+            got = cv.triton.warpAffine(cv.cuda_GpuMat(img), M, (7, 9),
                                        borderMode=cv.BORDER_CONSTANT, borderValue=bv).download()
             self.assertEqual(tuple(int(v) for v in got[0, 0]), want)
 
@@ -572,7 +564,7 @@ class triton_warpaffine_binding_test(_TritonBase):
         img = np.zeros((9, 7), np.float32)
         M = np.array([[1.0, 0.0, -1000.0], [0.0, 1.0, -1000.0]])
         for bv in (0.5, -1.75, 3.25):
-            got = cv.triton.warpAffine(self._upload(img), M, (7, 9),
+            got = cv.triton.warpAffine(cv.cuda_GpuMat(img), M, (7, 9),
                                        borderMode=cv.BORDER_CONSTANT,
                                        borderValue=bv).download()
             self.assertAlmostEqual(float(got[0, 0]), bv, places=6)
@@ -581,10 +573,10 @@ class triton_warpaffine_binding_test(_TritonBase):
         rng = np.random.RandomState(2)
         img = rng.randint(0, 256, (37, 53, 3)).astype(np.uint8)
         M = np.array(_WA_GEOMS[2][1], np.float64)
-        dst = self._upload(np.zeros_like(img))
-        cv.triton.warpAffine(self._upload(img), M, (53, 37), dst=dst)
+        dst = cv.cuda_GpuMat((37, 53), cv.CV_8UC3)
+        cv.triton.warpAffine(cv.cuda_GpuMat(img), M, (53, 37), dst=dst)
         first = dst.download()
-        cv.triton.warpAffine(self._upload(img), M, (53, 37), dst=dst)
+        cv.triton.warpAffine(cv.cuda_GpuMat(img), M, (53, 37), dst=dst)
         self.assertEqual(int(np.abs(first.astype(np.int16) -
                                     dst.download().astype(np.int16)).max()), 0)
 
@@ -596,7 +588,7 @@ class triton_warpaffine_binding_test(_TritonBase):
                 shape = (19, 27) if cn == 1 else (19, 27, cn)
                 img = (rng.uniform(-2, 2, shape).astype(dtype) if dtype == np.float32
                        else _cvt_input(rng, dtype, 19, 27, cn))
-                gpu = self._upload(img)
+                gpu = cv.cuda_GpuMat(img)
                 for direction in (0, cv.WARP_INVERSE_MAP):
                     area = cv.triton.warpAffine(gpu, matrix, (27, 19),
                                                flags=cv.INTER_AREA | direction,
@@ -613,9 +605,9 @@ class triton_warpaffine_binding_test(_TritonBase):
                 shape = (7, 9) if cn == 1 else (7, 9, cn)
                 img = np.zeros(shape, dtype)
                 initial = np.full(shape, 17, dtype)
-                dst = self._upload(initial)
+                dst = cv.cuda_GpuMat(initial)
                 with self.assertRaises(cv.error):
-                    cv.triton.warpAffine(self._upload(img), matrix, (9, 7), dst=dst,
+                    cv.triton.warpAffine(cv.cuda_GpuMat(img), matrix, (9, 7), dst=dst,
                                          flags=cv.INTER_CUBIC, borderMode=cv.BORDER_TRANSPARENT)
                 np.testing.assert_array_equal(dst.download(), initial)
 
@@ -624,30 +616,30 @@ class triton_warpaffine_binding_test(_TritonBase):
         M = np.eye(3, dtype=np.float64)[:2]
         # AREA follows the CPU rewrite to LINEAR; LANCZOS4 is unsupported.
         with self.assertRaises(cv.error):
-            cv.triton.warpAffine(self._upload(u8), M, (32, 32), flags=cv.INTER_LANCZOS4)
+            cv.triton.warpAffine(cv.cuda_GpuMat(u8), M, (32, 32), flags=cv.INTER_LANCZOS4)
         # AREA is served AND equals LINEAR, checked rather than merely not raising.
-        area = cv.triton.warpAffine(self._upload(u8), M, (32, 32),
+        area = cv.triton.warpAffine(cv.cuda_GpuMat(u8), M, (32, 32),
                                     flags=cv.INTER_AREA).download()
-        lin = cv.triton.warpAffine(self._upload(u8), M, (32, 32),
+        lin = cv.triton.warpAffine(cv.cuda_GpuMat(u8), M, (32, 32),
                                    flags=cv.INTER_LINEAR).download()
         self.assertEqual(int(np.abs(area.astype(np.int16) - lin.astype(np.int16)).max()), 0)
         # CV_16U is served; CV_16S is not.
-        got = cv.triton.warpAffine(self._upload(np.zeros((32, 32, 3), np.uint16)),
+        got = cv.triton.warpAffine(cv.cuda_GpuMat(np.zeros((32, 32, 3), np.uint16)),
                                    M, (32, 32)).download()
         self.assertEqual(got.dtype, np.uint16)
         with self.assertRaises(cv.error):
-            cv.triton.warpAffine(self._upload(np.zeros((32, 32, 3), np.int16)), M, (32, 32))
+            cv.triton.warpAffine(cv.cuda_GpuMat(np.zeros((32, 32, 3), np.int16)), M, (32, 32))
         with self.assertRaises(cv.error):
-            cv.triton.warpAffine(self._upload(np.zeros((32, 32, 2), np.uint8)), M, (32, 32))
+            cv.triton.warpAffine(cv.cuda_GpuMat(np.zeros((32, 32, 2), np.uint8)), M, (32, 32))
         with self.assertRaises(cv.error):
-            cv.triton.warpAffine(self._upload(u8), np.zeros((3, 3), np.float64), (32, 32))
+            cv.triton.warpAffine(cv.cuda_GpuMat(u8), np.zeros((3, 3), np.float64), (32, 32))
 
 
 class triton_warpaffine_numeric_test(_TritonBase):
     """Compare with the linked CPU paths selected by warpAffine."""
 
     def _check(self, img, M, dsize, flags, border, bv=0):
-        g = self._upload(img)
+        g = cv.cuda_GpuMat(img)
         got = cv.triton.warpAffine(g, M, dsize, flags=flags, borderMode=border,
                                    borderValue=bv).download()
         ref = _wa_cpu_reference(img, M, dsize, flags, border, bv)
@@ -691,8 +683,8 @@ class triton_warpaffine_numeric_test(_TritonBase):
                     for direction in (0, cv.WARP_INVERSE_MAP):
                         for interpolation in (cv.INTER_NEAREST, cv.INTER_LINEAR, cv.INTER_AREA):
                             flags = interpolation | direction
-                            dst = self._upload(initial)
-                            got = cv.triton.warpAffine(self._upload(img), matrix, (27, 19),
+                            dst = cv.cuda_GpuMat(initial)
+                            got = cv.triton.warpAffine(cv.cuda_GpuMat(img), matrix, (27, 19),
                                                        dst=dst, flags=flags,
                                                        borderMode=cv.BORDER_TRANSPARENT).download()
                             ref = _wa_cpu_reference(img, matrix, (27, 19), flags,

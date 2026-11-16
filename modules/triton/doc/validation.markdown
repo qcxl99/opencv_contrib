@@ -75,9 +75,8 @@ and tests; select compatible Python development headers/library and NumPy.
 Both builds must compile the module, `opencv_test_triton`, `opencv_perf_triton`,
 examples and `opencv_python3` when those options are enabled. HIP additionally
 builds `opencv_test_triton_hip`. CUDA uses three GpuMat examples; HIP uses
-`example_triton_device` in its three modes and `samples/hip/device.py`. Build all
-configured libraries before installation, not just a sample that happens to link
-against an older library.
+`example_triton_device` in its three modes. Build all configured libraries before
+installation, not just a sample that happens to link against an older library.
 
 In a new result directory, use native discovery/filter/XML instead of hardcoded
 historical counts. For example, with `BUILD_ENABLED` and `RESULTS` set explicitly:
@@ -91,11 +90,9 @@ mkdir -p "$RESULTS"
 
 Run perf with the task's selected scope and OpenCV options from a fresh result
 working directory. Perf smoke/execution is not performance qualification.
-CUDA Python tests exercise the three GpuMat wrappers. HIP Python tests exercise
-HipImage upload/download, the three operators, output reuse, shared ROIs,
-stream dependencies and validation errors in
-`misc/python/test/test_triton_hip.py`. Run the Python tests with OpenCV's
-`modules/python/test` helpers on `PYTHONPATH`. Separate positive, refusal,
+CUDA Python tests exercise the three real GpuMat wrappers. HIP Python tests
+exercise backend queries and the explicitly unsupported GpuMat operations;
+no HIP Python device-buffer wrapper is advertised. Separate positive, refusal,
 platform skip, missing data and zero-test results.
 
 Install and hardware evidence
