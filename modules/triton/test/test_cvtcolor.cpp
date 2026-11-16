@@ -156,7 +156,7 @@ TEST(Triton_CvtColor, MatchesCpu420)
             Mat got;
             dst.download(got);
             // The size really did change: this is the property that distinguishes the family, and
-            // asserting it here is what would catch a regression to "dst created at src.size()".
+            // The destination must use the decoded dimensions rather than src.size().
             ASSERT_EQ(got.size(), sz) << "4:2:0 decode must produce H x W, not the source shape";
             ASSERT_EQ(got.channels(), c.dcn);
             EXPECT_EQ(0.0, cvtest::norm(got, cpuCvt(host, c.code), NORM_INF));

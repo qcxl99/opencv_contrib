@@ -9,6 +9,7 @@
 #include "compile_protocol.hpp"
 #include "cvtcolor.hpp"
 #include "resize_plan.hpp"
+#include "lifetime.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -163,22 +164,71 @@ Status error(Reason r, const std::string& msg)
 
 struct CtxGuard
 {
-    bool pushed = false;
+    bool pushed = false, valid = false;
     explicit CtxGuard(CUcontext c)
     {
         CUcontext cur = nullptr;
-        cuCtxGetCurrent(&cur);
-        if (c && cur != c) pushed = cuCtxPushCurrent(c) == CUDA_SUCCESS;
+        if (cuCtxGetCurrent(&cur) != CUDA_SUCCESS) return;
+        if (c && cur == c) valid = true;
+        else if (c) valid = pushed = cuCtxPushCurrent(c) == CUDA_SUCCESS;
     }
     ~CtxGuard() { if (pushed) { CUcontext p; cuCtxPopCurrent(&p); } }
 };
 
-// Is `c` still the context it was (`gen`, its cuCtxGetId)? A destroyed context took its modules,
-// memory and events with it, and its handle value may have come back as another context.
-bool contextAlive(CUcontext c, std::uint64_t gen)
+ContextLife contextLife(CUcontext c, std::uint64_t gen)
 {
+    if (!c) return ContextLife::Gone;
     unsigned long long id = 0;
-    return c && cuCtxGetId(c, &id) == CUDA_SUCCESS && id == gen;
+    const CUresult result = cuCtxGetId(c, &id);
+    if (result == CUDA_SUCCESS) return id == gen ? ContextLife::Alive : ContextLife::Gone;
+    if (result == CUDA_ERROR_INVALID_CONTEXT || result == CUDA_ERROR_CONTEXT_IS_DESTROYED ||
+        result == CUDA_ERROR_DEINITIALIZED) return ContextLife::Gone;
+    return ContextLife::Unknown;
+}
+
+PrimaryOwners<CUcontext>& primaryOwners()
+{
+    static auto* owners = new PrimaryOwners<CUcontext>();
+    return *owners;
+}
+
+CUresult primaryContext(int device, CUcontext& context)
+{
+    return static_cast<CUresult>(primaryOwners().get(device, context,
+        [](CUcontext& out, int ordinal) {
+            CUdevice dev;
+            CUresult result = cuDeviceGet(&dev, ordinal);
+            if (result == CUDA_SUCCESS) result = cuDevicePrimaryCtxRetain(&out, dev);
+            return static_cast<int>(result);
+        }));
+}
+
+struct CleanupDiagnostics
+{
+    std::atomic<long long> errors{0};
+    std::mutex mutex;
+    std::string last;
+};
+CleanupDiagnostics& cleanupDiagnostics()
+{
+    static auto* diagnostics = new CleanupDiagnostics();
+    return *diagnostics;
+}
+void cleanupError(const std::string& message)
+{
+    auto& d = cleanupDiagnostics();
+    ++d.errors;
+    std::lock_guard<std::mutex> lock(d.mutex);
+    d.last = message;
+    std::fprintf(stderr, "OpenCV Triton resource retained: %s\n", message.c_str());
+}
+Completion eventCompletion(CUevent event)
+{
+    const CUresult result = cuEventQuery(event);
+    if (result == CUDA_SUCCESS) return Completion::Complete;
+    if (result == CUDA_ERROR_NOT_READY) return Completion::NotReady;
+    cleanupError("cuEventQuery: " + cuErr(result));
+    return Completion::Error;
 }
 
 bool driverReady()
@@ -199,10 +249,30 @@ struct ModuleRes
     CUfunction fn = nullptr;
     Manifest man;
     std::string dir;
-    ~ModuleRes()
+    bool cleanup_failed = false;
+    bool had_error = false;
+    bool failed() const { return had_error; }
+    void noteError(const std::string& message)
     {
-        if (mod && contextAlive(ctx, gen)) { CtxGuard g(ctx); cuModuleUnload(mod); }
+        if (!had_error) cleanupError(message);
+        had_error = true;
+    }
+    bool release()
+    {
+        const ContextLife life = contextLife(ctx, gen);
+        if (life == ContextLife::Gone) { ++g_module_frees; return true; }
+        if (life == ContextLife::Unknown) { noteError("module context completion unknown"); return false; }
+        if (cleanup_failed) return false;
+        CtxGuard guard(ctx);
+        if (!guard.valid) { noteError("cannot enter module context"); return false; }
+        if (mod)
+        {
+            const CUresult result = cuModuleUnload(mod);
+            if (result != CUDA_SUCCESS) { cleanup_failed = true; noteError("cuModuleUnload outcome unknown; held until context destruction: " + cuErr(result)); return false; }
+            mod = nullptr;
+        }
         ++g_module_frees;
+        return true;
     }
 };
 
@@ -218,31 +288,90 @@ struct TableRes
     CUstream upload_stream = nullptr;
     std::map<std::string, std::size_t> offset;
     int xmax = 0, kx = 0, ky = 0;
-    ~TableRes()
+    bool upload_started = false, upload_recorded = false, cleanup_failed = false;
+    bool had_error = false;
+    bool failed() const { return had_error; }
+    void noteError(const std::string& message)
     {
-        if (contextAlive(ctx, gen))
-        {
-            CtxGuard g(ctx);
-            // Normally every launch that read these tables has completed. Only a table whose
-            // launch failed can still have its upload pending: keep allocate -> upload -> free
-            // in order rather than free under it.
-            if (uploaded && cuEventQuery(uploaded) == CUDA_ERROR_NOT_READY)
-                cuStreamWaitEvent(nullptr, uploaded, 0);
-            if (uploaded) cuEventDestroy(uploaded);
-            // cuMemFree blocks until the context's in-flight work drains (measured), which would
-            // stall the application's thread on every eviction; the stream-ordered free does not.
-            if (base) { if (stream_ordered) cuMemFreeAsync(base, nullptr); else cuMemFree(base); }
-        }
+        if (!had_error) cleanupError(message);
+        had_error = true;
+    }
+    bool release()
+    {
+        const ContextLife life = contextLife(ctx, gen);
+        if (life == ContextLife::Gone) { ++g_table_frees; return true; }
+        if (life == ContextLife::Unknown) { noteError("table context completion unknown"); return false; }
+        if (cleanup_failed) return false;
+        CtxGuard guard(ctx);
+        if (!guard.valid) { noteError("cannot enter table context"); return false; }
+        if (upload_started && (!uploaded || !upload_recorded))
+            noteError("upload has no valid completion marker; retained until context destruction");
+        const bool released = releaseUpload(false, life,
+            upload_started, uploaded && upload_recorded,
+            [&]() {
+                const Completion done = eventCompletion(uploaded);
+                if (done == Completion::Error) had_error = true;
+                return done;
+            },
+            [&]() {
+                const CUresult result = cuStreamWaitEvent(nullptr, uploaded, 0);
+                if (result != CUDA_SUCCESS) noteError("cuStreamWaitEvent during retirement: " + cuErr(result));
+            },
+            [&]() {
+                if (!base) return true;
+                const CUresult result = stream_ordered ? cuMemFreeAsync(base, nullptr) : cuMemFree(base);
+                if (result != CUDA_SUCCESS) { cleanup_failed = true; noteError("table free outcome unknown; held until context destruction: " + cuErr(result)); return false; }
+                base = 0;
+                return true;
+            },
+            [&]() {
+                if (!uploaded) return true;
+                const CUresult result = cuEventDestroy(uploaded);
+                if (result != CUDA_SUCCESS) { cleanup_failed = true; noteError("cuEventDestroy outcome unknown; held until context destruction: " + cuErr(result)); return false; }
+                uploaded = nullptr;
+                return true;
+            });
+        if (!released) return false;
         ++g_table_frees;
+        return true;
     }
     CUdeviceptr at(const char* k) const { return base + offset.at(k); }
 };
+
+thread_local bool recordingCapture = false;
+struct CaptureScope
+{
+    bool previous;
+    explicit CaptureScope(bool capture) : previous(recordingCapture) { recordingCapture = capture; }
+    ~CaptureScope() { recordingCapture = previous; }
+};
+
+template<class T>
+Retirement<T>& retired()
+{
+    static auto* queue = new Retirement<T>();
+    return *queue;
+}
+template<class T>
+std::shared_ptr<T> resource()
+{
+    return std::shared_ptr<T>(new T(), [](T* value) {
+        if (recordingCapture) retired<T>().hold(value);
+        else retired<T>().dispose(value);
+    });
+}
+void retryRetired(bool skip)
+{
+    retired<TableRes>().retry(skip);
+    retired<ModuleRes>().retry(skip);
+}
 
 struct Pending
 {
     CUcontext ctx;
     std::uint64_t gen;
     CUevent done;
+    bool query_error_reported = false;
     std::vector<std::shared_ptr<void>> keep;   // what this launch reads: freed only after `done`
 };
 
@@ -293,6 +422,7 @@ struct State
     Lru<ModuleRes> modules{64};
     Lru<TableRes> tables{256};
     std::list<Pending> pending;
+    std::list<Pending> failed_events; // completion proven; never retry an uncertain destroy
     std::vector<CapturePin> capture_pins;   // held until releaseCapturePins(), see there
     detail::RuntimeStats st;
     std::map<std::string, std::shared_ptr<std::mutex>> compile_mu;
@@ -395,10 +525,15 @@ Status finishLaunch(State& s, CUcontext ctx, std::uint64_t gen, CUstream stream,
     {
         // Cannot observe completion: keep the resources for the life of the process rather than
         // risk freeing what the launch may still read.
-        static std::vector<std::shared_ptr<void>> leaked;
-        leaked.push_back(mod);
-        if (tab) leaked.push_back(tab);
-        if (tab2) leaked.push_back(tab2);
+        if (done) cuEventDestroy(done);
+        Pending hold;
+        hold.ctx = ctx; hold.gen = gen; hold.done = nullptr;
+        hold.keep.push_back(mod);
+        if (tab) hold.keep.push_back(tab);
+        if (tab2) hold.keep.push_back(tab2);
+        s.pending.push_back(std::move(hold));
+        s.st.pending = static_cast<long long>(s.pending.size());
+        cleanupError("completion marker failed; resources held until context destruction: " + cuErr(r));
         Status e = error(Reason::LaunchFailed, "completion event: " + cuErr(r));
         e.submitted = true;
         return e;
@@ -422,33 +557,69 @@ Status finishLaunch(State& s, CUcontext ctx, std::uint64_t gen, CUstream stream,
 // `skipQuery` is set when the caller is capturing: reaping is a bookkeeping optimisation, and
 // doing it must never be allowed to break a capture. Pending entries simply stay pending until
 // a later, non-capturing call.
-void reapLocked(State& s, std::vector<std::shared_ptr<void>>& released, bool skipQuery = false)
+Status reapLocked(State& s, std::vector<std::shared_ptr<void>>& released, bool skipQuery = false)
 {
+    Status result; result.code = Code::Prepared;
+    if (skipQuery) return result; // No query of any event/context while capturing.
+    for (auto event = s.failed_events.begin(); event != s.failed_events.end();)
+    {
+        if (contextLife(event->ctx, event->gen) == ContextLife::Gone)
+            event = s.failed_events.erase(event); // context owns the native event; no stale API call
+        else ++event;
+    }
     for (auto it = s.pending.begin(); it != s.pending.end();)
     {
-        if (contextAlive(it->ctx, it->gen))
+        const ContextLife life = contextLife(it->ctx, it->gen);
+        const Reclaim decision = completionDecision(false, life, [&]() {
+            if (!it->done) return Completion::Error;
+            CtxGuard guard(it->ctx);
+            return guard.valid ? eventCompletion(it->done) : Completion::Error;
+        });
+        if (decision != Reclaim::Release)
         {
-            CtxGuard g(it->ctx);
-            if (skipQuery || cuEventQuery(it->done) == CUDA_ERROR_NOT_READY) { ++it; continue; }
-            cuEventDestroy(it->done);
+            if (decision == Reclaim::Error)
+            {
+                result = error(Reason::LaunchFailed, "completion unknown; pending resources retained (retry reapCompleted)");
+                if (!it->query_error_reported) { cleanupError(result.message); it->query_error_reported = true; }
+            }
+            ++it;
+            continue;
+        }
+        if (life == ContextLife::Alive && it->done)
+        {
+            CtxGuard guard(it->ctx);
+            if (!guard.valid) { result = error(Reason::ContextMismatch, "cannot enter completed event context"); ++it; continue; }
+            const CUresult destroyed = cuEventDestroy(it->done);
+            if (destroyed != CUDA_SUCCESS)
+            {
+                Pending failed;
+                failed.ctx = it->ctx; failed.gen = it->gen; failed.done = it->done;
+                s.failed_events.push_back(std::move(failed));
+                result = error(Reason::LaunchFailed, "completed event destruction failed; handle retained without retry: " + cuErr(destroyed));
+                cleanupError(result.message);
+                // GPU completion is proven: module/table leases can be released safely.
+                // Only the uncertain native event handle stays until context destruction.
+            }
         }
         released.insert(released.end(), it->keep.begin(), it->keep.end());
-        it = s.pending.erase(it);             // complete, or its context is gone: release
+        it = s.pending.erase(it);
     }
     s.st.pending = static_cast<long long>(s.pending.size());
+    return result;
 }
 
 Status currentContext(int device, CUcontext& ctx, std::uint64_t& gen)
 {
     if (!driverReady()) return error(Reason::ToolchainUnavailable, "cuInit failed");
     ctx = nullptr;
-    cuCtxGetCurrent(&ctx);
+    CUresult current = cuCtxGetCurrent(&ctx);
+    if (current != CUDA_SUCCESS) return error(Reason::ContextMismatch, "cuCtxGetCurrent: " + cuErr(current));
     if (!ctx)
     {
-        CUdevice d;
-        CUresult r = cuDeviceGet(&d, device);
-        if (r == CUDA_SUCCESS) r = cuDevicePrimaryCtxRetain(&ctx, d);
+        CUresult r = primaryContext(device, ctx);
         if (r == CUDA_SUCCESS) r = cuCtxSetCurrent(ctx);
+        // The registry owns the single process-lifetime retain, including when SetCurrent
+        // fails. Repeated/short-lived threads borrow it, never retain a thread-local copy.
         if (r != CUDA_SUCCESS) return error(Reason::ContextMismatch, "no context for device " + std::to_string(device) + ": " + cuErr(r));
     }
     CUdevice cd;
@@ -506,7 +677,7 @@ std::shared_ptr<ModuleRes> moduleFor(const KernelKey& key, CUcontext ctx, std::u
         st = error(Reason::ManifestInvalid, "binary changed after verification");
         return nullptr;
     }
-    auto m = std::make_shared<ModuleRes>();
+    auto m = resource<ModuleRes>();
     m->ctx = ctx;
     m->gen = gen;
     m->man = man;
@@ -615,11 +786,12 @@ std::shared_ptr<TableRes> tablesFor(const Normalized& n, CUcontext ctx, std::uin
         }
         poison = s.poison;
     }
-    auto t = std::make_shared<TableRes>();
+    auto t = resource<TableRes>();
     t->ctx = ctx;
     t->gen = gen;
     buildTables(n, *t);
     t->bytes = t->host.size();
+    t->upload_stream = stream;
     CUdevice dev;
     int pools = 0;
     if (cuCtxGetDevice(&dev) == CUDA_SUCCESS)
@@ -627,9 +799,9 @@ std::shared_ptr<TableRes> tablesFor(const Normalized& n, CUcontext ctx, std::uin
     t->stream_ordered = pools != 0;
     CUresult r = t->stream_ordered ? cuMemAllocAsync(&t->base, t->bytes, stream) : cuMemAlloc(&t->base, t->bytes);
     if (r == CUDA_SUCCESS && poison) r = cuMemsetD8Async(t->base, 0xFF, t->bytes, stream);
-    if (r == CUDA_SUCCESS) r = cuMemcpyHtoDAsync(t->base, t->host.data(), t->bytes, stream);
+    if (r == CUDA_SUCCESS) { t->upload_started = true; r = cuMemcpyHtoDAsync(t->base, t->host.data(), t->bytes, stream); }
     if (r == CUDA_SUCCESS) r = cuEventCreate(&t->uploaded, CU_EVENT_DISABLE_TIMING);
-    if (r == CUDA_SUCCESS) r = cuEventRecord(t->uploaded, stream);
+    if (r == CUDA_SUCCESS) { r = cuEventRecord(t->uploaded, stream); t->upload_recorded = r == CUDA_SUCCESS; }
     if (r != CUDA_SUCCESS) { st = error(Reason::DeviceAlloc, "table upload: " + cuErr(r)); return nullptr; }
     t->upload_stream = stream;
     std::vector<std::shared_ptr<TableRes>> ev;
@@ -701,7 +873,7 @@ std::shared_ptr<TableRes> cvtTablesFor(const cv_triton_color::HsvTables& hv, int
         }
         poison = s.poison;
     }
-    auto t = std::make_shared<TableRes>();
+    auto t = resource<TableRes>();
     t->ctx = ctx;
     t->gen = gen;
     pack(t->host, t->offset, "sdiv", hv.sdiv.data(), hv.sdiv.size() * sizeof(int));
@@ -715,6 +887,7 @@ std::shared_ptr<TableRes> cvtTablesFor(const cv_triton_color::HsvTables& hv, int
     pack(t->host, t->offset, "t16", &dummy, sizeof(int));
     pack(t->host, t->offset, "t64", &dummy, sizeof(int));
     t->bytes = t->host.size();
+    t->upload_stream = stream;
     CUdevice dev;
     int pools = 0;
     if (cuCtxGetDevice(&dev) == CUDA_SUCCESS)
@@ -722,9 +895,9 @@ std::shared_ptr<TableRes> cvtTablesFor(const cv_triton_color::HsvTables& hv, int
     t->stream_ordered = pools != 0;
     CUresult r = t->stream_ordered ? cuMemAllocAsync(&t->base, t->bytes, stream) : cuMemAlloc(&t->base, t->bytes);
     if (r == CUDA_SUCCESS && poison) r = cuMemsetD8Async(t->base, 0xFF, t->bytes, stream);
-    if (r == CUDA_SUCCESS) r = cuMemcpyHtoDAsync(t->base, t->host.data(), t->bytes, stream);
+    if (r == CUDA_SUCCESS) { t->upload_started = true; r = cuMemcpyHtoDAsync(t->base, t->host.data(), t->bytes, stream); }
     if (r == CUDA_SUCCESS) r = cuEventCreate(&t->uploaded, CU_EVENT_DISABLE_TIMING);
-    if (r == CUDA_SUCCESS) r = cuEventRecord(t->uploaded, stream);
+    if (r == CUDA_SUCCESS) { r = cuEventRecord(t->uploaded, stream); t->upload_recorded = r == CUDA_SUCCESS; }
     if (r != CUDA_SUCCESS) { st = error(Reason::DeviceAlloc, "cvtColor table upload: " + cuErr(r)); return nullptr; }
     t->upload_stream = stream;
     std::vector<std::shared_ptr<TableRes>> ev;
@@ -783,7 +956,7 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, CUcontext ctx, std::uint64_t
     }
 
     const cv_triton_color::LabLuvTables& tab = cv_triton_color::labluv_tables();
-    auto t = std::make_shared<TableRes>();
+    auto t = resource<TableRes>();
     t->ctx = ctx;
     t->gen = gen;
     // t32: fixed-layout concat, in the order the kernel's offsets name. `pack` aligns each blob
@@ -814,6 +987,7 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, CUcontext ctx, std::uint64_t
         pack(t->host, t->offset, "t16", &one, sizeof(short));
     }
     t->bytes = t->host.size();
+    t->upload_stream = stream;
 
     CUdevice dev;
     int pools = 0;
@@ -822,9 +996,9 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, CUcontext ctx, std::uint64_t
     t->stream_ordered = pools != 0;
     CUresult r = t->stream_ordered ? cuMemAllocAsync(&t->base, t->bytes, stream) : cuMemAlloc(&t->base, t->bytes);
     if (r == CUDA_SUCCESS && poison) r = cuMemsetD8Async(t->base, 0xFF, t->bytes, stream);
-    if (r == CUDA_SUCCESS) r = cuMemcpyHtoDAsync(t->base, t->host.data(), t->bytes, stream);
+    if (r == CUDA_SUCCESS) { t->upload_started = true; r = cuMemcpyHtoDAsync(t->base, t->host.data(), t->bytes, stream); }
     if (r == CUDA_SUCCESS) r = cuEventCreate(&t->uploaded, CU_EVENT_DISABLE_TIMING);
-    if (r == CUDA_SUCCESS) r = cuEventRecord(t->uploaded, stream);
+    if (r == CUDA_SUCCESS) { r = cuEventRecord(t->uploaded, stream); t->upload_recorded = r == CUDA_SUCCESS; }
     if (r != CUDA_SUCCESS) { st = error(Reason::DeviceAlloc, "cvtColor Lab/Luv table upload: " + cuErr(r)); return nullptr; }
     t->upload_stream = stream;
     std::vector<std::shared_ptr<TableRes>> ev;
@@ -879,10 +1053,17 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
     const CUstream stream = reinterpret_cast<CUstream>(ex.stream);
     State& s = S();
     std::vector<std::shared_ptr<void>> released;   // destroyed at return, outside the lock
+    const bool isCapturing = capturing(stream);
+    CaptureScope captureScope(isCapturing);
+    retryRetired(isCapturing);
+    if (cleanupDiagnostics().errors.load() != 0 &&
+        (retired<TableRes>().hasFailure() || retired<ModuleRes>().hasFailure()))
+        return error(Reason::LaunchFailed, "prior cleanup failed; resources retained (retry reapCompleted or restart after persistent driver errors)");
     {
         std::lock_guard<std::mutex> lk(s.mu);
-        reapLocked(s, released, capturing(stream));
+        st = reapLocked(s, released, isCapturing);
     }
+    if (!st.ok()) return st;
     if (n.route.kind == ref::ROUTE_COPY)   // cv::resize: src.copyTo(dst). A copy, not a Triton launch.
     {
         CUDA_MEMCPY2D cp;
@@ -993,10 +1174,17 @@ Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std:
     const CUstream stream = reinterpret_cast<CUstream>(ex.stream);
     State& s = S();
     std::vector<std::shared_ptr<void>> released;
+    const bool isCapturing = capturing(stream);
+    CaptureScope captureScope(isCapturing);
+    retryRetired(isCapturing);
+    if (cleanupDiagnostics().errors.load() != 0 &&
+        (retired<TableRes>().hasFailure() || retired<ModuleRes>().hasFailure()))
+        return error(Reason::LaunchFailed, "prior cleanup failed; resources retained (retry reapCompleted or restart after persistent driver errors)");
     {
         std::lock_guard<std::mutex> lk(s.mu);
-        reapLocked(s, released, capturing(stream));
+        st = reapLocked(s, released, isCapturing);
     }
+    if (!st.ok()) return st;
 
     CUdevice dev;
     cuCtxGetDevice(&dev);
@@ -1130,10 +1318,17 @@ Status warpAffine(const cv_triton_warp::Request& req, const ExecContext& ex)
     const CUstream stream = reinterpret_cast<CUstream>(ex.stream);
     State& s = S();
     std::vector<std::shared_ptr<void>> released;
+    const bool isCapturing = capturing(stream);
+    CaptureScope captureScope(isCapturing);
+    retryRetired(isCapturing);
+    if (cleanupDiagnostics().errors.load() != 0 &&
+        (retired<TableRes>().hasFailure() || retired<ModuleRes>().hasFailure()))
+        return error(Reason::LaunchFailed, "prior cleanup failed; resources retained (retry reapCompleted or restart after persistent driver errors)");
     {
         std::lock_guard<std::mutex> lk(s.mu);
-        reapLocked(s, released, capturing(stream));
+        st = reapLocked(s, released, isCapturing);
     }
+    if (!st.ok()) return st;
 
     CUdevice dev;
     cuCtxGetDevice(&dev);
@@ -1239,6 +1434,9 @@ RuntimeStats runtimeStats()
     State& s = S();
     std::lock_guard<std::mutex> lk(s.mu);
     RuntimeStats r = s.st;
+    r.cleanup_errors = cleanupDiagnostics().errors.load();
+    r.retired_resources = static_cast<long long>(retired<TableRes>().size() + retired<ModuleRes>().size() + s.failed_events.size());
+    { std::lock_guard<std::mutex> diagnosticsLock(cleanupDiagnostics().mutex); r.last_cleanup_error = cleanupDiagnostics().last; }
     r.module_frees = g_module_frees.load();
     r.table_frees = g_table_frees.load();
     return r;
@@ -1286,8 +1484,13 @@ void reapCompleted()
 {
     State& s = S();
     std::vector<std::shared_ptr<void>> released;
-    std::lock_guard<std::mutex> lk(s.mu);
-    reapLocked(s, released);
+    retryRetired(false);
+    Status status;
+    { std::lock_guard<std::mutex> lk(s.mu); status = reapLocked(s, released); }
+    if (!status.ok()) CV_Error(Error::GpuApiCallError, status.message);
+    if (cleanupDiagnostics().errors.load() != 0 &&
+        (retired<TableRes>().hasFailure() || retired<ModuleRes>().hasFailure()))
+        CV_Error(Error::GpuApiCallError, "cleanup outcome remains unknown; resources retained until proven safe or process exit");
 }
 
 void setPoisonNewTables(bool on)

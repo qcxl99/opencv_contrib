@@ -41,6 +41,19 @@ def main():
                     ('resize_plan.cpp', 'provider.cpp', 'compile_protocol.cpp')]
         subprocess.run(command + ['-o', str(binary)], check=True)
         subprocess.run([str(binary), sys.executable, temporary], check=True)
+        lifetime = Path(temporary) / 'lifetime-check'
+        subprocess.run(shlex.split(args.cxx) + ['-std=c++17', '-O2', '-Wall', '-Wextra',
+                       '-Werror', '-pthread', '-I' + str(runtime),
+                       str(module / 'test' / 'cpu' / 'test_lifetime.cpp'), '-o', str(lifetime)], check=True)
+        subprocess.run([str(lifetime)], check=True)
+        subprocess.run([sys.executable, '-B', str(module / 'test' / 'cpu' / 'check_native_lifetime.py'),
+                        '--cxx', args.cxx], check=True)
+        graph = Path(temporary) / 'graph-request-check'
+        subprocess.run(shlex.split(args.cxx) + ['-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
+                       '-I' + str(runtime), str(module / 'test' / 'cpu' / 'test_graph_request.cpp')]
+                       + [str(runtime / name) for name in ('resize_plan.cpp', 'provider.cpp', 'compile_protocol.cpp')]
+                       + ['-o', str(graph)], check=True)
+        subprocess.run([str(graph)], check=True)
     print('PASS: source notices, Python syntax, HIP derivations and CPU protocol controls')
     print('Not checked: enabled OpenCV builds, GPU correctness/performance, installation or compiler JIT')
     return 0

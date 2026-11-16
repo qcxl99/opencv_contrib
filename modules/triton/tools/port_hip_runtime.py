@@ -65,7 +65,7 @@ sub('    return isFile(d + "/kernels/resize_cpu.py") && isFile(d + "/tools/compi
 sub('        k.kernels = r + "/kernels/resize_cpu.py";\n', '        k.kernels = r + "/kernels/resize_cpu_hip.py";\n', 1)
 sub('            k.error = "kernels/resize_cpu.py and tools/compile_helper.py not found under " + r;\n',
     '            k.error = "kernels/resize_cpu_hip.py and tools/compile_helper.py not found under " + r;\n', 1)
-# Float cvtColor now uses explicit libdevice rounding too; derive its HIP source.
+# Float cvtColor uses explicit libdevice rounding; derive its HIP source.
 sub('        k.cvt_kernels = r + "/kernels/cvtcolor_cpu.py";\n',
     '        k.cvt_kernels = r + "/kernels/cvtcolor_cpu_hip.py";\n', 1)
 sub('        k.wa_kernels = r + "/kernels/warpaffine_cpu.py";\n',
@@ -100,21 +100,20 @@ out = re.sub(r'\bcuErr\(', 'hipErr(', out)
 # ---- 4. calls whose signature differs (before the token renames) -----------------------
 # CUdeviceptr is an integer, hipDeviceptr_t a void*: the resources keep integers, the calls cast.
 sub('    CUdeviceptr base = 0;\n', '    std::uintptr_t base = 0;\n', None)
-out = out.replace('if (base) { if (stream_ordered) cuMemFreeAsync(base, nullptr); else cuMemFree(base); }',
-                  'if (base)\n            {\n                void* p = reinterpret_cast<void*>(base);\n'
-                  '                if (stream_ordered) (void)hipFreeAsync(p, nullptr); else (void)hipFree(p);\n            }')
+sub('const CUresult result = stream_ordered ? cuMemFreeAsync(base, nullptr) : cuMemFree(base);',
+    'const hipError_t result = stream_ordered ? hipFreeAsync(reinterpret_cast<void*>(base), nullptr) : hipFree(reinterpret_cast<void*>(base));', 1)
 alloc_old = '''    CUresult r = t->stream_ordered ? cuMemAllocAsync(&t->base, t->bytes, stream) : cuMemAlloc(&t->base, t->bytes);
     if (r == CUDA_SUCCESS && poison) r = cuMemsetD8Async(t->base, 0xFF, t->bytes, stream);
-    if (r == CUDA_SUCCESS) r = cuMemcpyHtoDAsync(t->base, t->host.data(), t->bytes, stream);
+    if (r == CUDA_SUCCESS) { t->upload_started = true; r = cuMemcpyHtoDAsync(t->base, t->host.data(), t->bytes, stream); }
     if (r == CUDA_SUCCESS) r = cuEventCreate(&t->uploaded, CU_EVENT_DISABLE_TIMING);
-    if (r == CUDA_SUCCESS) r = cuEventRecord(t->uploaded, stream);'''
+    if (r == CUDA_SUCCESS) { r = cuEventRecord(t->uploaded, stream); t->upload_recorded = r == CUDA_SUCCESS; }'''
 alloc_new = '''    void* dptr = nullptr;
     hipError_t r = t->stream_ordered ? hipMallocAsync(&dptr, t->bytes, stream) : hipMalloc(&dptr, t->bytes);
     t->base = reinterpret_cast<std::uintptr_t>(dptr);
     if (r == hipSuccess && poison) r = hipMemsetD8Async(dptr, 0xFF, t->bytes, stream);
-    if (r == hipSuccess) r = hipMemcpyHtoDAsync(dptr, t->host.data(), t->bytes, stream);
+    if (r == hipSuccess) { t->upload_started = true; r = hipMemcpyHtoDAsync(dptr, t->host.data(), t->bytes, stream); }
     if (r == hipSuccess) r = hipEventCreateWithFlags(&t->uploaded, hipEventDisableTiming);
-    if (r == hipSuccess) r = hipEventRecord(t->uploaded, stream);'''
+    if (r == hipSuccess) { r = hipEventRecord(t->uploaded, stream); t->upload_recorded = r == hipSuccess; }'''
 n_alloc = out.count(alloc_old)
 if n_alloc < 2: sys.exit(f"table-upload block: expected >=2, found {n_alloc}")
 out = out.replace(alloc_old, alloc_new)
@@ -227,7 +226,7 @@ struct State
 # generation: the retained context is pinned for this process's cache lifetime.
 # Device reset and primary-context reset are unsupported while this runtime is in use.
 context_helper = r'''
-hipError_t contextGeneration(hipCtx_t context, unsigned long long* generation)
+hipError_t contextGeneration(hipCtx_t context, unsigned long long* generation, bool registerPrimary = true)
 {
     using GetId = hipError_t (*)(hipCtx_t, unsigned long long*);
     static const GetId get_id = reinterpret_cast<GetId>(dlsym(RTLD_DEFAULT, "hipCtxGetId"));
@@ -235,43 +234,49 @@ hipError_t contextGeneration(hipCtx_t context, unsigned long long* generation)
     if (!context || !generation) return hipErrorInvalidContext;
     struct Primary { hipCtx_t context; int device; unsigned long long generation; };
     struct Registry { std::mutex mutex; std::vector<Primary> primaries; };
-    static Registry* registry = new Registry();
+    static auto* registry = new Registry();
     std::lock_guard<std::mutex> lock(registry->mutex);
     for (const auto& primary : registry->primaries)
         if (primary.context == context)
         {
             unsigned int flags = 0; int active = 0;
             const hipError_t result = hipDevicePrimaryCtxGetState(primary.device, &flags, &active);
-            if (result != hipSuccess || !active) return hipErrorInvalidContext;
+            if (result != hipSuccess) return result;
+            if (!active) return hipErrorInvalidContext;
             *generation = primary.generation;
             return hipSuccess;
         }
+    // Cleanup must not register/retain a new context or switch a destroyed one.
+    if (!registerPrimary) return hipErrorInvalidValue;
     hipCtx_t previous = nullptr;
     hipError_t result = hipCtxGetCurrent(&previous);
-    if (result != hipSuccess || previous != context) return hipErrorInvalidContext;
+    if (result != hipSuccess) return result;
+    if (previous != context) return hipErrorInvalidContext;
     hipDevice_t device;
     result = hipCtxGetDevice(&device);
     if (result != hipSuccess) return result;
-    for (const auto& primary : registry->primaries)
-        if (primary.device == static_cast<int>(device)) return hipErrorInvalidContext;
     hipCtx_t primary = nullptr;
-    result = hipDevicePrimaryCtxRetain(&primary, device);
+    result = primaryContext(static_cast<int>(device), primary);
+    // ROCm/DTK retain can change the current context: restore even when ownership
+    // acquisition succeeded but this request names a distinct private context.
     const hipError_t restored = hipCtxSetCurrent(previous);
     if (result != hipSuccess) return result;
     if (restored != hipSuccess) return restored;
-    // This retain lasts for the runtime's process-lifetime caches. A distinct
-    // private context is rejected before loading modules or submitting work.
+    if (context != primary) return hipErrorInvalidContext;
     const auto id = static_cast<unsigned long long>(registry->primaries.size()) + 1;
     registry->primaries.push_back({primary, static_cast<int>(device), id});
-    if (context != primary) return hipErrorInvalidContext;
     *generation = id;
     return hipSuccess;
 }
 
 '''
-sub('bool contextAlive(CUcontext c, std::uint64_t gen)\n',
-    context_helper + 'bool contextAlive(CUcontext c, std::uint64_t gen)\n', 1)
-sub('cuCtxGetId(', 'contextGeneration(', 2)
+# Declare primaryContext before context identification so hipCtxGetId and the
+# primary-context fallback share one process-lifetime reference per device.
+sub('ContextLife contextLife(CUcontext c, std::uint64_t gen)\n',
+    'CUresult primaryContext(int device, CUcontext& context);\n' + context_helper +
+    'ContextLife contextLife(CUcontext c, std::uint64_t gen)\n', 1)
+sub('cuCtxGetId(c, &id)', 'contextGeneration(c, &id, false)', 1)
+sub('cuCtxGetId(ctx, &id)', 'contextGeneration(ctx, &id)', 1)
 
 # ---- 6. plain token renames -----------------------------------------------------------
 pairs = [
@@ -279,6 +284,12 @@ pairs = [
     ("CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED", "hipDeviceAttributeMemoryPoolsSupported"),
     ("CU_EVENT_DISABLE_TIMING", "hipEventDisableTiming"),
     ("CUDA_ERROR_NOT_READY", "hipErrorNotReady"),
+    ("CU_STREAM_CAPTURE_STATUS_NONE", "hipStreamCaptureStatusNone"),
+    ("CUstreamCaptureStatus", "hipStreamCaptureStatus"),
+    ("cuStreamIsCapturing", "hipStreamIsCapturing"),
+    ("CUDA_ERROR_INVALID_CONTEXT", "hipErrorInvalidContext"),
+    ("CUDA_ERROR_CONTEXT_IS_DESTROYED", "hipErrorContextIsDestroyed"),
+    ("CUDA_ERROR_DEINITIALIZED", "hipErrorDeinitialized"),
     ("CUDA_SUCCESS", "hipSuccess"),
     ("CUcontext", "hipCtx_t"), ("CUstream", "hipStream_t"), ("CUresult", "hipError_t"),
     ("CUdevice", "hipDevice_t"), ("CUevent", "hipEvent_t"), ("CUmodule", "hipModule_t"),

@@ -97,6 +97,9 @@ def check_request(req: dict) -> tuple[dict, str, str]:
     try:
         key, text = req["key"], req["key_text"]
         src_path, cache = req["source_path"], req["cache_dir"]
+        # Check signature/constexpr element types, launch/target integer fields
+        # and compiler/source/path strings before serialization or compilation.
+        # Canonical key equality and absolute paths are checked separately below.
         ok = (isinstance(key["kernel"], str) and all(isinstance(n, str) and isinstance(t, str) for n, t in key["signature"])
               and all(isinstance(n, str) and isinstance(v, int) and not isinstance(v, bool) for n, v in key["constexprs"])
               and all(isinstance(key[f], int) for f in ("num_warps", "num_stages"))
@@ -184,8 +187,8 @@ def amdhsa_params(amdgcn: str) -> tuple[str, list[dict]]:
 
 
 def hip_scalar_class(ty: str, kind: str, size: int):
-    """The scalar class the manifest's `ptx` field carries for a hip argument ('ptx' is the
-    protocol's historical field name), or None if the compiler passes it some other way.
+    """The scalar class stored in the manifest's `ptx` field for a HIP argument,
+    or None if the compiler passes it some other way.
     The AMDHSA metadata separates pointers from scalars and gives the size, but not
     signed-vs-float, so i32 and fp32 are told apart by the key's own type string."""
     if ty.startswith("*"):

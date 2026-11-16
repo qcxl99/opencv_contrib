@@ -2,7 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Internal candidate-only HIP graph measurement. No Torch, alternate kernel or
+// Internal HIP graph timing of the Triton implementation. No Torch, alternate kernel or
 // dispatch table: every recorded operation uses the public production DeviceImage
 // entry. All graph-bound buffers/streams/modules/tables outlive completed replays.
 #include "opencv2/triton.hpp"
@@ -13,6 +13,8 @@
 #include "../../src/runtime/cvtcolor.hpp"
 #include "../../test/resize_reference.hpp"
 #include "../../validation/numerics.hpp"
+#include "graph_request.hpp"
+#include "../../src/entry.hpp"
 #include <hip/hip_runtime_api.h>
 #include <algorithm>
 #include <chrono>
@@ -29,14 +31,27 @@
 namespace J = cv_triton_runtime;
 namespace D = cv::triton::detail;
 using Clock = std::chrono::steady_clock;
-static double ms(Clock::time_point start) { return std::chrono::duration<double,std::milli>(Clock::now()-start).count(); }
-static void checked(hipError_t e) { if (e != hipSuccess) throw std::runtime_error(std::string("HIP_API_ERROR: ")+hipGetErrorString(e)); }
-static void require(bool value,const std::string& why) { if (!value) throw std::runtime_error(why); }
-static std::string text(const J::Json& j,const std::string& name,const std::string& fallback="") {
-    const auto* p=j.get(name);return p?p->str:fallback;
+static double ms(Clock::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
-static int number(const J::Json& j,const std::string& name,int fallback=0) { const auto* p=j.get(name);return p?static_cast<int>(p->num):fallback; }
-static std::string hashFile(const std::string& p) { std::string h;require(J::sha256_file(p,h),"missing file: "+p);return h; }
+static void checked(hipError_t e)
+{
+    if (e != hipSuccess)
+        throw std::runtime_error(std::string("HIP_API_ERROR: ") + hipGetErrorString(e));
+}
+static void require(bool value, const std::string& why)
+{
+    if (!value)
+        throw std::runtime_error(why);
+}
+using triton_graph::text;
+static std::string hashFile(const std::string& p)
+{
+    std::string h;
+    require(J::sha256_file(p, h), "missing file: " + p);
+    return h;
+}
 
 // Error policy: do not free potentially in-flight resources after an API error.
 // main returns immediately to a supervised process exit; no reset or retry.
@@ -148,6 +163,9 @@ struct Operation {
     double verify(const cv::Mat& got,const cv::Mat& expected,const cv::Mat& input) const {
         require(got.size()==expected.size() && got.type()==expected.type(),"output size/type mismatch");
         double worst=0;
+        // Only the supported float32 gray/YUV/YCrCb arithmetic families use the
+        // per-pixel scaled bound; permutation/copy paths require exact values.
+        // See validation/numerics.hpp and src/runtime/cvtcolor.hpp.
         bool arithmetic=op=="cvtcolor" && input.depth()==CV_32F &&
             (cv_triton_color::find(code)->op==cv_triton_color::Op::Gray || cv_triton_color::find(code)->op==cv_triton_color::Op::Yuv || cv_triton_color::find(code)->op==cv_triton_color::Op::YCrCb);
         for(int y=0;y<got.rows;++y)for(int x=0;x<got.cols;++x) {
@@ -211,90 +229,290 @@ static void primitiveControl() {
     r.finish();std::cout<<"{\"status\":\"PASS\",\"primitive_graph_nodes\":1,\"replays\":3}"<<std::endl;
 }
 
-int main(int argc,char** argv) {
- try {
-    cv::setNumThreads(2);
-    if(argc==2 && std::string(argv[1])=="--primitive-control"){primitiveControl();return 0;}
-    require(argc==2,"usage: perf_graph REQUEST.json | --primitive-control");
-    std::string raw;require(J::read_file(argv[1],raw),"missing request");J::Json request;std::string why;require(J::json_parse(raw,request,why),why);
-    const auto* item=request.get("case");require(item!=nullptr,"missing case");const auto& c=*item;
-    const int rows=number(c,"src_h"),cols=number(c,"src_w"),cn=number(c,"channels",1),dh=number(c,"dst_h",rows),dw=number(c,"dst_w",cols);
-    const std::string dtype=text(c,"dtype","uint8");const int depth=dtype=="uint8"?CV_8U:dtype=="uint16"?CV_16U:dtype=="float32"?CV_32F:-1;
-    const int calls=number(request,"captured_calls",250),samples=number(request,"samples",10);
-    require(rows>0&&cols>0&&dw>0&&dh>0&&rows<=4096&&cols<=4096&&dw<=4096&&dh<=4096&&cn>=1&&cn<=4&&depth>=0,"invalid dimensions/type");
-    require(calls>=1&&calls<=250&&samples==10,"invalid frozen graph budget");
-    Operation op;op.op=text(request,"op");require(op.op=="resize"||op.op=="cvtcolor"||op.op=="warpaffine","unknown operator");op.size={dw,dh};
-    const std::string mode=text(c,"mode","INTER_LINEAR");op.interpolation=mode.find("NEAREST")!=std::string::npos?cv::INTER_NEAREST:mode.find("CUBIC")!=std::string::npos?cv::INTER_CUBIC:mode.find("AREA")!=std::string::npos?cv::INTER_AREA:cv::INTER_LINEAR;
-    require(mode=="INTER_NEAREST"||mode=="INTER_LINEAR"||mode=="INTER_CUBIC"||mode=="INTER_AREA"||mode=="NEAREST"||mode=="LINEAR"||mode=="CUBIC","unknown mode");
-    if(op.op=="cvtcolor") {
-        const auto name=text(c,"code");const auto& table=cv_triton_color::all();auto found=std::find_if(table.begin(),table.end(),[&](const cv_triton_color::CodeSpec& s){return name==s.name;});require(found!=table.end(),"unknown conversion code");op.code=found->code;
-    }
-    op.matrix=cv::Mat::eye(2,3,CV_64F);if(const auto* m=c.get("M")){require(m->arr.size()==6,"invalid matrix");for(int i=0;i<6;++i)op.matrix.ptr<double>(i/3)[i%3]=m->arr[i].num;}
-    op.flags=op.interpolation;const auto* inverse=c.get("inverse");if(inverse&&inverse->b)op.flags|=cv::WARP_INVERSE_MAP;
-    const auto border=text(c,"border","BORDER_REPLICATE");require(border=="BORDER_REPLICATE"||border=="BORDER_CONSTANT"||border=="BORDER_REFLECT_101"||border=="BORDER_WRAP","unsupported benchmark border");
-    op.border=border=="BORDER_CONSTANT"?cv::BORDER_CONSTANT:border=="BORDER_REFLECT_101"?cv::BORDER_REFLECT_101:border=="BORDER_WRAP"?cv::BORDER_WRAP:cv::BORDER_REPLICATE;
-    cv::Mat host=readInput(request,"input_path","input_sha256",rows,cols,CV_MAKETYPE(depth,cn));
-    cv::Mat changed=readInput(request,"changed_path","changed_sha256",rows,cols,host.type());
-    const cv::Mat reference=op.reference(host),changedRef=op.reference(changed);require(cv::norm(reference,changedRef,cv::NORM_INF)>0,"input mutation did not change expected output");
-    Resources r;checked(hipStreamCreateWithFlags(&r.stream,hipStreamNonBlocking));checked(hipEventCreate(&r.start));checked(hipEventCreate(&r.stop));
-    Pitched src,dst;bool roi=number(request,"roi",1)!=0;src.allocate(r,true,host.size(),host.type(),roi);dst.allocate(r,false,reference.size(),reference.type(),roi);
-    src.upload(host,r.stream);checked(hipStreamSynchronize(r.stream));
-    auto first=Clock::now();op.call(src,dst,r.stream);checked(hipStreamSynchronize(r.stream));const double firstMs=ms(first);
-    cv::Mat normal=dst.downloadAndCheck(r.stream);op.verify(normal,reference,host);
-    auto warm=Clock::now();for(int i=0;i<20;++i)op.call(src,dst,r.stream);checked(hipStreamSynchronize(r.stream));D::reapCompleted();double warmMs=ms(warm);
-    const auto identity=D::runtimeStats();require(!identity.last_key.empty()&&!identity.last_artifact.empty(),"no actual production dispatch identity");
-    const std::string manifest=identity.last_artifact+"/manifest.json";std::string manifestRaw;require(J::read_file(manifest,manifestRaw),"missing actual manifest");J::Json man;require(J::json_parse(manifestRaw,man,why),why);
-    require(text(man,"key_text")==identity.last_key,"manifest/key identity mismatch");const auto* bin=man.get("binary");require(bin,"manifest binary absent");std::string binary=identity.last_artifact+"/"+text(*bin,"file");require(hashFile(binary)==text(*bin,"sha256"),"compiled binary hash mismatch");
-    const std::string parameterHash=J::sha256_hex(raw);
-    const Binding binding{src.image,dst.image,parameterHash};const int refusals=binding.negativeControls();
-    std::vector<double> perCall,graphTotal;double captureMs=0,instantiateMs=0,ordinaryMs=0,ordinaryWall=0;std::string inventory;long long maxPins=0;double worst=0;
-    // Two independent construct/destroy lifecycles; the second is a correctness
-    // control after module/table eviction, not another timing sample population.
-    for(int generation=0;generation<2;++generation) {
-        src.upload(host,r.stream);dst.poison(r.stream);checked(hipStreamSynchronize(r.stream));
-        op.call(src,dst,r.stream);checked(hipStreamSynchronize(r.stream));D::reapCompleted();
-        const auto before=D::runtimeStats();
-        auto start=Clock::now();checked(hipStreamBeginCapture(r.stream,hipStreamCaptureModeThreadLocal));
-        for(int i=0;i<calls;++i)op.call(src,dst,r.stream);
-        checked(hipStreamEndCapture(r.stream,&r.graph));const double captured=ms(start);
-        auto after=D::runtimeStats();
-        require(after.helper_compiles==before.helper_compiles && after.module_loads==before.module_loads && after.table_uploads==before.table_uploads,"JIT/load/upload occurred inside capture");
-        require(after.capture_launches-before.capture_launches==calls && after.capture_pin_holds>0,"runtime capture work/pins missing");
-        maxPins=std::max(maxPins,after.capture_pin_holds);auto nodes=nodeInventory(r.graph,calls,op.op);if(generation==0)inventory=nodes;
-        start=Clock::now();checked(hipGraphInstantiate(&r.exec,r.graph,nullptr,nullptr,0));const double instantiated=ms(start);
-        if(generation==0){captureMs=captured;instantiateMs=instantiated;}
-        auto admission=[&](){require(binding.matches(src.image,dst.image,parameterHash),"graph binding changed");};
-        auto replay=[&](){checked(hipGraphLaunch(r.exec,r.stream));};
-        // Full poison and complete reference comparison after replay; canaries
-        // catch unexpected writes, changed input prevents stale/empty work passes.
-        for(int trial=0;trial<3;++trial) {
-            if(trial==1){src.upload(changed,r.stream);D::setCacheLimits(0,0);}
-            dst.poison(r.stream,trial==2?0x5A:Pitched::guard);admission();replay();checked(hipStreamSynchronize(r.stream));
-            auto got=dst.downloadAndCheck(r.stream);const auto& expected=trial?changedRef:reference;const auto& source=trial?changed:host;
-            worst=std::max(worst,op.verify(got,expected,source));
-            if(!trial)require(cv::norm(got,normal,cv::NORM_INF)==0,"graph differs from ordinary production output");
-            const auto uploaded=src.downloadAndCheck(r.stream);require(cv::norm(uploaded,source,cv::NORM_INF)==0,"source altered by graph");
+int main(int argc, char** argv)
+{
+    try
+    {
+        cv::setNumThreads(2);
+        if (argc == 2 && std::string(argv[1]) == "--primitive-control")
+        {
+            primitiveControl();
+            return 0;
         }
-        if(generation==0) {
-            for(int sample=0;sample<samples;++sample) {
-                admission();checked(hipEventRecord(r.start,r.stream));replay();checked(hipEventRecord(r.stop,r.stream));checked(hipEventSynchronize(r.stop));float elapsed=0;checked(hipEventElapsedTime(&elapsed,r.start,r.stop));require(elapsed>0&&std::isfinite(elapsed),"invalid graph elapsed time");graphTotal.push_back(elapsed);perCall.push_back(elapsed/calls);
+        require(argc == 2, "usage: perf_graph REQUEST.json | --primitive-control");
+        std::string raw;
+        require(J::read_file(argv[1], raw), "missing request");
+        J::Json request;
+        std::string why;
+        require(J::json_parse(raw, request, why), why);
+        const auto parsed = triton_graph::parse(request); // Before host/GPU allocation.
+        const auto& c = *request.get("case");
+        const int rows = parsed.rows, cols = parsed.cols, cn = parsed.channels;
+        const int dh = parsed.height, dw = parsed.width;
+        const int depth = parsed.dtype == "uint8"    ? CV_8U
+                          : parsed.dtype == "uint16" ? CV_16U
+                                                     : CV_32F;
+        const int calls = parsed.calls, samples = parsed.samples;
+        Operation op;
+        op.op = parsed.op;
+        op.size = {dw, dh};
+        const std::string& mode = parsed.mode;
+        op.interpolation = mode == "INTER_NEAREST" ? cv::INTER_NEAREST
+                           : mode == "INTER_CUBIC" ? cv::INTER_CUBIC
+                           : mode == "INTER_AREA"  ? cv::INTER_AREA
+                                                   : cv::INTER_LINEAR;
+        if (op.op == "cvtcolor")
+        {
+            const auto& table = cv_triton_color::all();
+            auto found =
+                std::find_if(table.begin(), table.end(), [&](const cv_triton_color::CodeSpec& spec)
+                             { return parsed.code == spec.name; });
+            require(found != table.end(), "unknown conversion code");
+            op.code = found->code;
+            J::DeviceView view;
+            view.ptr = 4096;
+            view.rows = rows;
+            view.cols = cols;
+            view.channels = cn;
+            view.step = static_cast<std::size_t>(cols) * cn * CV_ELEM_SIZE1(CV_MAKETYPE(depth, cn));
+            view.type = depth == CV_8U    ? J::ElemType::U8
+                        : depth == CV_16U ? J::ElemType::U16
+                                          : J::ElemType::F32;
+            const auto out = D::cvtColorOutput(view, op.code);
+            require(dw == out.size.width && dh == out.size.height,
+                    "declared destination differs from conversion output");
+        }
+        op.matrix = cv::Mat(2, 3, CV_64F, const_cast<double*>(parsed.matrix)).clone();
+        op.flags = op.interpolation | (parsed.inverse ? cv::WARP_INVERSE_MAP : 0);
+        op.border = parsed.border == "BORDER_CONSTANT"      ? cv::BORDER_CONSTANT
+                    : parsed.border == "BORDER_REFLECT_101" ? cv::BORDER_REFLECT_101
+                    : parsed.border == "BORDER_WRAP"        ? cv::BORDER_WRAP
+                                                            : cv::BORDER_REPLICATE;
+        if (op.op == "warpaffine")
+        {
+            J::DeviceView view;
+            view.ptr = 4096;
+            view.rows = rows;
+            view.cols = cols;
+            view.channels = cn;
+            view.step = static_cast<std::size_t>(cols) * cn * CV_ELEM_SIZE1(CV_MAKETYPE(depth, cn));
+            view.type = depth == CV_8U    ? J::ElemType::U8
+                        : depth == CV_16U ? J::ElemType::U16
+                                          : J::ElemType::F32;
+            const auto warp = D::warpRequest(view, op.matrix, op.flags, op.border, op.borderValue);
+            (void)D::warpOutput(warp, op.size); // Pure source/output admission before allocation.
+        }
+        cv::Mat host =
+            readInput(request, "input_path", "input_sha256", rows, cols, CV_MAKETYPE(depth, cn));
+        cv::Mat changed =
+            readInput(request, "changed_path", "changed_sha256", rows, cols, host.type());
+        if (depth == CV_32F)
+            require(cv::checkRange(host) && cv::checkRange(changed), "nonfinite input data");
+        const cv::Mat reference = op.reference(host), changedRef = op.reference(changed);
+        require(cv::norm(reference, changedRef, cv::NORM_INF) > 0,
+                "input mutation did not change expected output");
+        Resources r;
+        checked(hipStreamCreateWithFlags(&r.stream, hipStreamNonBlocking));
+        checked(hipEventCreate(&r.start));
+        checked(hipEventCreate(&r.stop));
+        Pitched src, dst;
+        bool roi = parsed.roi;
+        src.allocate(r, true, host.size(), host.type(), roi);
+        dst.allocate(r, false, reference.size(), reference.type(), roi);
+        src.upload(host, r.stream);
+        checked(hipStreamSynchronize(r.stream));
+        auto first = Clock::now();
+        op.call(src, dst, r.stream);
+        checked(hipStreamSynchronize(r.stream));
+        const double firstMs = ms(first);
+        cv::Mat normal = dst.downloadAndCheck(r.stream);
+        op.verify(normal, reference, host);
+        auto warm = Clock::now();
+        for (int i = 0; i < 20; ++i)
+            op.call(src, dst, r.stream);
+        checked(hipStreamSynchronize(r.stream));
+        D::reapCompleted();
+        double warmMs = ms(warm);
+        const auto identity = D::runtimeStats();
+        require(!identity.last_key.empty() && !identity.last_artifact.empty(),
+                "no actual production dispatch identity");
+        const std::string manifest = identity.last_artifact + "/manifest.json";
+        std::string manifestRaw;
+        require(J::read_file(manifest, manifestRaw), "missing actual manifest");
+        J::Json man;
+        require(J::json_parse(manifestRaw, man, why), why);
+        require(text(man, "key_text") == identity.last_key, "manifest/key identity mismatch");
+        const auto* bin = man.get("binary");
+        require(bin, "manifest binary absent");
+        std::string binary = identity.last_artifact + "/" + text(*bin, "file");
+        require(hashFile(binary) == text(*bin, "sha256"), "compiled binary hash mismatch");
+        const std::string parameterHash = J::sha256_hex(raw);
+        const Binding binding{src.image, dst.image, parameterHash};
+        const int refusals = binding.negativeControls();
+        std::vector<double> perCall, graphTotal;
+        double captureMs = 0, instantiateMs = 0, ordinaryMs = 0, ordinaryWall = 0;
+        std::string inventory;
+        long long maxPins = 0;
+        double worst = 0;
+        // Two independent construct/destroy lifecycles; the second is a correctness
+        // control after module/table eviction, not another timing sample population.
+        for (int generation = 0; generation < 2; ++generation)
+        {
+            src.upload(host, r.stream);
+            dst.poison(r.stream);
+            checked(hipStreamSynchronize(r.stream));
+            op.call(src, dst, r.stream);
+            checked(hipStreamSynchronize(r.stream));
+            D::reapCompleted();
+            const auto before = D::runtimeStats();
+            auto start = Clock::now();
+            checked(hipStreamBeginCapture(r.stream, hipStreamCaptureModeThreadLocal));
+            for (int i = 0; i < calls; ++i)
+                op.call(src, dst, r.stream);
+            checked(hipStreamEndCapture(r.stream, &r.graph));
+            const double captured = ms(start);
+            auto after = D::runtimeStats();
+            require(after.helper_compiles == before.helper_compiles &&
+                        after.module_loads == before.module_loads &&
+                        after.table_uploads == before.table_uploads,
+                    "JIT/load/upload occurred inside capture");
+            require(after.capture_launches - before.capture_launches == calls &&
+                        after.capture_pin_holds > 0,
+                    "runtime capture work/pins missing");
+            maxPins = std::max(maxPins, after.capture_pin_holds);
+            auto nodes = nodeInventory(r.graph, calls, op.op);
+            if (generation == 0)
+                inventory = nodes;
+            start = Clock::now();
+            checked(hipGraphInstantiate(&r.exec, r.graph, nullptr, nullptr, 0));
+            const double instantiated = ms(start);
+            if (generation == 0)
+            {
+                captureMs = captured;
+                instantiateMs = instantiated;
             }
-            worst=std::max(worst,op.verify(dst.downloadAndCheck(r.stream),changedRef,changed));
+            auto admission = [&]()
+            {
+                require(binding.matches(src.image, dst.image, parameterHash),
+                        "graph binding changed");
+            };
+            auto replay = [&]() { checked(hipGraphLaunch(r.exec, r.stream)); };
+            // Full poison and complete reference comparison after replay; canaries
+            // catch unexpected writes, changed input prevents stale/empty work passes.
+            for (int trial = 0; trial < 3; ++trial)
+            {
+                if (trial == 1)
+                {
+                    src.upload(changed, r.stream);
+                    D::setCacheLimits(0, 0);
+                }
+                dst.poison(r.stream, trial == 2 ? 0x5A : Pitched::guard);
+                admission();
+                replay();
+                checked(hipStreamSynchronize(r.stream));
+                auto got = dst.downloadAndCheck(r.stream);
+                const auto& expected = trial ? changedRef : reference;
+                const auto& source = trial ? changed : host;
+                worst = std::max(worst, op.verify(got, expected, source));
+                if (!trial)
+                    require(cv::norm(got, normal, cv::NORM_INF) == 0,
+                            "graph differs from ordinary production output");
+                const auto uploaded = src.downloadAndCheck(r.stream);
+                require(cv::norm(uploaded, source, cv::NORM_INF) == 0, "source altered by graph");
+            }
+            if (generation == 0)
+            {
+                for (int sample = 0; sample < samples; ++sample)
+                {
+                    admission();
+                    checked(hipEventRecord(r.start, r.stream));
+                    replay();
+                    checked(hipEventRecord(r.stop, r.stream));
+                    checked(hipEventSynchronize(r.stop));
+                    float elapsed = 0;
+                    checked(hipEventElapsedTime(&elapsed, r.start, r.stop));
+                    require(elapsed > 0 && std::isfinite(elapsed), "invalid graph elapsed time");
+                    graphTotal.push_back(elapsed);
+                    perCall.push_back(elapsed / calls);
+                }
+                worst =
+                    std::max(worst, op.verify(dst.downloadAndCheck(r.stream), changedRef, changed));
+            }
+            checked(hipStreamSynchronize(r.stream));
+            checked(hipGraphExecDestroy(r.exec));
+            r.exec = nullptr;
+            checked(hipGraphDestroy(r.graph));
+            r.graph = nullptr;
+            cv::triton::releaseGraphResources();
+            D::reapCompleted();
+            require(D::runtimeStats().capture_pin_holds == 0 && D::runtimeStats().pending == 0,
+                    "pins/pending survive graph destruction");
+            D::setCacheLimits(64, 256);
         }
-        checked(hipStreamSynchronize(r.stream));checked(hipGraphExecDestroy(r.exec));r.exec=nullptr;checked(hipGraphDestroy(r.graph));r.graph=nullptr;
-        cv::triton::releaseGraphResources();D::reapCompleted();require(D::runtimeStats().capture_pin_holds==0&&D::runtimeStats().pending==0,"pins/pending survive graph destruction");D::setCacheLimits(64,256);
+        // Ordinary production-call cost remains separate, with JIT re-warmed after eviction.
+        op.call(src, dst, r.stream);
+        checked(hipStreamSynchronize(r.stream));
+        auto wallStart = Clock::now();
+        checked(hipEventRecord(r.start, r.stream));
+        for (int i = 0; i < 250; ++i)
+            op.call(src, dst, r.stream);
+        checked(hipEventRecord(r.stop, r.stream));
+        checked(hipEventSynchronize(r.stop));
+        ordinaryWall = ms(wallStart) / 250;
+        float elapsed = 0;
+        checked(hipEventElapsedTime(&elapsed, r.start, r.stop));
+        ordinaryMs = elapsed / 250;
+        worst = std::max(worst, op.verify(dst.downloadAndCheck(r.stream), changedRef, changed));
+        D::reapCompleted();
+        require(hashFile(manifest) == J::sha256_hex(manifestRaw) &&
+                    hashFile(binary) == text(*bin, "sha256"),
+                "artifact changed during experiment");
+        r.finish();
+        std::vector<double> sorted = perCall;
+        std::sort(sorted.begin(), sorted.end());
+        auto quantile = [&](double q)
+        {
+            double pos = q * (sorted.size() - 1);
+            size_t low = static_cast<size_t>(pos), high = std::min(low + 1, sorted.size() - 1);
+            return sorted[low] * (high - pos) + sorted[high] * (pos - low);
+        };
+        // Existing graph_replay metric spelling; no new qualification/report schema.
+        std::cout.precision(17);
+        std::cout
+            << "{\"case_id\":" << J::json_quote(text(c, "id"))
+            << ",\"metric\":\"graph_replay\",\"status\":\"PASS\",\"baseline_status\":\"BASELINE_UNAVAILABLE\",\"candidate_ms\":"
+            << quantile(.5) << ",\"p10_ms\":" << quantile(.1) << ",\"p90_ms\":" << quantile(.9)
+            << ",\"min_ms\":" << sorted.front() << ",\"max_ms\":" << sorted.back()
+            << ",\"captured_calls\":" << calls << ",\"timed_replays\":" << samples
+            << ",\"raw_total_graph_ms\":[";
+        for (size_t i = 0; i < graphTotal.size(); ++i)
+            std::cout << (i ? "," : "") << graphTotal[i];
+        std::cout << "],\"raw_per_call_ms\":[";
+        for (size_t i = 0; i < perCall.size(); ++i)
+            std::cout << (i ? "," : "") << perCall[i];
+        std::cout << "],\"first_compile_call_wall_ms\":" << firstMs
+                  << ",\"warmup20_wall_ms\":" << warmMs << ",\"capture_wall_ms\":" << captureMs
+                  << ",\"instantiate_wall_ms\":" << instantiateMs
+                  << ",\"ordinary_event_ms\":" << ordinaryMs
+                  << ",\"ordinary_completion_wall_ms\":" << ordinaryWall
+                  << ",\"max_abs_error\":" << worst << ",\"binding_refusal_controls\":" << refusals
+                  << ",\"construct_destroy_cycles\":2,\"max_resource_pins\":" << maxPins
+                  << ",\"remaining_pins\":0,\"remaining_pending\":0,\"graph_work\":" << inventory
+                  << ",\"production_route\":" << J::json_quote(identity.last_route)
+                  << ",\"production_key\":" << J::json_quote(identity.last_key)
+                  << ",\"artifact\":" << J::json_quote(identity.last_artifact)
+                  << ",\"manifest_sha256\":" << J::json_quote(J::sha256_hex(manifestRaw))
+                  << ",\"binary_sha256\":" << J::json_quote(text(*bin, "sha256"))
+                  << ",\"request_sha256\":" << J::json_quote(J::sha256_hex(raw))
+                  << ",\"executed_parameters\":" << triton_graph::executionJson(parsed)
+                  << ",\"input_sha256\":" << J::json_quote(text(request, "input_sha256"))
+                  << ",\"changed_sha256\":" << J::json_quote(text(request, "changed_sha256")) << "}"
+                  << std::endl;
+        return 0;
     }
-    // Ordinary production-call cost remains separate, with JIT re-warmed after eviction.
-    op.call(src,dst,r.stream);checked(hipStreamSynchronize(r.stream));
-    auto wallStart=Clock::now();checked(hipEventRecord(r.start,r.stream));for(int i=0;i<250;++i)op.call(src,dst,r.stream);checked(hipEventRecord(r.stop,r.stream));checked(hipEventSynchronize(r.stop));ordinaryWall=ms(wallStart)/250;float elapsed=0;checked(hipEventElapsedTime(&elapsed,r.start,r.stop));ordinaryMs=elapsed/250;
-    worst=std::max(worst,op.verify(dst.downloadAndCheck(r.stream),changedRef,changed));D::reapCompleted();
-    require(hashFile(manifest)==J::sha256_hex(manifestRaw) && hashFile(binary)==text(*bin,"sha256"),"artifact changed during experiment");
-    r.finish();std::vector<double> sorted=perCall;std::sort(sorted.begin(),sorted.end());
-    auto quantile=[&](double q){double pos=q*(sorted.size()-1);size_t low=static_cast<size_t>(pos),high=std::min(low+1,sorted.size()-1);return sorted[low]*(high-pos)+sorted[high]*(pos-low);};
-    // Existing graph_replay metric spelling; no new qualification/report schema.
-    std::cout.precision(17);std::cout<<"{\"case_id\":"<<J::json_quote(text(c,"id"))<<",\"metric\":\"graph_replay\",\"status\":\"PASS\",\"baseline_status\":\"BASELINE_UNAVAILABLE\",\"candidate_ms\":"<<quantile(.5)<<",\"p10_ms\":"<<quantile(.1)<<",\"p90_ms\":"<<quantile(.9)<<",\"min_ms\":"<<sorted.front()<<",\"max_ms\":"<<sorted.back()<<",\"captured_calls\":"<<calls<<",\"timed_replays\":"<<samples<<",\"raw_total_graph_ms\":[";
-    for(size_t i=0;i<graphTotal.size();++i)std::cout<<(i?",":"")<<graphTotal[i];std::cout<<"],\"raw_per_call_ms\":[";for(size_t i=0;i<perCall.size();++i)std::cout<<(i?",":"")<<perCall[i];
-    std::cout<<"],\"first_compile_call_wall_ms\":"<<firstMs<<",\"warmup20_wall_ms\":"<<warmMs<<",\"capture_wall_ms\":"<<captureMs<<",\"instantiate_wall_ms\":"<<instantiateMs<<",\"ordinary_event_ms\":"<<ordinaryMs<<",\"ordinary_completion_wall_ms\":"<<ordinaryWall<<",\"max_abs_error\":"<<worst<<",\"binding_refusal_controls\":"<<refusals<<",\"construct_destroy_cycles\":2,\"max_resource_pins\":"<<maxPins<<",\"remaining_pins\":0,\"remaining_pending\":0,\"graph_work\":"<<inventory<<",\"production_route\":"<<J::json_quote(identity.last_route)<<",\"production_key\":"<<J::json_quote(identity.last_key)<<",\"artifact\":"<<J::json_quote(identity.last_artifact)<<",\"manifest_sha256\":"<<J::json_quote(J::sha256_hex(manifestRaw))<<",\"binary_sha256\":"<<J::json_quote(text(*bin,"sha256"))<<",\"request_sha256\":"<<J::json_quote(J::sha256_hex(raw))<<",\"input_sha256\":"<<J::json_quote(text(request,"input_sha256"))<<",\"changed_sha256\":"<<J::json_quote(text(request,"changed_sha256"))<<"}"<<std::endl;
-    return 0;
- } catch(const std::exception& error){std::cerr<<error.what()<<std::endl;return 1;}
+    catch (const std::exception& error)
+    {
+        std::cerr << error.what() << std::endl;
+        return 1;
+    }
 }

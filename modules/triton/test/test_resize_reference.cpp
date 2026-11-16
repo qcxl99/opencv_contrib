@@ -124,6 +124,45 @@ TEST(Triton_ResizeReference, Area2x2Rounding)
                 }
 }
 
+// Independent 3x3 sums, with source and destination having unrelated parent pitches.
+TEST(Triton_ResizeReference, Area3x3IndependentPitchesAndGuards)
+{
+    for (int depth : {CV_8U, CV_32F})
+        for (int channels : {1, 3, 4})
+        {
+            const int type = CV_MAKETYPE(depth, channels);
+            Mat sourceParent(11, 17, type, Scalar::all(9));
+            Mat source = sourceParent(Rect(1, 1, 12, 9));
+            for (int y = 0; y < source.rows; ++y)
+                for (int x = 0; x < source.cols * channels; ++x)
+                    if (depth == CV_8U) source.ptr<uchar>(y)[x] = static_cast<uchar>(9 * ((y * 13 + x * 7) % 16));
+                    else source.ptr<float>(y)[x] = static_cast<float>(9 * ((y * 13 + x * 7) % 16)) / 8.f;
+            Mat destinationParent(7, 11, type, Scalar::all(77));
+            const Mat before = destinationParent.clone();
+            Mat destination = destinationParent(Rect(2, 1, 4, 3));
+            resize_ref::ImageRef input{source.data, source.rows, source.cols, channels, source.step, depth == CV_32F};
+            resize_ref::ImageRef output{destination.data, destination.rows, destination.cols, channels, destination.step, depth == CV_32F};
+            resize_ref::resize(input, output, 1.0 / 3, 1.0 / 3, INTER_AREA);
+            for (int y = 0; y < 3; ++y)
+                for (int x = 0; x < 4; ++x)
+                    for (int c = 0; c < channels; ++c)
+                    {
+                        double sum = 0;
+                        for (int yy = 0; yy < 3; ++yy)
+                            for (int xx = 0; xx < 3; ++xx)
+                                sum += depth == CV_8U ? source.ptr<uchar>(3 * y + yy)[(3 * x + xx) * channels + c]
+                                    : source.ptr<float>(3 * y + yy)[(3 * x + xx) * channels + c];
+                        if (depth == CV_8U) EXPECT_EQ(saturate_cast<uchar>(sum / 9), destination.ptr<uchar>(y)[x * channels + c]);
+                        else EXPECT_NEAR(sum / 9, destination.ptr<float>(y)[x * channels + c], 8.419e-7);
+                    }
+            for (int y = 0; y < destinationParent.rows; ++y)
+                for (int x = 0; x < destinationParent.cols; ++x)
+                    if (!Rect(2, 1, 4, 3).contains(Point(x, y)))
+                        EXPECT_EQ(0, std::memcmp(before.ptr(y) + x * before.elemSize(),
+                            destinationParent.ptr(y) + x * destinationParent.elemSize(), before.elemSize()));
+        }
+}
+
 // Direct convolution and pixel-coverage gold values are independent of the
 // production route and coefficient tables. The test-only evaluator above still
 // shares those tables with the runtime; these small cases check that boundary.

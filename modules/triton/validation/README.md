@@ -26,8 +26,9 @@ HIP executable groups checks and reports internal counts separately from
 registered tests; standard OpenCV list/filter/XML options operate on its groups.
 
 Production adapters share `src/entry.hpp` metadata resolution and request
-validation, allocate or reuse through their owning API, then validate actual
-output storage before launch. The runtime owns compiled modules and tables.
+validation. GpuMat entries allocate or reuse output storage; device-buffer entries
+validate caller-provided output storage before launch. The runtime owns compiled
+modules and tables.
 On DTK, device/range and stream-context queries are available, while
 `HIP_POINTER_ATTRIBUTE_CONTEXT` does not identify allocation context. Tests must
 preserve that limitation rather than infer foreign-context ownership.

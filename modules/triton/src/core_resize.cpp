@@ -90,7 +90,7 @@ void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
     if (dsize.width <= 0 || dsize.height <= 0)
         CV_Error(Error::StsUnsupportedFormat, "cv::triton::resizeCore: dsize must be explicit and non-empty");
     // resize covers CV_8U and CV_32F only; CV_16U belongs to warpAffine. Checked here because
-    // toDeviceView is shared and now accepts all three depths -- refusing later would let the
+    // toDeviceView is shared and accepts all three depths -- refusing later would let the
     // request reach the compile helper, which reports -2 instead of the documented
     // StsUnsupportedFormat.
     for (const ImageView* v : {&src, &dst})

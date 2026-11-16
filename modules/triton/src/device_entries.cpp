@@ -28,10 +28,16 @@ namespace {
 #ifdef OPENCV_TRITON_HAVE_HIP_ADAPTER
 // ROCm uses `type`; some DTK headers retain `memoryType`. Keep both source
 // layouts compatible without guessing the toolkit from the platform name.
-template<class Attributes>
-auto allocationMemoryType(const Attributes& value,int) -> decltype(value.type) { return value.type; }
-template<class Attributes>
-auto allocationMemoryType(const Attributes& value,long) -> decltype(value.memoryType) { return value.memoryType; }
+template <class Attributes>
+auto allocationMemoryType(const Attributes& value, int) -> decltype(value.type)
+{
+    return value.type;
+}
+template <class Attributes>
+auto allocationMemoryType(const Attributes& value, long) -> decltype(value.memoryType)
+{
+    return value.memoryType;
+}
 #endif
 
 cv_triton_runtime::DeviceView view(const DeviceImage& m, int device)
@@ -57,7 +63,8 @@ cv_triton_runtime::DeviceView view(const DeviceImage& m, int device)
     hipPointerAttribute_t attributes{};
     // DTK does not implement HIP_POINTER_ATTRIBUTE_CONTEXT. Query allocation
     // device/range, and obtain the active context's real lifetime identity.
-    std::uintptr_t native=0;std::uint64_t lifetime=0;
+    std::uintptr_t native = 0;
+    std::uint64_t lifetime = 0;
     detail::requireStatus(runtime::contextIdentity(device,native,lifetime),"HIP context identity");
     current=reinterpret_cast<hipCtx_t>(native);generation=lifetime;
     if (hipCtxGetDevice(&actual) != hipSuccess || actual != device ||
@@ -98,27 +105,34 @@ void requireDevice(int device, const char* op)
 
 void validateStream(std::uintptr_t stream)
 {
-    if (!stream) return;
+    if (!stream)
+        return;
 #ifdef OPENCV_TRITON_HAVE_HIP_ADAPTER
-    hipCtx_t current=nullptr,owner=nullptr;
-    using GetStreamContext=hipError_t (*)(hipStream_t,hipCtx_t*);
-    static const auto getContext=reinterpret_cast<GetStreamContext>(dlsym(RTLD_DEFAULT,"hipStreamGetCtx"));
-    bool valid=hipCtxGetCurrent(&current)==hipSuccess && current;
-    if(valid && getContext)valid=getContext(reinterpret_cast<hipStream_t>(stream),&owner)==hipSuccess && owner==current;
-    else if(valid)
+    hipCtx_t current = nullptr, owner = nullptr;
+    using GetStreamContext = hipError_t (*)(hipStream_t, hipCtx_t*);
+    static const auto getContext =
+        reinterpret_cast<GetStreamContext>(dlsym(RTLD_DEFAULT, "hipStreamGetCtx"));
+    bool valid = hipCtxGetCurrent(&current) == hipSuccess && current;
+    if (valid && getContext)
+        valid = getContext(reinterpret_cast<hipStream_t>(stream), &owner) == hipSuccess &&
+                owner == current;
+    else if (valid)
     {
         // Standard ROCm has a stream-device query but no public stream-context
         // query. Current contextIdentity already admits retained primaries only.
         // Arbitrary same-device private-stream provenance is unsupported and
         // must not be claimed as proven by this device-only fallback.
-        hipDevice_t device=-1,actual=-1;
-        valid=hipCtxGetDevice(&device)==hipSuccess &&
-              hipStreamGetDevice(reinterpret_cast<hipStream_t>(stream),&actual)==hipSuccess && actual==device;
+        hipDevice_t device = -1, actual = -1;
+        valid = hipCtxGetDevice(&device) == hipSuccess &&
+                hipStreamGetDevice(reinterpret_cast<hipStream_t>(stream), &actual) == hipSuccess &&
+                actual == device;
     }
-    if(!valid)
+    if (!valid)
 #else
     CUcontext current = nullptr, owner = nullptr;
-    if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &owner) != CUDA_SUCCESS || owner != current)
+    if (cuCtxGetCurrent(&current) != CUDA_SUCCESS ||
+        cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &owner) != CUDA_SUCCESS ||
+        owner != current)
 #endif
         CV_Error(Error::StsBadArg, "stream must belong to the current device context");
 }

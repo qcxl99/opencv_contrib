@@ -28,6 +28,7 @@
 #include "compile_protocol.hpp"
 #include "cvtcolor.hpp"
 #include "resize_plan.hpp"
+#include "lifetime.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -189,20 +190,20 @@ Status error(Reason r, const std::string& msg)
 
 struct CtxGuard
 {
-    bool pushed = false;
+    bool pushed = false, valid = false;
     explicit CtxGuard(hipCtx_t c)
     {
         hipCtx_t cur = nullptr;
-        (void)hipCtxGetCurrent(&cur);
-        if (c && cur != c) pushed = hipCtxPushCurrent(c) == hipSuccess;
+        if (hipCtxGetCurrent(&cur) != hipSuccess) return;
+        if (c && cur == c) valid = true;
+        else if (c) valid = pushed = hipCtxPushCurrent(c) == hipSuccess;
     }
     ~CtxGuard() { if (pushed) { hipCtx_t p; (void)hipCtxPopCurrent(&p); } }
 };
 
-// Is `c` still the context it was (`gen`, its hipCtxGetId)? A destroyed context took its modules,
-// memory and events with it, and its handle value may have come back as another context.
+hipError_t primaryContext(int device, hipCtx_t& context);
 
-hipError_t contextGeneration(hipCtx_t context, unsigned long long* generation)
+hipError_t contextGeneration(hipCtx_t context, unsigned long long* generation, bool registerPrimary = true)
 {
     using GetId = hipError_t (*)(hipCtx_t, unsigned long long*);
     static const GetId get_id = reinterpret_cast<GetId>(dlsym(RTLD_DEFAULT, "hipCtxGetId"));
@@ -210,43 +211,95 @@ hipError_t contextGeneration(hipCtx_t context, unsigned long long* generation)
     if (!context || !generation) return hipErrorInvalidContext;
     struct Primary { hipCtx_t context; int device; unsigned long long generation; };
     struct Registry { std::mutex mutex; std::vector<Primary> primaries; };
-    static Registry* registry = new Registry();
+    static auto* registry = new Registry();
     std::lock_guard<std::mutex> lock(registry->mutex);
     for (const auto& primary : registry->primaries)
         if (primary.context == context)
         {
             unsigned int flags = 0; int active = 0;
             const hipError_t result = hipDevicePrimaryCtxGetState(primary.device, &flags, &active);
-            if (result != hipSuccess || !active) return hipErrorInvalidContext;
+            if (result != hipSuccess) return result;
+            if (!active) return hipErrorInvalidContext;
             *generation = primary.generation;
             return hipSuccess;
         }
+    // Cleanup must not register/retain a new context or switch a destroyed one.
+    if (!registerPrimary) return hipErrorInvalidValue;
     hipCtx_t previous = nullptr;
     hipError_t result = hipCtxGetCurrent(&previous);
-    if (result != hipSuccess || previous != context) return hipErrorInvalidContext;
+    if (result != hipSuccess) return result;
+    if (previous != context) return hipErrorInvalidContext;
     hipDevice_t device;
     result = hipCtxGetDevice(&device);
     if (result != hipSuccess) return result;
-    for (const auto& primary : registry->primaries)
-        if (primary.device == static_cast<int>(device)) return hipErrorInvalidContext;
     hipCtx_t primary = nullptr;
-    result = hipDevicePrimaryCtxRetain(&primary, device);
+    result = primaryContext(static_cast<int>(device), primary);
+    // ROCm/DTK retain can change the current context: restore even when ownership
+    // acquisition succeeded but this request names a distinct private context.
     const hipError_t restored = hipCtxSetCurrent(previous);
     if (result != hipSuccess) return result;
     if (restored != hipSuccess) return restored;
-    // This retain lasts for the runtime's process-lifetime caches. A distinct
-    // private context is rejected before loading modules or submitting work.
+    if (context != primary) return hipErrorInvalidContext;
     const auto id = static_cast<unsigned long long>(registry->primaries.size()) + 1;
     registry->primaries.push_back({primary, static_cast<int>(device), id});
-    if (context != primary) return hipErrorInvalidContext;
     *generation = id;
     return hipSuccess;
 }
 
-bool contextAlive(hipCtx_t c, std::uint64_t gen)
+ContextLife contextLife(hipCtx_t c, std::uint64_t gen)
 {
+    if (!c) return ContextLife::Gone;
     unsigned long long id = 0;
-    return c && contextGeneration(c, &id) == hipSuccess && id == gen;
+    const hipError_t result = contextGeneration(c, &id, false);
+    if (result == hipSuccess) return id == gen ? ContextLife::Alive : ContextLife::Gone;
+    if (result == hipErrorInvalidContext || result == hipErrorContextIsDestroyed ||
+        result == hipErrorDeinitialized) return ContextLife::Gone;
+    return ContextLife::Unknown;
+}
+
+PrimaryOwners<hipCtx_t>& primaryOwners()
+{
+    static auto* owners = new PrimaryOwners<hipCtx_t>();
+    return *owners;
+}
+
+hipError_t primaryContext(int device, hipCtx_t& context)
+{
+    return static_cast<hipError_t>(primaryOwners().get(device, context,
+        [](hipCtx_t& out, int ordinal) {
+            hipDevice_t dev;
+            hipError_t result = hipDeviceGet(&dev, ordinal);
+            if (result == hipSuccess) result = hipDevicePrimaryCtxRetain(&out, dev);
+            return static_cast<int>(result);
+        }));
+}
+
+struct CleanupDiagnostics
+{
+    std::atomic<long long> errors{0};
+    std::mutex mutex;
+    std::string last;
+};
+CleanupDiagnostics& cleanupDiagnostics()
+{
+    static auto* diagnostics = new CleanupDiagnostics();
+    return *diagnostics;
+}
+void cleanupError(const std::string& message)
+{
+    auto& d = cleanupDiagnostics();
+    ++d.errors;
+    std::lock_guard<std::mutex> lock(d.mutex);
+    d.last = message;
+    std::fprintf(stderr, "OpenCV Triton resource retained: %s\n", message.c_str());
+}
+Completion eventCompletion(hipEvent_t event)
+{
+    const hipError_t result = hipEventQuery(event);
+    if (result == hipSuccess) return Completion::Complete;
+    if (result == hipErrorNotReady) return Completion::NotReady;
+    cleanupError("hipEventQuery: " + hipErr(result));
+    return Completion::Error;
 }
 
 bool driverReady()
@@ -267,10 +320,30 @@ struct ModuleRes
     hipFunction_t fn = nullptr;
     Manifest man;
     std::string dir;
-    ~ModuleRes()
+    bool cleanup_failed = false;
+    bool had_error = false;
+    bool failed() const { return had_error; }
+    void noteError(const std::string& message)
     {
-        if (mod && contextAlive(ctx, gen)) { CtxGuard g(ctx); (void)hipModuleUnload(mod); }
+        if (!had_error) cleanupError(message);
+        had_error = true;
+    }
+    bool release()
+    {
+        const ContextLife life = contextLife(ctx, gen);
+        if (life == ContextLife::Gone) { ++g_module_frees; return true; }
+        if (life == ContextLife::Unknown) { noteError("module context completion unknown"); return false; }
+        if (cleanup_failed) return false;
+        CtxGuard guard(ctx);
+        if (!guard.valid) { noteError("cannot enter module context"); return false; }
+        if (mod)
+        {
+            const hipError_t result = hipModuleUnload(mod);
+            if (result != hipSuccess) { cleanup_failed = true; noteError("hipModuleUnload outcome unknown; held until context destruction: " + hipErr(result)); return false; }
+            mod = nullptr;
+        }
         ++g_module_frees;
+        return true;
     }
 };
 
@@ -286,35 +359,90 @@ struct TableRes
     hipStream_t upload_stream = nullptr;
     std::map<std::string, std::size_t> offset;
     int xmax = 0, kx = 0, ky = 0;
-    ~TableRes()
+    bool upload_started = false, upload_recorded = false, cleanup_failed = false;
+    bool had_error = false;
+    bool failed() const { return had_error; }
+    void noteError(const std::string& message)
     {
-        if (contextAlive(ctx, gen))
-        {
-            CtxGuard g(ctx);
-            // Normally every launch that read these tables has completed. Only a table whose
-            // launch failed can still have its upload pending: keep allocate -> upload -> free
-            // in order rather than free under it.
-            if (uploaded && hipEventQuery(uploaded) == hipErrorNotReady)
-                (void)hipStreamWaitEvent(nullptr, uploaded, 0);
-            if (uploaded) (void)hipEventDestroy(uploaded);
-            // cuMemFree blocks until the context's in-flight work drains (measured), which would
-            // stall the application's thread on every eviction; the stream-ordered free does not.
-            if (base)
-            {
-                void* p = reinterpret_cast<void*>(base);
-                if (stream_ordered) (void)hipFreeAsync(p, nullptr); else (void)hipFree(p);
-            }
-        }
+        if (!had_error) cleanupError(message);
+        had_error = true;
+    }
+    bool release()
+    {
+        const ContextLife life = contextLife(ctx, gen);
+        if (life == ContextLife::Gone) { ++g_table_frees; return true; }
+        if (life == ContextLife::Unknown) { noteError("table context completion unknown"); return false; }
+        if (cleanup_failed) return false;
+        CtxGuard guard(ctx);
+        if (!guard.valid) { noteError("cannot enter table context"); return false; }
+        if (upload_started && (!uploaded || !upload_recorded))
+            noteError("upload has no valid completion marker; retained until context destruction");
+        const bool released = releaseUpload(false, life,
+            upload_started, uploaded && upload_recorded,
+            [&]() {
+                const Completion done = eventCompletion(uploaded);
+                if (done == Completion::Error) had_error = true;
+                return done;
+            },
+            [&]() {
+                const hipError_t result = hipStreamWaitEvent(nullptr, uploaded, 0);
+                if (result != hipSuccess) noteError("hipStreamWaitEvent during retirement: " + hipErr(result));
+            },
+            [&]() {
+                if (!base) return true;
+                const hipError_t result = stream_ordered ? hipFreeAsync(reinterpret_cast<void*>(base), nullptr) : hipFree(reinterpret_cast<void*>(base));
+                if (result != hipSuccess) { cleanup_failed = true; noteError("table free outcome unknown; held until context destruction: " + hipErr(result)); return false; }
+                base = 0;
+                return true;
+            },
+            [&]() {
+                if (!uploaded) return true;
+                const hipError_t result = hipEventDestroy(uploaded);
+                if (result != hipSuccess) { cleanup_failed = true; noteError("hipEventDestroy outcome unknown; held until context destruction: " + hipErr(result)); return false; }
+                uploaded = nullptr;
+                return true;
+            });
+        if (!released) return false;
         ++g_table_frees;
+        return true;
     }
     std::uintptr_t at(const char* k) const { return base + offset.at(k); }
 };
+
+thread_local bool recordingCapture = false;
+struct CaptureScope
+{
+    bool previous;
+    explicit CaptureScope(bool capture) : previous(recordingCapture) { recordingCapture = capture; }
+    ~CaptureScope() { recordingCapture = previous; }
+};
+
+template<class T>
+Retirement<T>& retired()
+{
+    static auto* queue = new Retirement<T>();
+    return *queue;
+}
+template<class T>
+std::shared_ptr<T> resource()
+{
+    return std::shared_ptr<T>(new T(), [](T* value) {
+        if (recordingCapture) retired<T>().hold(value);
+        else retired<T>().dispose(value);
+    });
+}
+void retryRetired(bool skip)
+{
+    retired<TableRes>().retry(skip);
+    retired<ModuleRes>().retry(skip);
+}
 
 struct Pending
 {
     hipCtx_t ctx;
     std::uint64_t gen;
     hipEvent_t done;
+    bool query_error_reported = false;
     std::vector<std::shared_ptr<void>> keep;   // what this launch reads: freed only after `done`
 };
 
@@ -400,6 +528,7 @@ struct State
     Lru<ModuleRes> modules{64};
     Lru<TableRes> tables{256};
     std::list<Pending> pending;
+    std::list<Pending> failed_events; // completion proven; never retry an uncertain destroy
     std::vector<CapturePin> capture_pins;   // held until releaseCapturePins(), see there
     detail::RuntimeStats st;
     std::map<std::string, std::shared_ptr<std::mutex>> compile_mu;
@@ -425,7 +554,7 @@ void countEvicted(const std::vector<std::shared_ptr<V>>& ev, long long& counter,
     }
 }
 
-// True when `stream` is inside a capture region. cuStreamIsCapturing is legal there, unlike
+// True when `stream` is inside a capture region. hipStreamIsCapturing is legal there, unlike
 // hipEventQuery: querying any event while capturing invalidates the whole capture
 // (hipErrorStreamCaptureUnsupported).
 bool capturing(hipStream_t stream)
@@ -502,10 +631,15 @@ Status finishLaunch(State& s, hipCtx_t ctx, std::uint64_t gen, hipStream_t strea
     {
         // Cannot observe completion: keep the resources for the life of the process rather than
         // risk freeing what the launch may still read.
-        static std::vector<std::shared_ptr<void>> leaked;
-        leaked.push_back(mod);
-        if (tab) leaked.push_back(tab);
-        if (tab2) leaked.push_back(tab2);
+        if (done) (void)hipEventDestroy(done);
+        Pending hold;
+        hold.ctx = ctx; hold.gen = gen; hold.done = nullptr;
+        hold.keep.push_back(mod);
+        if (tab) hold.keep.push_back(tab);
+        if (tab2) hold.keep.push_back(tab2);
+        s.pending.push_back(std::move(hold));
+        s.st.pending = static_cast<long long>(s.pending.size());
+        cleanupError("completion marker failed; resources held until context destruction: " + hipErr(r));
         Status e = error(Reason::LaunchFailed, "completion event: " + hipErr(r));
         e.submitted = true;
         return e;
@@ -529,33 +663,69 @@ Status finishLaunch(State& s, hipCtx_t ctx, std::uint64_t gen, hipStream_t strea
 // `skipQuery` is set when the caller is capturing: reaping is a bookkeeping optimisation, and
 // doing it must never be allowed to break a capture. Pending entries simply stay pending until
 // a later, non-capturing call.
-void reapLocked(State& s, std::vector<std::shared_ptr<void>>& released, bool skipQuery = false)
+Status reapLocked(State& s, std::vector<std::shared_ptr<void>>& released, bool skipQuery = false)
 {
+    Status result; result.code = Code::Prepared;
+    if (skipQuery) return result; // No query of any event/context while capturing.
+    for (auto event = s.failed_events.begin(); event != s.failed_events.end();)
+    {
+        if (contextLife(event->ctx, event->gen) == ContextLife::Gone)
+            event = s.failed_events.erase(event); // context owns the native event; no stale API call
+        else ++event;
+    }
     for (auto it = s.pending.begin(); it != s.pending.end();)
     {
-        if (contextAlive(it->ctx, it->gen))
+        const ContextLife life = contextLife(it->ctx, it->gen);
+        const Reclaim decision = completionDecision(false, life, [&]() {
+            if (!it->done) return Completion::Error;
+            CtxGuard guard(it->ctx);
+            return guard.valid ? eventCompletion(it->done) : Completion::Error;
+        });
+        if (decision != Reclaim::Release)
         {
-            CtxGuard g(it->ctx);
-            if (skipQuery || hipEventQuery(it->done) == hipErrorNotReady) { ++it; continue; }
-            (void)hipEventDestroy(it->done);
+            if (decision == Reclaim::Error)
+            {
+                result = error(Reason::LaunchFailed, "completion unknown; pending resources retained (retry reapCompleted)");
+                if (!it->query_error_reported) { cleanupError(result.message); it->query_error_reported = true; }
+            }
+            ++it;
+            continue;
+        }
+        if (life == ContextLife::Alive && it->done)
+        {
+            CtxGuard guard(it->ctx);
+            if (!guard.valid) { result = error(Reason::ContextMismatch, "cannot enter completed event context"); ++it; continue; }
+            const hipError_t destroyed = hipEventDestroy(it->done);
+            if (destroyed != hipSuccess)
+            {
+                Pending failed;
+                failed.ctx = it->ctx; failed.gen = it->gen; failed.done = it->done;
+                s.failed_events.push_back(std::move(failed));
+                result = error(Reason::LaunchFailed, "completed event destruction failed; handle retained without retry: " + hipErr(destroyed));
+                cleanupError(result.message);
+                // GPU completion is proven: module/table leases can be released safely.
+                // Only the uncertain native event handle stays until context destruction.
+            }
         }
         released.insert(released.end(), it->keep.begin(), it->keep.end());
-        it = s.pending.erase(it);             // complete, or its context is gone: release
+        it = s.pending.erase(it);
     }
     s.st.pending = static_cast<long long>(s.pending.size());
+    return result;
 }
 
 Status currentContext(int device, hipCtx_t& ctx, std::uint64_t& gen)
 {
     if (!driverReady()) return error(Reason::ToolchainUnavailable, "hipInit failed");
     ctx = nullptr;
-    (void)hipCtxGetCurrent(&ctx);
+    hipError_t current = hipCtxGetCurrent(&ctx);
+    if (current != hipSuccess) return error(Reason::ContextMismatch, "hipCtxGetCurrent: " + hipErr(current));
     if (!ctx)
     {
-        hipDevice_t d;
-        hipError_t r = hipDeviceGet(&d, device);
-        if (r == hipSuccess) r = hipDevicePrimaryCtxRetain(&ctx, d);
+        hipError_t r = primaryContext(device, ctx);
         if (r == hipSuccess) r = hipCtxSetCurrent(ctx);
+        // The registry owns the single process-lifetime retain, including when SetCurrent
+        // fails. Repeated/short-lived threads borrow it, never retain a thread-local copy.
         if (r != hipSuccess) return error(Reason::ContextMismatch, "no context for device " + std::to_string(device) + ": " + hipErr(r));
     }
     hipDevice_t cd;
@@ -613,7 +783,7 @@ std::shared_ptr<ModuleRes> moduleFor(const KernelKey& key, hipCtx_t ctx, std::ui
         st = error(Reason::ManifestInvalid, "binary changed after verification");
         return nullptr;
     }
-    auto m = std::make_shared<ModuleRes>();
+    auto m = resource<ModuleRes>();
     m->ctx = ctx;
     m->gen = gen;
     m->man = man;
@@ -726,11 +896,12 @@ std::shared_ptr<TableRes> tablesFor(const Normalized& n, hipCtx_t ctx, std::uint
         }
         poison = s.poison;
     }
-    auto t = std::make_shared<TableRes>();
+    auto t = resource<TableRes>();
     t->ctx = ctx;
     t->gen = gen;
     buildTables(n, *t);
     t->bytes = t->host.size();
+    t->upload_stream = stream;
     hipDevice_t dev;
     int pools = 0;
     if (hipCtxGetDevice(&dev) == hipSuccess)
@@ -740,9 +911,9 @@ std::shared_ptr<TableRes> tablesFor(const Normalized& n, hipCtx_t ctx, std::uint
     hipError_t r = t->stream_ordered ? hipMallocAsync(&dptr, t->bytes, stream) : hipMalloc(&dptr, t->bytes);
     t->base = reinterpret_cast<std::uintptr_t>(dptr);
     if (r == hipSuccess && poison) r = hipMemsetD8Async(dptr, 0xFF, t->bytes, stream);
-    if (r == hipSuccess) r = hipMemcpyHtoDAsync(dptr, t->host.data(), t->bytes, stream);
+    if (r == hipSuccess) { t->upload_started = true; r = hipMemcpyHtoDAsync(dptr, t->host.data(), t->bytes, stream); }
     if (r == hipSuccess) r = hipEventCreateWithFlags(&t->uploaded, hipEventDisableTiming);
-    if (r == hipSuccess) r = hipEventRecord(t->uploaded, stream);
+    if (r == hipSuccess) { r = hipEventRecord(t->uploaded, stream); t->upload_recorded = r == hipSuccess; }
     if (r != hipSuccess) { st = error(Reason::DeviceAlloc, "table upload: " + hipErr(r)); return nullptr; }
     t->upload_stream = stream;
     std::vector<std::shared_ptr<TableRes>> ev;
@@ -814,7 +985,7 @@ std::shared_ptr<TableRes> cvtTablesFor(const cv_triton_color::HsvTables& hv, int
         }
         poison = s.poison;
     }
-    auto t = std::make_shared<TableRes>();
+    auto t = resource<TableRes>();
     t->ctx = ctx;
     t->gen = gen;
     pack(t->host, t->offset, "sdiv", hv.sdiv.data(), hv.sdiv.size() * sizeof(int));
@@ -828,6 +999,7 @@ std::shared_ptr<TableRes> cvtTablesFor(const cv_triton_color::HsvTables& hv, int
     pack(t->host, t->offset, "t16", &dummy, sizeof(int));
     pack(t->host, t->offset, "t64", &dummy, sizeof(int));
     t->bytes = t->host.size();
+    t->upload_stream = stream;
     hipDevice_t dev;
     int pools = 0;
     if (hipCtxGetDevice(&dev) == hipSuccess)
@@ -837,9 +1009,9 @@ std::shared_ptr<TableRes> cvtTablesFor(const cv_triton_color::HsvTables& hv, int
     hipError_t r = t->stream_ordered ? hipMallocAsync(&dptr, t->bytes, stream) : hipMalloc(&dptr, t->bytes);
     t->base = reinterpret_cast<std::uintptr_t>(dptr);
     if (r == hipSuccess && poison) r = hipMemsetD8Async(dptr, 0xFF, t->bytes, stream);
-    if (r == hipSuccess) r = hipMemcpyHtoDAsync(dptr, t->host.data(), t->bytes, stream);
+    if (r == hipSuccess) { t->upload_started = true; r = hipMemcpyHtoDAsync(dptr, t->host.data(), t->bytes, stream); }
     if (r == hipSuccess) r = hipEventCreateWithFlags(&t->uploaded, hipEventDisableTiming);
-    if (r == hipSuccess) r = hipEventRecord(t->uploaded, stream);
+    if (r == hipSuccess) { r = hipEventRecord(t->uploaded, stream); t->upload_recorded = r == hipSuccess; }
     if (r != hipSuccess) { st = error(Reason::DeviceAlloc, "cvtColor table upload: " + hipErr(r)); return nullptr; }
     t->upload_stream = stream;
     std::vector<std::shared_ptr<TableRes>> ev;
@@ -898,7 +1070,7 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, hipCtx_t ctx, std::uint64_t 
     }
 
     const cv_triton_color::LabLuvTables& tab = cv_triton_color::labluv_tables();
-    auto t = std::make_shared<TableRes>();
+    auto t = resource<TableRes>();
     t->ctx = ctx;
     t->gen = gen;
     // t32: fixed-layout concat, in the order the kernel's offsets name. `pack` aligns each blob
@@ -929,6 +1101,7 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, hipCtx_t ctx, std::uint64_t 
         pack(t->host, t->offset, "t16", &one, sizeof(short));
     }
     t->bytes = t->host.size();
+    t->upload_stream = stream;
 
     hipDevice_t dev;
     int pools = 0;
@@ -939,9 +1112,9 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, hipCtx_t ctx, std::uint64_t 
     hipError_t r = t->stream_ordered ? hipMallocAsync(&dptr, t->bytes, stream) : hipMalloc(&dptr, t->bytes);
     t->base = reinterpret_cast<std::uintptr_t>(dptr);
     if (r == hipSuccess && poison) r = hipMemsetD8Async(dptr, 0xFF, t->bytes, stream);
-    if (r == hipSuccess) r = hipMemcpyHtoDAsync(dptr, t->host.data(), t->bytes, stream);
+    if (r == hipSuccess) { t->upload_started = true; r = hipMemcpyHtoDAsync(dptr, t->host.data(), t->bytes, stream); }
     if (r == hipSuccess) r = hipEventCreateWithFlags(&t->uploaded, hipEventDisableTiming);
-    if (r == hipSuccess) r = hipEventRecord(t->uploaded, stream);
+    if (r == hipSuccess) { r = hipEventRecord(t->uploaded, stream); t->upload_recorded = r == hipSuccess; }
     if (r != hipSuccess) { st = error(Reason::DeviceAlloc, "cvtColor Lab/Luv table upload: " + hipErr(r)); return nullptr; }
     t->upload_stream = stream;
     std::vector<std::shared_ptr<TableRes>> ev;
@@ -996,10 +1169,17 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
     const hipStream_t stream = reinterpret_cast<hipStream_t>(ex.stream);
     State& s = S();
     std::vector<std::shared_ptr<void>> released;   // destroyed at return, outside the lock
+    const bool isCapturing = capturing(stream);
+    CaptureScope captureScope(isCapturing);
+    retryRetired(isCapturing);
+    if (cleanupDiagnostics().errors.load() != 0 &&
+        (retired<TableRes>().hasFailure() || retired<ModuleRes>().hasFailure()))
+        return error(Reason::LaunchFailed, "prior cleanup failed; resources retained (retry reapCompleted or restart after persistent driver errors)");
     {
         std::lock_guard<std::mutex> lk(s.mu);
-        reapLocked(s, released, capturing(stream));
+        st = reapLocked(s, released, isCapturing);
     }
+    if (!st.ok()) return st;
     if (n.route.kind == ref::ROUTE_COPY)   // cv::resize: src.copyTo(dst). A copy, not a Triton launch.
     {
         const hipError_t r = hipMemcpy2DAsync(reinterpret_cast<void*>(req.dst.ptr), req.dst.step,
@@ -1110,10 +1290,17 @@ Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std:
     const hipStream_t stream = reinterpret_cast<hipStream_t>(ex.stream);
     State& s = S();
     std::vector<std::shared_ptr<void>> released;
+    const bool isCapturing = capturing(stream);
+    CaptureScope captureScope(isCapturing);
+    retryRetired(isCapturing);
+    if (cleanupDiagnostics().errors.load() != 0 &&
+        (retired<TableRes>().hasFailure() || retired<ModuleRes>().hasFailure()))
+        return error(Reason::LaunchFailed, "prior cleanup failed; resources retained (retry reapCompleted or restart after persistent driver errors)");
     {
         std::lock_guard<std::mutex> lk(s.mu);
-        reapLocked(s, released, capturing(stream));
+        st = reapLocked(s, released, isCapturing);
     }
+    if (!st.ok()) return st;
 
     DevInfo dev;
     {
@@ -1249,10 +1436,17 @@ Status warpAffine(const cv_triton_warp::Request& req, const ExecContext& ex)
     const hipStream_t stream = reinterpret_cast<hipStream_t>(ex.stream);
     State& s = S();
     std::vector<std::shared_ptr<void>> released;
+    const bool isCapturing = capturing(stream);
+    CaptureScope captureScope(isCapturing);
+    retryRetired(isCapturing);
+    if (cleanupDiagnostics().errors.load() != 0 &&
+        (retired<TableRes>().hasFailure() || retired<ModuleRes>().hasFailure()))
+        return error(Reason::LaunchFailed, "prior cleanup failed; resources retained (retry reapCompleted or restart after persistent driver errors)");
     {
         std::lock_guard<std::mutex> lk(s.mu);
-        reapLocked(s, released, capturing(stream));
+        st = reapLocked(s, released, isCapturing);
     }
+    if (!st.ok()) return st;
 
     DevInfo dev;
     {
@@ -1360,6 +1554,9 @@ RuntimeStats runtimeStats()
     State& s = S();
     std::lock_guard<std::mutex> lk(s.mu);
     RuntimeStats r = s.st;
+    r.cleanup_errors = cleanupDiagnostics().errors.load();
+    r.retired_resources = static_cast<long long>(retired<TableRes>().size() + retired<ModuleRes>().size() + s.failed_events.size());
+    { std::lock_guard<std::mutex> diagnosticsLock(cleanupDiagnostics().mutex); r.last_cleanup_error = cleanupDiagnostics().last; }
     r.module_frees = g_module_frees.load();
     r.table_frees = g_table_frees.load();
     return r;
@@ -1407,8 +1604,13 @@ void reapCompleted()
 {
     State& s = S();
     std::vector<std::shared_ptr<void>> released;
-    std::lock_guard<std::mutex> lk(s.mu);
-    reapLocked(s, released);
+    retryRetired(false);
+    Status status;
+    { std::lock_guard<std::mutex> lk(s.mu); status = reapLocked(s, released); }
+    if (!status.ok()) CV_Error(Error::GpuApiCallError, status.message);
+    if (cleanupDiagnostics().errors.load() != 0 &&
+        (retired<TableRes>().hasFailure() || retired<ModuleRes>().hasFailure()))
+        CV_Error(Error::GpuApiCallError, "cleanup outcome remains unknown; resources retained until proven safe or process exit");
 }
 
 void setPoisonNewTables(bool on)

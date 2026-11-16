@@ -85,6 +85,8 @@ struct RuntimeStats
     long long deferred = 0;            //!< evictions of a resource still held by an in-flight launch
     long long cross_stream_waits = 0;  //!< launches that waited on another stream's table upload
     long long launches = 0, copies = 0;
+    long long cleanup_errors = 0, retired_resources = 0;
+    std::string last_cleanup_error;
     long long pending = 0;             //!< launches whose completion has not been observed yet
     long long capture_launches = 0;    //!< launches recorded into a capturing stream
     long long capture_pin_holds = 0;   //!< resources currently pinned for captured graphs

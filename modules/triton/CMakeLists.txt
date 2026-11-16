@@ -122,7 +122,7 @@ else()
   set(_triton_kernel_files resize_cpu.py cvtcolor_cpu.py warpaffine_cpu.py)
 endif()
 # Install the public umbrella and caller-owned device-buffer headers below.
-# src/core.hpp remains private; no owning HIP image or stream API is installed.
+# src/core.hpp is private implementation support.
 file(GLOB _triton_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton.hpp"
                        "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/triton/device.hpp")
 file(GLOB _triton_int_hdrs "${CMAKE_CURRENT_LIST_DIR}/src/*.hpp" "${CMAKE_CURRENT_LIST_DIR}/src/runtime/*.hpp")
@@ -289,7 +289,7 @@ if(_triton_backend STREQUAL "cuda")
   endforeach()
 else()
   # Standard common accuracy/perf sources use the HIP implementation of the
-  # private validation boundary. Legacy driver-specific checks remain separate.
+  # private validation boundary. Driver-specific checks use separate targets.
   ocv_add_accuracy_tests(FILES "Src"
       "${CMAKE_CURRENT_LIST_DIR}/test/test_main.cpp"
       "${CMAKE_CURRENT_LIST_DIR}/test/test_common.cpp"
@@ -377,8 +377,8 @@ else()
       install(TARGETS ${_t} RUNTIME DESTINATION "${OPENCV_TEST_INSTALL_PATH}" COMPONENT tests)
     endif()
   endif()
-  # Internal graph metric only; never replaces ordinary-call or paired primary
-  # qualification. No Torch dependency, no installed public graph owner.
+  # Internal graph replay timing, separate from ordinary-call performance.
+  # The helper has no Torch dependency.
   option(TRITON_BUILD_HIP_GRAPH_BENCH "Build internal warmed production HIP graph benchmark" OFF)
   if(TRITON_BUILD_HIP_GRAPH_BENCH AND BUILD_PERF_TESTS
       AND (NOT DEFINED OPENCV_BUILD_PERF_TEST_MODULES_LIST

@@ -182,9 +182,8 @@ const CodeSpec TABLE[] = {
     // is a constexpr here too: `blue` carries Bayer2RGB_'s Blue (-1 for BG/GB, +1 for RG/GR) and
     // `swg` its Start_with_green (1 for GB/GR, 0 for BG/RG).
     //
-    // On the "equivalent to RGGB" doc comment (imgproc.hpp:767): the name reads inverted against
-    // the pattern in the comment, and that is historical, not a bug to correct. The two fields
-    // below are what the invoker is actually handed; nothing here re-derives them from the name.
+    // Bayer enum names and documented pattern names use different conventions. The fields
+    // below follow the CPU invoker arguments rather than deriving phase from the enum name.
     //
     // BayerBG2BGR at dcn=4 is a distinct CPU call path (_dst created with 4 channels and the
     // invoker's `dcn == 4` arms) and so is a distinct row, not a rerun of the 3-channel one.

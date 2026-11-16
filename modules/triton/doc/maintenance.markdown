@@ -48,7 +48,7 @@ lifecycle tests; HIP also provides `opencv_test_triton_hip`. Use the standard
 OpenCV list/filter/XML options and review failures and skipped tests.
 
 Accuracy tests list private reference/protocol sources explicitly in CMake and
-compile them as separate translation units. CUDA admission controls also compile
+compile them as separate translation units. CUDA input-validation tests also compile
 the private colour/warp plans into the test executable, without exporting those
 functions from the module. Separate compilation is not an independent algorithmic
 oracle: numerical independence still comes from the selected references and
@@ -77,3 +77,41 @@ Static installations use the configured resource install directory when the
 library-relative path is unavailable. Set `OPENCV_TRITON_RESOURCES` when moving
 a static SDK to another prefix. Shared installations locate resources relative
 to the library; both forms support the explicit override.
+
+Asynchronous cleanup and context ownership
+-----------------------------------------
+
+Completion queries distinguish success, not-ready and error. Capture submission
+skips event reclamation entirely. A query error is observable through a failed
+runtime submission/reap, a diagnostic and private cleanup counters; the resource
+is not released on an unknown completion status. Last-owner cleanup failures
+retain the entire module/table owner, including upload host bytes, in a private
+process-lifetime retirement queue. Noncapturing submissions and explicit noncapturing reaps
+retry completion checks without synchronizing the normal path. An unknown outcome
+of free/unload/event-destruction is not retried as the same irreversible call; that
+owner remains held until its context is known destroyed. A successful device-side wait
+alone does not release upload host memory. A failed/unrecorded completion marker
+is retained until context destruction can be established; persistent driver
+errors can therefore retain resources until process exit. Counters/diagnostics
+must be inspected rather than treating this as successful cleanup. Known-destroyed
+contexts release host ownership without querying old events or switching to them.
+Unknown context errors retain ownership rather than guessing destruction.
+While resources with failed cleanup remain held, later submissions and explicit
+cleanup calls report an error instead of silently accumulating more resources; recovery requires proven
+completion/context destruction, or process restart for persistent driver failure.
+
+A runtime-created primary context has one deliberate process-lifetime retain per
+device. Host threads borrow that owner, including after SetCurrent failure; they
+do not add retains per invocation/thread. HIP context identification through `hipCtxGetId`, when available, and the
+fallback that retains a primary context share the same resource owner. The fallback registry adds identity metadata, not
+another retain. This keeps module/table caches valid. The module deliberately does
+not release that owner during static teardown after the driver may be gone.
+Arbitrary primary-context resets and private contexts are unsupported by this fallback.
+
+If destruction of a completion event fails AFTER completion was proven, the
+retained references to the completed operation's modules and tables may be released. The call still reports the failure;
+its event handle/context identity are retained as failed metadata without retrying
+that irreversible destroy. Metadata is dropped only when context destruction is
+known, or at process exit. This completed-event case does not imply unfinished GPU
+work and does not block later unrelated calls; the `RuntimeStats::retired_resources` counter includes
+those retained event handles. Capture skips even this metadata reaping.

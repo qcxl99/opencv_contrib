@@ -415,11 +415,9 @@ TEST(Triton_Runtime, ArtifactIntegrity)
 
 // A call must be capturable, and a replayed graph must compute the same answer as a direct call.
 //
-// This is a regression test. The runtime used to call cuEventQuery() on every completed launch
-// while reaping; querying ANY event during capture invalidates the whole capture
-// (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED), so every launch failed inside a capture region --
-// for resize as well as cvtColor. The fix skips the query and the completion event while the
-// caller's stream is capturing, and this test would catch a reintroduction.
+// Event queries during capture can invalidate the capture
+// (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED). Reaping must avoid event queries and
+// completion-event recording while the caller's stream is capturing.
 //
 // The supported pattern is the one used here: warm on the stream you will capture on, so the
 // tables are already resident. Capturing on a stream that never saw the table upload still fails
@@ -427,7 +425,7 @@ TEST(Triton_Runtime, ArtifactIntegrity)
 // asserted here.
 // Capture, then evict everything, then replay: the graph must still read live memory.
 //
-// This is the regression that matters most. A graph recorded under capture refers to the module
+// A graph recorded under capture refers to the module
 // binary and the table buffers by handle, and it is launched later -- possibly after the caches
 // have evicted both. The runtime therefore pins them at capture time (finishLaunch) and releases
 // them only on releaseCapturePins(). The scenario below forces the eviction explicitly:

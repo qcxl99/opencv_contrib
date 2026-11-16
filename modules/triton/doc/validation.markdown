@@ -52,7 +52,7 @@ CUDA_VISIBLE_DEVICES= /path/to/build/bin/opencv_test_triton \
   --gtest_output=xml:/path/to/new-results/guard.xml
 ```
 
-The bytewise helper is shared by legacy CUDA ROI checks and common CUDA/HIP
+The bytewise helper is shared by CUDA ROI checks and common CUDA/HIP
 fixtures. An expected guard image is constructed at the actual destination type;
 16U data is never interpreted as float.
 
@@ -96,7 +96,7 @@ builds `opencv_test_triton_hip`. CUDA uses three GpuMat examples; HIP uses
 installation, not just a sample that happens to link against an older library.
 
 In a new result directory, use native discovery/filter/XML instead of hardcoded
-historical counts. For example, with `BUILD_ENABLED` and `RESULTS` set explicitly:
+stored counts. For example, with `BUILD_ENABLED` and `RESULTS` set explicitly:
 
 ```sh
 mkdir -p "$RESULTS"
@@ -106,7 +106,8 @@ mkdir -p "$RESULTS"
 ```
 
 Run perf with the task's selected scope and OpenCV options from a fresh result
-working directory. Perf smoke/execution is not performance qualification.
+working directory. A successful perf run alone does not demonstrate correctness
+or attainment of an application's performance requirements.
 CUDA Python tests exercise the three real GpuMat wrappers. HIP Python tests
 exercise backend queries and the explicitly unsupported GpuMat operations;
 no HIP Python device-buffer wrapper is advertised. Separate positive, refusal,
