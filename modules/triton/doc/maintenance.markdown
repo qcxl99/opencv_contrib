@@ -11,6 +11,10 @@ from the CPU output evaluator under `test/`; tests also compare against the
 linked OpenCV CPU implementations where documented. Keep algorithmic source
 attribution and license notices with the relevant implementation.
 
+Describe current behavior in guides and explain invariants in code comments.
+Keep development logs, run reports and build artifacts outside the source tree.
+Generated-source notices and integrity hashes remain with their generated files.
+
 For a first source read, follow one call through these layers:
 
 | Layer | Start here | Responsibility |
@@ -83,8 +87,13 @@ empty cache without a toolchain must fail clearly. Cache resources include
 kernel sources and helper scripts, so changes to them require corresponding
 compilation checks even when the C++ library is unchanged.
 
-See @ref tutorial_triton_h20_first_use for CUDA commands and
-@ref tutorial_triton_bw1000_first_use for HIP commands.
+Platform commands are separate: @ref tutorial_triton_h20_first_use for CUDA,
+@ref tutorial_triton_bw1000_first_use for HIP/DTK, and
+@ref tutorial_triton_w7900d_first_use for HIP/ROCm. HIP target identities include
+both architecture and warp size (BW1000: gfx936/wave64; W7900D: gfx1100/wave32).
+The HIP launch defaults are shared unless a guard selects a specialization;
+they are not separate per-device tuning or performance guarantees. Validate each
+platform's compiler, linked libraries and generated artifacts independently.
 
 Static installations use the configured resource install directory when the
 library-relative path is unavailable. Set `OPENCV_TRITON_RESOURCES` when moving

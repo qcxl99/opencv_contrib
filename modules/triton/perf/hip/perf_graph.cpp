@@ -210,8 +210,8 @@ static std::string nodeInventory(hipGraph_t graph,int expectedCalls,const std::s
         } else if(type==hipGraphNodeTypeMemcpy)++copies;
         else if(type==hipGraphNodeTypeMemset)++memsets;
     }
-    // One production call may contain more than one kernel. Frozen requests here
-    // currently lower to one; require explicit work coverage instead of an empty graph.
+    // Require kernel work for every recorded call and keep destination fills outside capture.
+    // A call may contain multiple kernels; node counts are reported for verification.
     require(kernels>=static_cast<size_t>(expectedCalls) && memsets==0,"missing kernel work or poison accidentally captured");
     (void)op;
     std::ostringstream o;o<<"{\"nodes\":"<<count<<",\"kernel_nodes\":"<<kernels<<",\"memcpy_nodes\":"<<copies<<",\"memset_nodes\":"<<memsets<<",\"launches\":[";
@@ -350,6 +350,7 @@ int main(int argc, char** argv)
         const Binding binding{src.image, dst.image, parameterHash};
         const int refusals = binding.negativeControls();
         std::vector<double> perCall, graphTotal;
+        std::vector<double> wallBlocks, eventBlocks;
         double captureMs = 0, instantiateMs = 0, ordinaryMs = 0, ordinaryWall = 0;
         std::string inventory;
         long long maxPins = 0;
@@ -452,21 +453,29 @@ int main(int argc, char** argv)
         // Ordinary production-call cost remains separate, with JIT re-warmed after eviction.
         op.call(src, dst, r.stream);
         checked(hipStreamSynchronize(r.stream));
-        auto wallStart = Clock::now();
-        checked(hipEventRecord(r.start, r.stream));
-        for (int i = 0; i < 250; ++i)
-            op.call(src, dst, r.stream);
-        checked(hipEventRecord(r.stop, r.stream));
-        checked(hipEventSynchronize(r.stop));
-        ordinaryWall = ms(wallStart) / 250;
-        float elapsed = 0;
-        checked(hipEventElapsedTime(&elapsed, r.start, r.stop));
-        ordinaryMs = elapsed / 250;
+        for (int sample = 0; sample < 7; ++sample)
+        {
+            auto wallStart = Clock::now();
+            checked(hipEventRecord(r.start, r.stream));
+            for (int i = 0; i < 250; ++i)
+                op.call(src, dst, r.stream);
+            checked(hipEventRecord(r.stop, r.stream));
+            checked(hipEventSynchronize(r.stop));
+            wallBlocks.push_back(ms(wallStart) / 250);
+            float elapsed = 0;
+            checked(hipEventElapsedTime(&elapsed, r.start, r.stop));
+            eventBlocks.push_back(elapsed / 250);
+        }
+        auto sortedWall = wallBlocks, sortedEvent = eventBlocks;
+        std::sort(sortedWall.begin(), sortedWall.end());
+        std::sort(sortedEvent.begin(), sortedEvent.end());
+        ordinaryWall = sortedWall[3];
+        ordinaryMs = sortedEvent[3];
         worst = std::max(worst, op.verify(dst.downloadAndCheck(r.stream), changedRef, changed));
         D::reapCompleted();
         require(hashFile(manifest) == J::sha256_hex(manifestRaw) &&
                     hashFile(binary) == text(*bin, "sha256"),
-                "artifact changed during experiment");
+                "artifact changed during benchmark");
         r.finish();
         std::vector<double> sorted = perCall;
         std::sort(sorted.begin(), sorted.end());
@@ -476,7 +485,7 @@ int main(int argc, char** argv)
             size_t low = static_cast<size_t>(pos), high = std::min(low + 1, sorted.size() - 1);
             return sorted[low] * (high - pos) + sorted[high] * (pos - low);
         };
-        // Existing graph_replay metric spelling; no new qualification/report schema.
+        // Retain raw timing samples alongside the per-call summary.
         std::cout.precision(17);
         std::cout
             << "{\"case_id\":" << J::json_quote(text(c, "id"))
@@ -490,6 +499,12 @@ int main(int argc, char** argv)
         std::cout << "],\"raw_per_call_ms\":[";
         for (size_t i = 0; i < perCall.size(); ++i)
             std::cout << (i ? "," : "") << perCall[i];
+        std::cout << "],\"ordinary_wall_blocks_ms\":[";
+        for (size_t i = 0; i < wallBlocks.size(); ++i)
+            std::cout << (i ? "," : "") << wallBlocks[i];
+        std::cout << "],\"ordinary_event_blocks_ms\":[";
+        for (size_t i = 0; i < eventBlocks.size(); ++i)
+            std::cout << (i ? "," : "") << eventBlocks[i];
         std::cout << "],\"first_compile_call_wall_ms\":" << firstMs
                   << ",\"warmup20_wall_ms\":" << warmMs << ",\"capture_wall_ms\":" << captureMs
                   << ",\"instantiate_wall_ms\":" << instantiateMs

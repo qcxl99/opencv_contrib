@@ -2,15 +2,15 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// Runtime JIT, HIP driver side (Hygon BW1000 / gfx936, DTK). See runtime.hpp for execution and ownership rules.
+// Runtime JIT for the HIP driver API (ROCm/DTK). See runtime.hpp for execution and ownership rules.
 //
 // GENERATED from cuda_runtime.cpp by tools/port_hip_runtime.py -- do not edit; edit the CUDA
 // file and re-run the port. Exactly one of the two is compiled into a build (CMakeLists.txt).
 //
 // What differs from the CUDA file, and why -- everything else is the same code:
-//   * Target: backend "hip"; arch = the gfx number parsed from gcnArchName ("gfx936:sramecc+:..."
-//     -> 936; an arch with a letter suffix such as gfx90a has no integer form in the key and is
-//     refused); warp_size from the device (64 on gfx936, not 32).
+//   * Target: backend "hip", numeric gfx architecture and warp size queried from the device.
+//     BW1000 uses gfx936/wave64; W7900D uses gfx1100/wave32. Letter-suffix targets such as
+//     gfx90a cannot be represented by this key and are rejected.
 //   * Kernels: kernels/<op>_cpu_hip.py where the CUDA source calls a libdevice primitive
 //     the HIP compiler lacks; tools/make_kernels_cpu_hip.py derives resize, cvtColor
 //     and warpAffine sources and rejects stale copies.
@@ -20,8 +20,8 @@
 //     visibility variables as CUDA_VISIBLE_DEVICES= does for cuda.
 //   * Dynamic shared memory above the 64 KiB LDS is refused rather than requested through an
 //     attribute call, which HIP defines for host function pointers, not module functions.
-//   * The hipCtx* family is marked deprecated in HIP. It is what DTK offers for explicit context
-//     handling and what this runtime's context identity needs; the warning is silenced here only.
+//   * Context identity uses DTK's hipCtxGetId when available, otherwise retained primary
+//     contexts on ROCm. Deprecation warnings for the required hipCtx* API are local to this file.
 #include "../precomp.hpp"
 
 #include "runtime.hpp"
@@ -120,8 +120,8 @@ const Config& config()
         k.helper = r + "/tools/compile_helper.py";
         if (!hasResources(r))
             k.error = "kernels/resize_cpu_hip.py and tools/compile_helper.py not found under " + r;
-        // cvtColor is optional: a tree that predates it still runs resize, and asking for a
-        // cvtColor code there reports the missing source rather than failing the whole module.
+        // Resolve per-operation resources independently; a missing file is reported
+        // when that operation is requested.
         k.cvt_kernels = r + "/kernels/cvtcolor_cpu_hip.py";
         if (!isFile(k.cvt_kernels))
             k.cvt_error = k.cvt_kernels + " not found";
@@ -492,7 +492,7 @@ struct CapturePin
 struct DevInfo
 {
     bool ok = false;
-    int arch = 0;                // 936 for gfx936
+    int arch = 0;                // numeric gfx suffix, e.g. 936 or 1100
     int warp = 64;
     std::string arch_name, why;
 };
@@ -580,9 +580,8 @@ bool capturing(hipStream_t stream)
 //    replay after an eviction would reference an unloaded module or a freed table buffer.
 //
 // Pins are released only by releaseCapturePins(). CUDA gives no notification when the caller
-// destroys a graph, so the module cannot know; a caller that keeps graphs indefinitely keeps
-// the pin, which is bounded by the number of distinct (code, size-class) keys it captured and is
-// a few kilobytes each.
+// destroys a graph, so the caller releases references after graph use. Retained storage
+// includes the compiled modules and device tables for every distinct captured key.
 // `tab2` is a SECOND table set for the same launch: cvtColor's Xyz/Lab/Luv codes read the small
 // sdiv/hdiv set and their own 2.3 MB family set in the same kernel, and both must be kept alive
 // exactly as long as `tab`. Null for every other caller.
@@ -1266,9 +1265,8 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
 
 // ------------------------------------------------------------------- cvtColor
 
-// One flat pass over output pixels. Everything that decides what is computed lives in
-// cvtcolor.cpp (the code table, the validation, the compile key); this only publishes the
-// two div tables and launches.
+// Row-pitched colour conversion. cvtcolor.cpp owns code/depth admission and compile keys;
+// this runtime resolves the required lookup tables and submits the selected kernel.
 Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std::string* opName)
 {
     cv_triton_color::Normalized n;
@@ -1333,10 +1331,8 @@ Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std:
                       {"ORD", spec.ord},
                       // Bayer row phase (Start_with_green); 0 for every other op, which ignores it.
                       {"SWG", spec.swg},
-                      // The one depth constexpr. Only Op::Bayer can be non-zero -- normalize
-                      // refuses every other op at 16U -- but it is passed for all of them so the
-                      // key always names the same set, which is what the compile helper checks
-                      // (tools/compile_helper.py: `constexprs != the kernel's`).
+                      // Every conversion key carries the admitted element depth. normalize()
+                      // checks each code/depth pair; the helper verifies the kernel's constexpr set.
                       {"U16", n.u16 ? 1 : 0},
                       {"F32", n.f32 ? 1 : 0},
                       {"F32_CPU_SEPARATE4", n.f32_cpu_separate4 ? 1 : 0},
@@ -1404,9 +1400,8 @@ Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std:
     ptr("t16", t16);
     ptr("t64", t64);
     // DeviceView::step is the row pitch in BYTES. The kernel indexes a TYPED pointer, so the
-    // strides it receives are in ELEMENTS; for CV_8U the two are the same number, which is why
-    // this division only appeared when Bayer made 16U reachable. normalize() has already
-    // checked that step is a multiple of the element size, so the division is exact.
+    // strides it receives are in ELEMENTS. normalize() checks that the byte step
+    // is divisible by the element size.
     i32("cols", n.cols);
     i32("rows", n.rows);
     i32("src_rs", static_cast<long long>(req.src.step / cv_triton_runtime::elem_size(req.src.type)));
@@ -1474,13 +1469,13 @@ Status warpAffine(const cv_triton_warp::Request& req, const ExecContext& ex)
     }
     if (!dev.ok) return error(Reason::ToolchainUnavailable, dev.why);
 
-    // CUDA uses the upstream per-mode tiles: interpolation benefits from a
+    // CUDA uses per-mode tiles: interpolation benefits from a
     // shorter source-row span, while single-tap nearest keeps contiguous rows.
     if (std::string(name()) == "cuda-jit") {
         n.block_h = n.mode == cv_triton_warp::Mode::Nearest ? 1 : 2;
         n.block_w = n.mode == cv_triton_warp::Mode::Nearest ? 256 : 64;
     }
-    // HIP keeps its independently measured defaults.
+    // HIP uses backend-specific launch defaults.
     if (std::string(name()) == "hip-jit" && n.dst_h >= 64 && n.dst_w >= 256 &&
         static_cast<long long>(n.dst_h)*n.dst_w >= 65536 &&
         !(n.channels == 3 && n.mode == cv_triton_warp::Mode::Nearest &&

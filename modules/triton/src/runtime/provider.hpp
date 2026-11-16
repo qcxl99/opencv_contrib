@@ -31,9 +31,8 @@ inline std::size_t elem_size(ElemType t)
 }
 
 // Which device context a buffer, stream or module belongs to. `native` is the raw
-// CUcontext / hipCtx_t value; `generation` is assigned by the DeviceService and changes
-// whenever it sees that context destroyed and a handle value reused, so no cache keys a
-// resource on a bare handle alone.
+// CUcontext / hipCtx_t value; `generation` identifies its lifetime. Native context
+// identities or retained-primary metadata prevent reuse based on a bare handle.
 struct ContextId {
     Backend backend = Backend::CUDA;
     int device = -1;
@@ -169,8 +168,8 @@ struct KernelKey {
 // Key and grid for a normalized request; route copy has no kernel (is_copy, a device
 // memcpy, reported as such and never as a Triton launch).
 //
-// cfg fields left at 0 are filled from default_config(n), the port of the dispatch table
-// in kernel.py; an explicit value (as the compile protocol passes) is never overridden.
+// Zero-valued cfg fields use the backend defaults and dispatch_table.hpp.
+// Explicit values are never overridden.
 struct LaunchShape {
     bool is_copy = false;
     KernelKey key;
@@ -208,7 +207,7 @@ public:
     virtual Status record(const ExecContext& ex, Event& out) = 0;
     // Add a device-side dependency to ex.stream, without waiting on the host.
     virtual Status wait(const ExecContext& ex, const Event& e) = 0;
-    // Nonblocking completion query. This legacy bool cannot distinguish not-ready from
+    // Nonblocking completion query. This bool cannot distinguish not-ready from
     // driver failure; current runtimes use lifetime.hpp's tri-state decisions instead.
     virtual bool completed(const Event& e) = 0;
     // Destroy an event only after no queued dependency or host query needs it.

@@ -387,7 +387,7 @@ Status resolve_output(const cv_triton_runtime::DeviceView& s, int code, Output& 
     if (!spec)
         return unsupported(Reason::Interpolation,
                            "cvtColor code " + std::to_string(code) +
-                               " is not served by this module: see cvtcolor.hpp for the "
+                               " is not served by this module: see doc/cvtcolor.markdown for the "
                                "supported set and depth-specific numeric criteria");
     // Depth. CV_8U is the rule for the table; CV_16U is additionally served by the families whose
     // CPU path is the SAME integer formula at both depths, i.e. the same coefficient tables with

@@ -4,7 +4,10 @@ BW1000 first use {#tutorial_triton_bw1000_first_use}
 This guide builds the HIP backend for Hygon BW1000/gfx936 with DTK 26.04 and
 flagtree 3.6.0. The compiler interpreter must import the HIP-capable Triton
 package. PyTorch is not a dependency. Set `ROCM_PATH` to the DTK installation
-for both configuration and runtime compilation.
+for both configuration and runtime compilation. This is the BW1000/DTK
+configuration; AMD W7900D/ROCm has a separate
+@ref tutorial_triton_w7900d_first_use "build guide". Do not reuse toolkit libraries
+or compiled artifacts between the two targets.
 
 Build and install
 -----------------

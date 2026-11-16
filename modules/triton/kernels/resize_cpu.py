@@ -469,8 +469,8 @@ def _resize_cpu_area_kernel(src, dst, xs, xa, xc, ys, ya, yc, KX, KY,
     computeResizeAreaTab gives every pixel CONSECUTIVE source columns
     (xs[k] = xs[0] + k) and one weight for every interior tap; only the first and
     the last can be partial. So the x table is read once per pixel -- start column,
-    first / interior / last weight -- instead of two loads per tap (the plan asserts
-    the property on the host tables, `_cpu_area_tab_regular`). uint8 input is finite,
+    first / interior / last weight -- instead of two loads per tap. The tables follow
+    computeResizeAreaTab's contiguous-tap layout. uint8 input is finite,
     so a padded tap (weight 0) adds an exact +0.0 and needs no predicate on the sums;
     float32 can hold inf/NaN (inf * 0 = NaN), so there padded taps stay masked out.
     """

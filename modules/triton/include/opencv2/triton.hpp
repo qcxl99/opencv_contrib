@@ -23,6 +23,7 @@
  * @see @ref tutorial_triton_warpaffine
  * @see @ref tutorial_triton_h20_first_use
  * @see @ref tutorial_triton_bw1000_first_use
+ * @see @ref tutorial_triton_w7900d_first_use
  */
 
 namespace cv { namespace triton {
@@ -30,7 +31,9 @@ namespace cv { namespace triton {
 //! @addtogroup triton
 //! @{
 
-/** @brief Return whether the current device is usable.
+/** @brief Return whether the selected backend has a usable device.
+ * CUDA checks its current device; HIP checks logical device 0 after visibility filtering.
+ * Use haveDevice() from opencv2/triton/device.hpp to query an explicit device index.
  * Does not check compiler availability; a cache miss may still raise a toolchain error.
  */
 CV_EXPORTS_W bool haveBackend();

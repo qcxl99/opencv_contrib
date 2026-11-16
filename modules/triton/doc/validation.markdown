@@ -36,12 +36,16 @@ python3 modules/triton/tools/check_source.py
 ```
 
 This checks source license notices and Python syntax without importing kernels,
-verifies both HIP generators with `--check`, then compiles and runs the pure C++
-key/protocol controls in `test/cpu/test_protocol.cpp`. It needs neither OpenCV
+verifies both HIP generators with `--check`, and runs the CPU controls for the
+compile protocol, graph requests and resource lifetime under `test/cpu/`.
+Native context/cleanup code is compiled with injected driver calls.
+It needs neither OpenCV
 binaries nor CUDA/HIP SDKs, Triton, Torch or a GPU. Controls cover request/key
 round trips, source/target separation, response identity, incomplete artifacts,
-validated scratch ABI, missing helpers and helper deadlines. This is not a
-compiler integration or complete artifact publication/recovery test.
+validated scratch ABI, missing helpers and helper deadlines. Graph controls
+check request admission; lifetime controls check capture, completion failures
+and context ownership without device work. These are not GPU execution or
+compiler-integration checks.
 
 After an enabled OpenCV build, the CPU-only `Triton_Validation.GuardBandsBytewise`
 gtest checks 8U/16U/32F, C1/C3/C4, unequal pitches and detection of byte corruption:
@@ -85,7 +89,9 @@ Use separate build/install directories, standard `BUILD_TESTS`,
 `BUILD_PERF_TESTS`, `BUILD_EXAMPLES`, and the corresponding backend toolkit.
 The @ref tutorial_triton_h20_first_use "H20 guide" contains the CUDA commands and installed
 Python/consumer/cache checks. The @ref tutorial_triton_bw1000_first_use "BW1000 guide"
-contains the HIP setup and device-entry checks. Include
+contains the HIP/DTK setup; @ref tutorial_triton_w7900d_first_use "W7900D"
+contains the HIP/ROCm setup. Both use C++ DeviceImage entries; results and
+performance ratios from one device do not validate the other. Include
 `python3,python_bindings_generator,ts` in BUILD_LIST when validating wrappers
 and tests; select compatible Python development headers/library and NumPy.
 
@@ -124,7 +130,7 @@ without the compiler. Existing runtime tests cover integrity and resource lifeti
 changed boundaries, including graph capture or cross-stream dependencies when
 applicable. First-use and deployment guides remain the command owners.
 
-A hosted CPU source check, an enabled compile job and an actual H20/BW1000 run
+A hosted CPU source check, an enabled compile job and an actual run on each target device
 establish different things. The repository's general PR workflow does not by
 itself establish that this default-off module was enabled. Hardware runners and
 integration into OpenCV's shared CI are to be agreed with maintainers; they are

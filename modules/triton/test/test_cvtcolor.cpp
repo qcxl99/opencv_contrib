@@ -164,10 +164,9 @@ TEST(Triton_CvtColor, MatchesCpu420)
     }
 }
 
-// The 16U half. Bayer is the only family the module serves at a second depth, and it is the same
-// integer algorithm there (demosaicing.cpp:1796-1803), so "exact" is the same claim and the same
-// comparison; only the Mat type changes. Sizes are reused so an addressing slip shows up at the
-// same places it would at 8U.
+// Bayer uses the same integer algorithm at 8U and 16U. Reuse the image sizes
+// to check full-range 16U arithmetic and element-size-dependent addressing.
+// Other supported 16U families are covered by the shared depth fixtures.
 TEST(Triton_CvtColor, MatchesCpu16U)
 {
     if (!ready()) throw SkipTestException("no Triton backend");

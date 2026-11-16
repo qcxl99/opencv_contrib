@@ -8,7 +8,7 @@
 // inverted internally, unless cv::WARP_INVERSE_MAP is set. The interpolation flags, dtypes and
 // border modes are listed in doc/warpaffine.markdown -- INTER_NEAREST, INTER_LINEAR,
 // INTER_CUBIC and INTER_AREA (LINEAR alias), CV_8U / CV_16U / CV_32F, channels 1/3/4. Inputs outside
-// that list (INTER_LANCZOS4, other depths) raises cv::Error::StsUnsupportedFormat rather than
+// that list (INTER_LANCZOS4, other depths) raise cv::Error::StsUnsupportedFormat rather than
 // falling back, so an unsupported request is a visible error, not a silent change of result.
 #include <cmath>
 #include <iostream>

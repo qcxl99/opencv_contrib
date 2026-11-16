@@ -3,7 +3,8 @@ Triton resize {#tutorial_triton_resize}
 
 @see @ref triton "Triton API reference".
 @see @ref tutorial_triton_h20_first_use "CUDA build and first use".
-@see @ref tutorial_triton_bw1000_first_use "HIP build and first use".
+@see @ref tutorial_triton_bw1000_first_use "BW1000 / DTK build and first use".
+@see @ref tutorial_triton_w7900d_first_use "W7900D / ROCm build and first use".
 
 Supported inputs
 ----------------

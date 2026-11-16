@@ -61,12 +61,11 @@ unstable probes or non-default rounding do not identify a profile. Explicit
 rounded GPU operations and per-row vector-body/scalar-tail grouping preserve
 this expression instead of relying on compiler FMA contraction settings.
 
-The directed domain includes unit/255 scale and adjacent signed values through
-`2*65535`, short rows, widths around four/sixteen-lane boundaries, dense buffers
-and pitched ROIs. This evidence is not a universal guarantee for all finite
-floats, overflow, subnormals, other HALs or changed arithmetic environments.
-An unidentified profile retains the fused/scaled path and is explicitly not
-qualified for the additional absolute cap. Copy paths remain exact.
+Directed accuracy fixtures include unit/255 scale and adjacent signed values
+through `2*65535`, short rows, vector-boundary widths and pitched ROIs.
+They do not establish a universal bound for overflow, subnormals, other HALs
+or changed arithmetic environments. An unidentified profile uses the fused path
+and the scaled bound without the additional absolute cap. Copy paths remain exact.
 
 
 CUDA provides GpuMat Python bindings. The HIP `DeviceImage` overload is C++ only.

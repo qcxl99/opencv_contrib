@@ -228,7 +228,7 @@ TEST(Triton_Common, CvtColorMixedScaleAbsoluteCap) {
     for (bool optimized : {false, true}) {
         cv::setUseOptimized(optimized);
         if (!cv_triton_color::float_cpu_separate4())
-            throw SkipTestException("linked CPU arithmetic is not identified separate4; absolute qualification unavailable");
+            throw SkipTestException("linked CPU arithmetic is not identified separate4; absolute accuracy check unavailable");
         device::Stream stream;
         for (const auto& c : cvt_cases::kCases32F)
             for (int width : {1,2,3,4,5,7,8,9,15,16,17,19,31,32,33,63,65})

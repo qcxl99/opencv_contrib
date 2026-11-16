@@ -32,15 +32,15 @@ def sub(old, new, count=None):
 
 # ---- 1. header: what this file is, and why it differs ----------------------------------
 sub('// Runtime JIT for the CUDA driver API. See runtime.hpp for execution and ownership rules.\n',
-'''// Runtime JIT, HIP driver side (Hygon BW1000 / gfx936, DTK). See runtime.hpp for execution and ownership rules.
+'''// Runtime JIT for the HIP driver API (ROCm/DTK). See runtime.hpp for execution and ownership rules.
 //
 // GENERATED from cuda_runtime.cpp by tools/port_hip_runtime.py -- do not edit; edit the CUDA
 // file and re-run the port. Exactly one of the two is compiled into a build (CMakeLists.txt).
 //
 // What differs from the CUDA file, and why -- everything else is the same code:
-//   * Target: backend "hip"; arch = the gfx number parsed from gcnArchName ("gfx936:sramecc+:..."
-//     -> 936; an arch with a letter suffix such as gfx90a has no integer form in the key and is
-//     refused); warp_size from the device (64 on gfx936, not 32).
+//   * Target: backend "hip", numeric gfx architecture and warp size queried from the device.
+//     BW1000 uses gfx936/wave64; W7900D uses gfx1100/wave32. Letter-suffix targets such as
+//     gfx90a cannot be represented by this key and are rejected.
 //   * Kernels: kernels/<op>_cpu_hip.py where the CUDA source calls a libdevice primitive
 //     the HIP compiler lacks; tools/make_kernels_cpu_hip.py derives resize, cvtColor
 //     and warpAffine sources and rejects stale copies.
@@ -50,8 +50,8 @@ sub('// Runtime JIT for the CUDA driver API. See runtime.hpp for execution and o
 //     visibility variables as CUDA_VISIBLE_DEVICES= does for cuda.
 //   * Dynamic shared memory above the 64 KiB LDS is refused rather than requested through an
 //     attribute call, which HIP defines for host function pointers, not module functions.
-//   * The hipCtx* family is marked deprecated in HIP. It is what DTK offers for explicit context
-//     handling and what this runtime's context identity needs; the warning is silenced here only.
+//   * Context identity uses DTK's hipCtxGetId when available, otherwise retained primary
+//     contexts on ROCm. Deprecation warnings for the required hipCtx* API are local to this file.
 ''', 1)
 sub('#include <cuda.h>\n', '#include <hip/hip_runtime_api.h>\n', 1)
 sub('#include <sys/stat.h>\n', '#include <sys/stat.h>\n\n#pragma GCC diagnostic ignored "-Wdeprecated-declarations"\n', 1)
@@ -188,7 +188,7 @@ sub('''struct State
 struct DevInfo
 {
     bool ok = false;
-    int arch = 0;                // 936 for gfx936
+    int arch = 0;                // numeric gfx suffix, e.g. 936 or 1100
     int warp = 64;
     std::string arch_name, why;
 };

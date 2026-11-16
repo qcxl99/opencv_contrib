@@ -98,8 +98,8 @@ const Config& config()
         k.helper = r + "/tools/compile_helper.py";
         if (!hasResources(r))
             k.error = "kernels/resize_cpu.py and tools/compile_helper.py not found under " + r;
-        // cvtColor is optional: a tree that predates it still runs resize, and asking for a
-        // cvtColor code there reports the missing source rather than failing the whole module.
+        // Resolve per-operation resources independently; a missing file is reported
+        // when that operation is requested.
         k.cvt_kernels = r + "/kernels/cvtcolor_cpu.py";
         if (!isFile(k.cvt_kernels))
             k.cvt_error = k.cvt_kernels + " not found";
@@ -474,9 +474,8 @@ bool capturing(CUstream stream)
 //    replay after an eviction would reference an unloaded module or a freed table buffer.
 //
 // Pins are released only by releaseCapturePins(). CUDA gives no notification when the caller
-// destroys a graph, so the module cannot know; a caller that keeps graphs indefinitely keeps
-// the pin, which is bounded by the number of distinct (code, size-class) keys it captured and is
-// a few kilobytes each.
+// destroys a graph, so the caller releases references after graph use. Retained storage
+// includes the compiled modules and device tables for every distinct captured key.
 // `tab2` is a SECOND table set for the same launch: cvtColor's Xyz/Lab/Luv codes read the small
 // sdiv/hdiv set and their own 2.3 MB family set in the same kernel, and both must be kept alive
 // exactly as long as `tab`. Null for every other caller.
@@ -1150,9 +1149,8 @@ Status resize(const ResizeRequest& req, const ExecContext& ex, std::string* rout
 
 // ------------------------------------------------------------------- cvtColor
 
-// One flat pass over output pixels. Everything that decides what is computed lives in
-// cvtcolor.cpp (the code table, the validation, the compile key); this only publishes the
-// two div tables and launches.
+// Row-pitched colour conversion. cvtcolor.cpp owns code/depth admission and compile keys;
+// this runtime resolves the required lookup tables and submits the selected kernel.
 Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std::string* opName)
 {
     cv_triton_color::Normalized n;
@@ -1215,10 +1213,8 @@ Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std:
                       {"ORD", spec.ord},
                       // Bayer row phase (Start_with_green); 0 for every other op, which ignores it.
                       {"SWG", spec.swg},
-                      // The one depth constexpr. Only Op::Bayer can be non-zero -- normalize
-                      // refuses every other op at 16U -- but it is passed for all of them so the
-                      // key always names the same set, which is what the compile helper checks
-                      // (tools/compile_helper.py: `constexprs != the kernel's`).
+                      // Every conversion key carries the admitted element depth. normalize()
+                      // checks each code/depth pair; the helper verifies the kernel's constexpr set.
                       {"U16", n.u16 ? 1 : 0},
                       {"F32", n.f32 ? 1 : 0},
                       {"F32_CPU_SEPARATE4", n.f32_cpu_separate4 ? 1 : 0},
@@ -1274,9 +1270,8 @@ Status cvtColor(const cv_triton_color::Request& req, const ExecContext& ex, std:
     ptr("t16", t16);
     ptr("t64", t64);
     // DeviceView::step is the row pitch in BYTES. The kernel indexes a TYPED pointer, so the
-    // strides it receives are in ELEMENTS; for CV_8U the two are the same number, which is why
-    // this division only appeared when Bayer made 16U reachable. normalize() has already
-    // checked that step is a multiple of the element size, so the division is exact.
+    // strides it receives are in ELEMENTS. normalize() checks that the byte step
+    // is divisible by the element size.
     i32("cols", n.cols);
     i32("rows", n.rows);
     i32("src_rs", static_cast<long long>(req.src.step / cv_triton_runtime::elem_size(req.src.type)));
@@ -1337,13 +1332,13 @@ Status warpAffine(const cv_triton_warp::Request& req, const ExecContext& ex)
     cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
     cuDeviceGetAttribute(&warp, CU_DEVICE_ATTRIBUTE_WARP_SIZE, dev);
 
-    // CUDA uses the upstream per-mode tiles: interpolation benefits from a
+    // CUDA uses per-mode tiles: interpolation benefits from a
     // shorter source-row span, while single-tap nearest keeps contiguous rows.
     if (std::string(name()) == "cuda-jit") {
         n.block_h = n.mode == cv_triton_warp::Mode::Nearest ? 1 : 2;
         n.block_w = n.mode == cv_triton_warp::Mode::Nearest ? 256 : 64;
     }
-    // HIP keeps its independently measured defaults.
+    // HIP uses backend-specific launch defaults.
     if (std::string(name()) == "hip-jit" && n.dst_h >= 64 && n.dst_w >= 256 &&
         static_cast<long long>(n.dst_h)*n.dst_w >= 65536 &&
         !(n.channels == 3 && n.mode == cv_triton_warp::Mode::Nearest &&

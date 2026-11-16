@@ -1,26 +1,13 @@
-# Optional module: GPU image operations through runtime-compiled Triton kernels.
+# Optional, default-off GPU operations with runtime-compiled Triton kernels.
+# Compilation uses a separate Python/Triton process; execution is C++ only.
+# This module does not require PyTorch or compile kernels during the OpenCV build.
 #
-# Off by default, like any module that needs an external toolchain (precedent: cnn_3dobj):
-# enable it with -DBUILD_opencv_triton=ON. An ordinary OpenCV build needs no Python, Triton or
-# PyTorch, and even an enabled build never needs PyTorch.
-#
-# Execution: kernels are compiled on first use by a separate, Torch-free helper process
-# (tools/compile_helper.py) into a verified on-disk cache; the call path itself is C++
-# (src/runtime/). Nothing is compiled at OpenCV build time.
-#
-# Backends (TRITON_BACKEND = auto | cuda | hip), Linux only:
-#   cuda  CUDA driver API (src/runtime/cuda_runtime.cpp), kernels/*_cpu.py, the cuda::GpuMat
-#         entries of opencv2/triton.hpp, and the GpuMat-based tests / perf / samples.
-#   hip   HIP on Hygon DTK / ROCm (src/runtime/hip_runtime.cpp, BW1000 = gfx936). Kernels are
-#         kernels/*_cpu_hip.py where the CUDA source needs a derivation (tools/
-#         make_kernels_cpu_hip.py; a stale copy fails the configure), else the CUDA source as
-#         written. The entries are opencv2/triton/device.hpp (device buffers + a hip stream);
-#         the GpuMat entries exist and raise, since OpenCV has no cv::cuda here. Common
-#         accuracy/perf and HIP lifecycle tests use HIP-capable Triton and ROCM_PATH.
-#   auto  cuda where the OpenCV build has CUDA (unchanged), else hip if a HIP toolkit is found,
-#         else the module is disabled. A tree whose CUDA is a compatibility layer (WITH_CUDA=ON
-#         on a BW1000 box) must say -DTRITON_BACKEND=hip.
-# Windows and macOS are disabled here, not silently half-built.
+# TRITON_BACKEND selects a Linux backend:
+#   cuda: CUDA driver API, GpuMat and DeviceImage entries, kernels/*_cpu.py.
+#   hip:  ROCm/DTK driver API, DeviceImage entries, generated kernels/*_cpu_hip.py.
+#         GpuMat entries report StsNotImplemented on this backend.
+#   auto: CUDA when enabled in OpenCV, otherwise HIP when its toolkit is available.
+# Select hip explicitly when CUDA is provided by a compatibility layer.
 set(BUILD_opencv_triton_INIT OFF)
 set(the_description "Triton-backed operations (runtime JIT)")
 # Register first: OpenCV returns during discovery and skips disabled modules,
@@ -245,20 +232,9 @@ if(_triton_backend STREQUAL "cuda")
                                        "${CMAKE_CURRENT_LIST_DIR}/perf/*.hpp")
   ocv_add_perf_tests(FILES "Src" ${_triton_common_perf_sources})
   ocv_add_samples()
-  # perf/ only: cv::cuda::resize as a labelled timing baseline. The implementation, the accuracy
-  # tests and the sample never use it, so cudawarping is an OPTIONAL dependency -- and it MUST be
-  # checked before being linked. Linking it unconditionally meant a build with triton but without
-  # cudawarping (a legal configuration: the module does not depend on it) failed at configure or
-  # link time instead of simply omitting the baseline test.
+  # Native CUDA comparisons are optional performance-test dependencies.
+  # Check each module independently during OpenCV discovery, before targets exist.
   if(TARGET opencv_perf_triton)
-    # `TARGET opencv_cudawarping` is NOT a usable test here: a module's CMakeLists runs in the
-    # first pass, before other modules' targets exist, so the target check was false even in a
-    # build that had cudawarping enabled. HAVE_opencv_cudawarping is the configure-time answer,
-    # and ocv_check_dependencies is the standard way to ask it.
-    #
-    # Two separate baselines, two separate guards: cv::cuda::resize is in cudawarping and
-    # cv::cuda::cvtColor in cudaimgproc, and a build may have either, both or neither. Each
-    # missing one omits its own perf test and nothing else.
     ocv_check_dependencies(opencv_cudawarping)
     if(OCV_DEPENDENCIES_FOUND)
       ocv_target_include_modules(opencv_perf_triton opencv_cudawarping)

@@ -167,8 +167,8 @@ struct LabLuvLayout {
 };
 
 // The runtime-argument list of the one jit function, in Triton's type strings. Constexpr
-// parameters are not runtime arguments. tests/test_cvtcolor_plan.py compares this with the
-// signature the JIT actually compiles.
+// parameters are not runtime arguments. The compile helper checks this against
+// the signature of the compiled kernel.
 std::string signature(const Normalized& n);
 
 // The explicit compile key. Triton is given no implicit specialisation (every channel count

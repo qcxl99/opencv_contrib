@@ -373,7 +373,7 @@ class triton_cvtcolor_test(_TritonBase):
         wrong = ref.astype(np.float64)
         wrong[0, 0] += 1e-3
         self.assertGreater(abs(wrong[0, 0] - ref[0, 0]), _cvt_f32_allow(src, ref)[0, 0])
-        # The former whole-image bound would incorrectly accept this small-pixel error.
+        # A whole-image bound would incorrectly accept this small-pixel error.
         self.assertLess(abs(wrong[0, 0] - ref[0, 0]), (8.0 * 2.0 ** -24) * 65535.0)
 
     def test_all_float32_codes_with_per_pixel_scale(self):

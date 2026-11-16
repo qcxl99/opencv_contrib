@@ -61,9 +61,9 @@ def _mapped_coord(xf, M00, M10, row_x, row_y, FUSED: tl.constexpr):
     0. An FMA3 build therefore rounds once and a baseline-only build rounds twice, and at a
     0.5 tie in the interpolation the two land on different source pixels.
 
-    Which one the reference used is decided by the C++ planner (it asks the driver for the
-    build's CPU dispatch) and arrives as the FUSED constexpr. Guessing it wrong is not an ulp
-    of noise: it is a whole output level on the pixels where the two disagree.
+    The C++ planner identifies the linked CPU arithmetic with fixed numerical probes
+    and passes it as FUSED. A different rounding at a sampling tie can select an
+    adjacent source pixel.
     """
     if FUSED:
         return (libdevice.fma(xf, M00.to(tl.float32), row_x),
@@ -84,7 +84,6 @@ def _warp_nearest(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, d
     xs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)[None, :]
     m = (ys < dst_h) & (xs < dst_w)
 
-    # per-row term in double, narrowed once (CV_WARPAFFINE_VECTOR_COMPUTE_MAPPED_COORD1)
     # static_cast<float>(y*M1 + M2): OpenCV's M[] is FLOAT, so the row term is
     # float arithmetic rounded twice (multiply, add). Computing it in double and
     # narrowing once moves the result by an ulp on ties, which a 0.5 tie turns

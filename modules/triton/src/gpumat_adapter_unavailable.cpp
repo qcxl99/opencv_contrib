@@ -24,7 +24,7 @@ namespace {
 {
     CV_Error(Error::StsNotImplemented,
              cv::format("cv::triton::%s (GpuMat overload) needs cv::cuda, which this build does not "
-                        "have (backend %s). Use cv::triton::%sDevice() from opencv2/triton/device.hpp "
+                        "have (backend %s). Use the cv::triton::%s DeviceImage overload from opencv2/triton/device.hpp "
                         "with device buffers and a %s stream instead.",
                         op, runtime::name(), op, runtime::name()));
 }
@@ -33,8 +33,7 @@ namespace {
 
 bool haveBackend()
 {
-    // The current device of this backend is ordinal 0 unless the caller selected another
-    // through the platform's visibility variable; there is no cv::cuda::getDevice() here.
+    // Query logical device 0 after the runtime's visibility filters.
     return runtime::deviceAvailable(0);
 }
 

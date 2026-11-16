@@ -17,7 +17,7 @@ enum Route { ROUTE_COPY, ROUTE_NEAREST, ROUTE_LINEAR, ROUTE_CUBIC, ROUTE_AREA_FA
 const char* route_name(Route r);
 
 // cv::resize parameter resolution. dsize wins when both sides are > 0; otherwise fx/fy
-// (both > 0) give dst = cvRound(src * f) and inverse scales that ARE fx/fy.
+// (both > 0) give dst = cvRound(src * f). Size2 retains the original fx/fy values.
 struct Size2 { int dst_h, dst_w; double inv_y, inv_x; };
 Size2 resolve_size(int src_h, int src_w, int dst_w, int dst_h, double fx, double fy);
 

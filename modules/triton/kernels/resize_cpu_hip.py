@@ -1,5 +1,5 @@
 # Generated HIP resize kernels; regenerate with tools/make_kernels_cpu_hip.py.
-# source_sha256: 788652ff361fa460b948f5622bd50ec7a8d2d47c751a15cf09d78869c1ff90ff
+# source_sha256: fcb074ff51acc6feb98745ee0e4a04ff39c362147b173dcb80ce9b6429eca293
 # This file is part of OpenCV project.
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
@@ -11,14 +11,10 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 
-# --- HIP/AMDGCN shims for the libdevice functions this file needs that
-# --- flagtree's hip libdevice does not provide (add_rn / mul_rn / div_rn / rint).
-# --- Semantics preserved: each is a SINGLE round-to-nearest operation that the
-# --- compiler may not reassociate or fuse into a neighbouring term.
-# --- v_add_f32 v_mul_f32 are the CDNA instructions for add.f32 / mul.f32; CDNA rounds to nearest-even
-# --- unconditionally.
-# --- `div_rn` has no single instruction on CDNA (the divide is a 5-instruction
-# --- sequence); plain `/` is used.
+# HIP/AMDGCN replacements for missing libdevice primitives: add_rn, mul_rn, div_rn, rint.
+# Explicit vector arithmetic preserves separate add/multiply/subtract operations.
+# v_rndne_f32 rounds to the nearest even integer.
+# Division uses Triton's `/` lowering, not a correctly rounded div_rn primitive.
 
 @triton.jit
 def _triton_add_rn(a, b):
@@ -502,8 +498,8 @@ def _resize_cpu_area_kernel(src, dst, xs, xa, xc, ys, ya, yc, KX, KY,
     computeResizeAreaTab gives every pixel CONSECUTIVE source columns
     (xs[k] = xs[0] + k) and one weight for every interior tap; only the first and
     the last can be partial. So the x table is read once per pixel -- start column,
-    first / interior / last weight -- instead of two loads per tap (the plan asserts
-    the property on the host tables, `_cpu_area_tab_regular`). uint8 input is finite,
+    first / interior / last weight -- instead of two loads per tap. The tables follow
+    computeResizeAreaTab's contiguous-tap layout. uint8 input is finite,
     so a padded tap (weight 0) adds an exact +0.0 and needs no predicate on the sums;
     float32 can hold inf/NaN (inf * 0 = NaN), so there padded taps stay masked out.
     """

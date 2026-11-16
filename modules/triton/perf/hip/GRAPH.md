@@ -5,7 +5,7 @@ repeatedly on one fixed nondefault stream. It uses production dispatch and
 kernels, with no Torch dependency. It measures the Triton implementation only:
 `baseline_status: BASELINE_UNAVAILABLE` means there is no baseline latency or
 speedup ratio. Graph timing does not establish ordinary-call performance or
-complete application qualification.
+application-level performance.
 
 ## Build and request
 
@@ -101,7 +101,11 @@ Other measurements remain separate:
 | First production call | Host wall, including conditional JIT/cache lookup/load |
 | Warmup | Host wall for 20 calls and completion |
 | Capture and instantiation | Separate host wall costs |
-| Ordinary calls | GPU-event time and completion wall, each divided by 250 calls |
+| Ordinary calls | Seven blocks of 250 calls, GPU-event time and batch-end completion wall per call |
+
+`ordinary_wall_blocks_ms` and `ordinary_event_blocks_ms` retain all per-call
+block averages; scalar ordinary fields report their medians. This is amortized
+synchronized batch cost, not separately synchronized individual-call latency.
 
 The raw field `first_compile_call_wall_ms` names the first production request
 in that process. It is not isolated compiler time and does not prove compilation

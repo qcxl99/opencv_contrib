@@ -15,12 +15,12 @@ struct DispatchRow {
     int block_h, block_w, num_warps;
 };
 
-// CPU_CONFIG: what a copy (or an unlisted dispatch class) uses.
+// Fallback configuration for copies and unlisted layout classes.
 constexpr int DISPATCH_FALLBACK_BLOCK_H = 1;
 constexpr int DISPATCH_FALLBACK_BLOCK_W = 256;
 constexpr int DISPATCH_FALLBACK_NUM_WARPS = 4;
 constexpr int DISPATCH_DEFAULT_NUM_STAGES = 3;
-// _CPU_MIN_PROGRAMS: _cpu_parallel's floor on the program count.
+// Minimum program count used when shrinking tiles for small outputs.
 constexpr int DISPATCH_MIN_PROGRAMS = 512;
 
 // Columns: route, channels, float32, vertical direction, exact-2x2 AREA,

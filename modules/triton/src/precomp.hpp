@@ -10,11 +10,8 @@
 #include "opencv2/imgproc.hpp"   // INTER_LINEAR / INTER_NEAREST -- needed by
                                  // core_resize.cpp, not just the CUDA adapter.
 
-// triton.hpp (the GpuMat-based public API) and cuda_stream_accessor.hpp (which
-// unconditionally includes cuda_runtime.h) are CUDA-adapter-only. This
-// precompiled header must not pull either in on a build with no CUDA toolkit
-// (e.g. BW1000/HIP): only cuda_resize_adapter.cpp is compiled against them,
-// and only in the CUDA build (see CMakeLists.txt).
+// The CUDA stream accessor includes cuda_runtime.h. Keep it out of HIP builds;
+// CUDA adapters use it to unwrap the public OpenCV stream.
 #ifdef OPENCV_TRITON_HAVE_CUDA_ADAPTER
 #include "opencv2/triton.hpp"
 #include "opencv2/core/cuda.hpp"

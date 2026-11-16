@@ -39,8 +39,8 @@ struct Request {
     int border_mode = 0;       // cv::BORDER_CONSTANT
     // The border value is a Scalar: up to four components, one per channel. A scalar v means
     // Scalar(v, 0, 0, 0), a sequence means its components zero-padded to four. It stays a
-    // double all the way to the kernel: for CV_32F a border of 0.5 is a legitimate value, so
-    // it must not be narrowed to an integer anywhere on the path.
+    // double in the request and is converted to the output depth before launch.
+    // Float borders retain fractional values, such as 0.5.
     double border[4] = {0, 0, 0, 0};
     bool inverse_map = false;
 };

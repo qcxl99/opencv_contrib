@@ -32,15 +32,9 @@ ANCHOR = "from triton.language.extra import libdevice\n"
 _RESIZE_SHIM = """\
 
 
-# --- HIP/AMDGCN shims for the libdevice functions this file needs that
-# --- flagtree's hip libdevice does not provide (add_rn / mul_rn / div_rn).
-# --- Semantics preserved: each is a SINGLE round-to-nearest operation that the
-# --- compiler may not reassociate or fuse into a neighbouring term, which is
-# --- exactly why the CPU-aligned kernels spell them out instead of using `+`
-# --- and `*`. v_add_f32 / v_mul_f32 are the CDNA instructions for add.f32 /
-# --- mul.f32; CDNA's rounding is round-to-nearest-even unconditionally.
-# --- `div_rn` has no single instruction on CDNA (the divide is a 5-instruction
-# --- sequence); plain `/` is used.
+# HIP/AMDGCN replacements for missing libdevice primitives.
+# Explicit vector add/multiply instructions prevent multiply-add contraction.
+# Division uses Triton's `/` lowering; it is not a correctly rounded div_rn primitive.
 @triton.jit
 def _triton_add_rn(a, b):
     return tl.inline_asm_elementwise("v_add_f32 $0, $1, $2", "=v,v,v", [a, b],
@@ -112,18 +106,14 @@ def shim_for(text: str) -> str:
     if used == RESIZE_SET:
         return _RESIZE_SHIM
     arith = [n for n in used if n not in ("div_rn", "rint")]
-    isa = (" ".join(f"v_{n.split('_')[0]}_f32" for n in arith) + " are the CDNA instructions for "
-           + " / ".join(f"{n.split('_')[0]}.f32" for n in arith)) if arith else ""
-    head = ("\n\n# --- HIP/AMDGCN shims for the libdevice functions this file needs that\n"
-            "# --- flagtree's hip libdevice does not provide (" + " / ".join(used) + ").\n"
-            "# --- Semantics preserved: each is a SINGLE round-to-nearest operation that the\n"
-            "# --- compiler may not reassociate or fuse into a neighbouring term.\n")
-    if isa:
-        head += ("# --- " + isa + "; CDNA rounds to nearest-even\n"
-                 "# --- unconditionally.\n")
+    head = ("\n\n# HIP/AMDGCN replacements for missing libdevice primitives: "
+            + ", ".join(used) + ".\n")
+    if arith:
+        head += "# Explicit vector arithmetic preserves separate add/multiply/subtract operations.\n"
+    if "rint" in used:
+        head += "# v_rndne_f32 rounds to the nearest even integer.\n"
     if "div_rn" in used:
-        head += ("# --- `div_rn` has no single instruction on CDNA (the divide is a 5-instruction\n"
-                 "# --- sequence); plain `/` is used.\n")
+        head += "# Division uses Triton's `/` lowering, not a correctly rounded div_rn primitive.\n"
     return head + "".join(_SHIMS[n] for n in used)
 
 

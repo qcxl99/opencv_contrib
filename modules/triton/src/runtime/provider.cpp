@@ -290,10 +290,10 @@ LaunchConfig default_config(const Normalized& n, const Target* target) {
                 { cfg.block_h=8; cfg.block_w=256; cfg.num_warps=2; }
         }
     }
-    // _cpu_parallel: shrink BLOCK_H, then BLOCK_W, until the launch has at least
+    // Shrink BLOCK_H, then BLOCK_W, until the launch has at least
     // DISPATCH_MIN_PROGRAMS programs (or neither can shrink). It counts programs on
     // dst_w for axis 1 whatever the route; that only errs on the small side for C3/C4
-    // element-major tiles, which is the safe direction. A copy keeps CPU_CONFIG untouched.
+    // element-major tiles, which is the safe direction. Copies keep the fallback tile.
     if (look.kind != ref::ROUTE_COPY) {
         auto programs = [&](const LaunchConfig& c) {
             return static_cast<long long>((n.dst_h + c.block_h - 1) / c.block_h) *

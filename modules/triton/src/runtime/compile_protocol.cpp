@@ -406,9 +406,10 @@ bool verify_artifact(const std::string& dir, const std::string& expected_key_tex
 }
 
 bool compiler_abi_validated(const std::string& compiler, const std::string& format) {
-    // Extend only after checking the new compiler's entry parameters (tests/test_compile_protocol.py).
+    // Admit a compiler only after validating its entry parameters and scratch requirements.
+// CPU protocol controls are in test/cpu/test_protocol.cpp.
     //   cubin: the PTX .entry parameters of upstream triton 3.6.0.
-    //   hsaco: the AMDHSA kernel-argument metadata of flagtree's triton on gfx936, read by
+    //   hsaco: AMDHSA kernel-argument metadata from the HIP compiler, read by
     //          compile_helper.py's hip_abi(). flagtree reports the same version string "3.6.0",
     //          so the compiler string cannot tell the two distributions apart: the binary
     //          format keys the entry, and a hip artifact is not validated by the cuda check.

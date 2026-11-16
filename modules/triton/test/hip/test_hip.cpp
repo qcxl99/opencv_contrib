@@ -736,14 +736,14 @@ int main(int argc, char** argv)
     warpCase({53, 37}, {61, 43}, CV_8UC1, cv::INTER_LINEAR | cv::WARP_INVERSE_MAP, cv::BORDER_CONSTANT, rot,
              cv::Scalar(), stream, seed++);
     // CUBIC's four taps start at floor(sx)-1. These columns cover the
-    // disputed floor(sx)==-3 strip and cross sx==-2, where the last tap
+    // floor(sx)==-3 strip and cross sx==-2, where the last tap
     // first enters the source: ix0+3<0 is outside; ix0+3==0 still samples.
     const double cubicLeftBoundary[6] = {0.25, 0, -3.25, 0, 1, 2.25};
     for (int type : {CV_8UC1, CV_16UC1, CV_32FC1})
         warpCase({53, 37}, {7, 5}, type, cv::INTER_CUBIC | cv::WARP_INVERSE_MAP,
                  cv::BORDER_CONSTANT, cubicLeftBoundary, cv::Scalar(251.25), stream, seed++);
 
-    // Entry-specific additions: retain the cases above and add AREA aliasing and
+    // Check AREA aliasing and
     // transparent old-destination semantics for every supported depth/channel pair.
     seed = 30001;
     for (int t : wtypes)

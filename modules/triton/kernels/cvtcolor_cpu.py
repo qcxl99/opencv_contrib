@@ -182,7 +182,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
     separately costs nothing and removes the division, and it is the same shape the
     resize kernels use.
 
-    `I0..I3` are the destination channel sources for OP_PERMUTE only (-1 = write 255).
+    `I0..I3` are the destination channel sources for OP_PERMUTE only (-1 = opaque alpha for the output depth).
     `BLUE` is the blue index (0 for BGR order, 2 for RGB). `INV` selects the inverse
     direction for OP_YUV / OP_YCRCB, and the decode direction for OP_PACKED. `HR` is the
     hue range: 180 for BGR2HSV, 256 for BGR2HSV_FULL -- the CPU adds hr to a negative hue,
@@ -197,9 +197,9 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
 
     Three table pointers, not one, because their element types differ and a pointer's type is
     what Triton uses for the load: `t32` is int32 (abToXZ_b, the two 256*256 Luv tables),
-    `t16` is int16 (the 33^3 Luv LUT and LabCbrtTab_b, whose values exceed int16 and are
-    therefore widened on the host to int32 -- see cvtcolor.cpp), `t64` is int64 (LvToVpl_b,
-    which reaches 6.2e13 at L=255: the CPU stores it as long long for exactly that reason).
+    `t16` is int16 (the 33^3 Luv LUT), and `t64` is int64 (LvToVpl_b, which reaches
+    6.2e13 at L=255). LabCbrtTab_b uses `t32` because its values exceed signed int16;
+    see cvtcolor.cpp.
     Unused pointers are still passed a live allocation; per-code constexprs mean the dead ones
     are never dereferenced."""
     row = tl.program_id(0)
@@ -609,7 +609,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
         # Bilinear Bayer demosaic, transcribed from Bayer2RGB_Invoker::operator()
         # (modules/imgproc/src/demosaicing.cpp:823-1021) and Bayer2Gray_Invoker (:669-767).
         #
-        # THE ADDRESSING IS THE WHOLE PROBLEM. The invoker starts at
+        # The CPU invoker starts at
         #     dst + (range.start + 1) * dst_step + dcn + 1      (:845)
         # ELEMENTS -- one element past the first interior pixel -- and every write is expressed
         # relative to that: dst[-1], dst[0], dst[1] for the pixel at column 1, then
@@ -641,7 +641,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
         H = rows
         W = cols
 
-        # Every interior write is above row 0 and left of column 0, so r and c are clamped into
+        # Interior pixels exclude the outermost rows and columns, so r and c are clamped into
         # [1, H-2] x [1, W-2] and the edge pixels are handled by RE-COMPUTING the interior
         # pixel they copy. That is what turns the CPU's pointer walk into a pure per-pixel map
         # and keeps every load inside the image. H <= 2 / W <= 2 have no interior at all: the
@@ -876,7 +876,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
         # (_p = i>>2, _q = (i>>1)&1, _r = i&1) and use the fraction where the bit is 1, so
         # weight i multiplies the node one step UP in each of those axes.
         if not INV:
-            # The LUT is stored AFTER the reverse tables, at a fixed offset. The sRGB LUT is
+            # The LUT uses its own int16 buffer at T_LUV_LUT. The sRGB LUT is
             # the only 8-bit forward Luv path: RGB2Luv_b's useInterpolation is set exactly when
             # srgb is true and no custom coefficients were supplied (color_lab.cpp:3368-3371),
             # so there is no linear-Luv forward arm here at all -- those two codes are refused
@@ -900,7 +900,7 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             # Node offsets. Step along each axis is 3*8 = 24 int16 per node, and the axes are
             # (p,q,r) = (R,G,B) in the CPU's own build order, so the R axis is the slowest.
             #
-            # THE WEIGHT ORDER IS THE COUNTER-INTUITIVE PART AND IT MATTERS. The CPU's table
+            # Trilinear corner weights follow the CPU table order. The table
             # builder (:1305-1312) puts pp = 16-p on w[0] and p on w[4]; trilinearInterpolate
             # (:1356-1363) then pairs w with the corner at 4*_p+2*_q+_r. So the weight carried
             # by the corner one node UP in an axis is the FRACTION in that axis, and the weight

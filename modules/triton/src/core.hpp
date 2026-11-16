@@ -2,15 +2,8 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-// MODULE-INTERNAL. Not installed, not exported: it is not part of this module's
-// public API.
-//
-// The platform-neutral core exists so the plan layer and the runtime do not have
-// to know about cv::cuda::GpuMat or cuda::Stream. A caller hands over device
-// pointers, sizes and strides; the GpuMat adapter in opencv2/triton.hpp validates
-// its arguments, unwraps them into an ImageView/ExecutionContext pair and calls
-// resizeCore() here.
-//
+// Private backend-neutral image views and resize entry. Not installed.
+// Public adapters validate native buffers and streams before calling the runtime.
 #ifndef OPENCV_TRITON_CORE_INTERNAL_HPP
 #define OPENCV_TRITON_CORE_INTERNAL_HPP
 
@@ -23,10 +16,6 @@ namespace cv { namespace triton {
 
 //! @addtogroup triton
 //! @{
-
-// A raw device-pointer API. It exists so the plan layer does not depend on
-// cuda::GpuMat; it is not a surface for callers to build ImageView structs by
-// hand, and it is not installed.
 
 /** @brief Describes one device-resident image buffer for the core API.
  *
@@ -84,10 +73,8 @@ struct ExecutionContext
  * channels, interpolation, explicit dsize, in-place rejection, overlap
  * rejection -- ROI src/dst are accepted, not rejected) against the
  * ImageView/ExecutionContext pair directly, with no GpuMat, no cuda::Stream
- * and no CUDA/HIP header dependency. `dst` must already be allocated to
- * `dsize` by the caller: unlike
- * the GpuMat adapter, this layer never allocates (it has no OutputArray to
- * allocate through).
+ * and no CUDA/HIP header dependency. The caller preallocates `dst` at `dsize`;
+ * this layer does not allocate output storage.
  *
  * @param src   Source image view, CV_8U or CV_32F, 1/3/4 channels, ROI
  *              views accepted.

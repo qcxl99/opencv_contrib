@@ -12,10 +12,7 @@
 #endif
 #include "opencv2/imgproc.hpp"
 
-// cv::cuda::resize is only a labelled timing baseline, and cudawarping is an OPTIONAL dependency
-// of perf/ (see CMakeLists.txt). Without this guard a build that has triton but not cudawarping
-// -- perfectly legal, since the implementation never uses it -- failed to compile the perf
-// module instead of simply skipping the baseline test.
+// Native CUDA resize and warpAffine comparisons require the optional cudawarping module.
 #ifdef OPENCV_TRITON_PERF_HAVE_CUDAWARPING
 #include "opencv2/cudawarping.hpp"
 #endif

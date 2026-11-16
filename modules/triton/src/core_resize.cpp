@@ -89,10 +89,8 @@ void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
 {
     if (dsize.width <= 0 || dsize.height <= 0)
         CV_Error(Error::StsUnsupportedFormat, "cv::triton::resizeCore: dsize must be explicit and non-empty");
-    // resize covers CV_8U and CV_32F only; CV_16U belongs to warpAffine. Checked here because
-    // toDeviceView is shared and accepts all three depths -- refusing later would let the
-    // request reach the compile helper, which reports -2 instead of the documented
-    // StsUnsupportedFormat.
+    // The shared view supports all operator depths; resize admits only CV_8U/CV_32F.
+    // Reject other depths before compilation with StsUnsupportedFormat.
     for (const ImageView* v : {&src, &dst})
     {
         const int depth = CV_MAT_DEPTH(v->type);
@@ -102,7 +100,7 @@ void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
                                 depth));
     }
     if (!runtime::deviceAvailable(ctx.device))
-        CV_Error(Error::StsNotImplemented, "cv::triton::resizeCore: no usable CUDA device for ctx.device; "
+        CV_Error(Error::StsNotImplemented, "cv::triton::resizeCore: no usable backend device for ctx.device; "
                                            "this module never falls back to CPU or cv::cuda");
     // scaleX/scaleY are kernel-space (source pixels per destination pixel); the computation uses
     // the inverse, as cv::resize's fx/fy. 1/(1/fx) is not always fx in double, so a caller that

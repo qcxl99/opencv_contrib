@@ -79,12 +79,21 @@ cmake --build <build> --parallel
 cmake --install <build>
 ```
 
-The supported compiler ABI is Triton 3.6.0. The CUDA configuration uses Linux,
-CUDA 12.8 and `sm_90`; see [H20 first use](doc/h20-first-use.markdown).
-The HIP configuration uses Hygon BW1000/gfx936, DTK 26.04 and flagtree 3.6.0;
-see [BW1000 first use](doc/bw1000-first-use.markdown). Select `TRITON_BACKEND=hip`
-explicitly on systems where CUDA is a compatibility layer. `auto` selects CUDA
-when OpenCV has CUDA support, otherwise an available HIP toolkit.
+The supported compiler ABI is Triton 3.6.0. Use the guide for the device and
+runtime being built:
+
+| Backend | Device target | Toolkit | Build guide |
+|---|---|---|---|
+| CUDA | NVIDIA H20, `sm_90` | CUDA 12.8 | [H20](doc/h20-first-use.markdown) |
+| HIP | Hygon BW1000, `gfx936`, wave64 | DTK 26.04 | [BW1000](doc/bw1000-first-use.markdown) |
+| HIP | AMD Radeon PRO W7900D, `gfx1100`, wave32 | ROCm 7.2.4 | [W7900D](doc/w7900d-first-use.markdown) |
+
+Both HIP configurations need a HIP-capable Triton 3.6.0 compiler, such as the
+matching flagtree package. They share the C++ API, not toolkit libraries or
+compiled artifacts. The runtime detects the actual target and warp size; a
+platform name does not select or validate them. Select `TRITON_BACKEND=hip`
+explicitly when CUDA is a compatibility layer. `auto` selects CUDA when OpenCV
+has CUDA support, otherwise an available HIP toolkit.
 
 `TRITON_PYTHON_EXECUTABLE` selects the runtime compiler interpreter.
 `TRITON_PYTHONPATH` supplies an optional import path. These settings are separate
@@ -133,10 +142,11 @@ must preallocate the resolved destination size. GpuMat operations are unavailabl
 on HIP and raise `StsNotImplemented`, including Python calls with omitted or
 `None` streams. Backend queries remain available in Python.
 
-On DTK, allocation device/range, active context generation and stream context
-are checked. The SDK does not expose allocation context through
-`HIP_POINTER_ATTRIBUTE_CONTEXT`; arbitrary foreign driver-context allocation
-ownership cannot be checked through that attribute.
+HIP allocation device/range checks are common to both configurations. DTK can
+query native context generation and stream context. On ROCm without those
+extensions, the runtime supports retained primary contexts and checks the
+stream's device. Arbitrary foreign-context allocation/stream ownership is not
+proven by those fallback queries. See the corresponding platform guide.
 
 ## Samples and tests
 
@@ -153,6 +163,9 @@ CUDA builds include CUDA lifecycle tests; HIP additionally provides
 Optional native CUDA comparisons require `cudawarping` and `cudaimgproc`; these
 are not production dependencies. Such timings use algorithms with potentially
 different numerical behavior and do not replace accuracy tests.
+
+The optional [HIP graph benchmark](perf/hip/GRAPH.md) measures warmed replay
+separately from ordinary calls.
 
 See [module maintenance](doc/maintenance.markdown) for local source generation
 and testing, and the [API header](include/opencv2/triton.hpp) for signatures.
