@@ -5,18 +5,23 @@
 #ifndef OPENCV_TRITON_VALIDATION_RESIZE_CASES_HPP
 #define OPENCV_TRITON_VALIDATION_RESIZE_CASES_HPP
 #include "opencv2/imgproc.hpp"
-namespace opencv_test { namespace triton_test { namespace resize_cases {
+namespace opencv_test
+{
+namespace triton_test
+{
+namespace resize_cases
+{
 struct RouteCase
 {
     Size src, dst;
     double fx, fy;
     int interp;
-    const char* route;
+    const char *route;
 };
 
 const RouteCase kCases[] = {
-    {Size(97,61),Size(131,53),0,0,INTER_CUBIC,"cubic"},
-    {Size(100,80),Size(37,29),0,0,INTER_AREA,"area"},
+    {Size(97, 61), Size(131, 53), 0, 0, INTER_CUBIC, "cubic"},
+    {Size(100, 80), Size(37, 29), 0, 0, INTER_AREA, "area"},
     // copy: identity, whatever the mode
     {Size(97, 53), Size(97, 53), 0, 0, INTER_NEAREST, "copy"},
     {Size(97, 53), Size(97, 53), 0, 0, INTER_LINEAR, "copy"},
@@ -66,5 +71,7 @@ const RouteCase kCases[] = {
 
 const int kTypes[] = {CV_8UC1, CV_8UC3, CV_8UC4, CV_32FC1, CV_32FC3, CV_32FC4};
 
-}}}
+}
+}
+}
 #endif

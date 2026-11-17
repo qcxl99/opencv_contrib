@@ -7,16 +7,15 @@
 // Source, destination and stream must belong to the selected device/context.
 // device is the backend device index. stream is hipStream_t/CUstream encoded as
 // an integer, or 0 for the default stream. Source and destination must not overlap.
-
 #ifndef OPENCV_TRITON_DEVICE_HPP
 #define OPENCV_TRITON_DEVICE_HPP
-
 #include <cstddef>
 #include <cstdint>
-
 #include "opencv2/core.hpp"
-
-namespace cv { namespace triton {
+namespace cv
+{
+namespace triton
+{
 
 //! @addtogroup triton
 //! @{
@@ -25,10 +24,10 @@ namespace cv { namespace triton {
  * row pitch in BYTES. A ROI view is described by its own first element and the parent's pitch. */
 struct CV_EXPORTS DeviceImage
 {
-    std::uintptr_t ptr = 0;   //!< device address of element (0, 0)
+    std::uintptr_t ptr = 0; //!< device address of element (0, 0)
     int rows = 0, cols = 0;
-    int type = 0;             //!< OpenCV type, e.g. CV_8UC3
-    std::size_t step = 0;     //!< row pitch in bytes; must cover a full packed row (zero is invalid)
+    int type = 0;         //!< OpenCV type, e.g. CV_8UC3
+    std::size_t step = 0; //!< row pitch in bytes; must cover a full packed row (zero is invalid)
 };
 
 /** @brief Return whether device is usable on the configured backend.
@@ -45,7 +44,7 @@ CV_EXPORTS bool haveDevice(int device);
  * @param stream Native hipStream_t/CUstream encoded as an integer; 0 selects the default.
  * Retain image storage until stream completion.
  */
-CV_EXPORTS void resize(const DeviceImage& src, const DeviceImage& dst, Size dsize,
+CV_EXPORTS void resize(const DeviceImage &src, const DeviceImage &dst, Size dsize,
                        int interpolation, int device, std::uintptr_t stream);
 
 /** @brief Resize using explicit size or scale factors.
@@ -58,8 +57,8 @@ CV_EXPORTS void resize(const DeviceImage& src, const DeviceImage& dst, Size dsiz
  * @param device Backend device index owning both images and stream.
  * @param stream Native stream handle; 0 selects the default. Retain storage until completion.
  */
-CV_EXPORTS void resize(const DeviceImage& src, const DeviceImage& dst, Size dsize,
-                       double fx, double fy, int interpolation, int device, std::uintptr_t stream);
+CV_EXPORTS void resize(const DeviceImage &src, const DeviceImage &dst, Size dsize, double fx,
+                       double fy, int interpolation, int device, std::uintptr_t stream);
 
 /** @brief Convert a device image between colour spaces.
  * @param src Source image with the code's required depth and channels.
@@ -69,8 +68,8 @@ CV_EXPORTS void resize(const DeviceImage& src, const DeviceImage& dst, Size dsiz
  * @param device Backend device index owning both images and stream.
  * @param stream Native stream handle; 0 selects the default. Retain storage until completion.
  */
-CV_EXPORTS void cvtColor(const DeviceImage& src, const DeviceImage& dst, int code,
-                         int device, std::uintptr_t stream);
+CV_EXPORTS void cvtColor(const DeviceImage &src, const DeviceImage &dst, int code, int device,
+                         std::uintptr_t stream);
 
 /** @brief Apply an affine transformation to a device image.
  * @param src Source image; supported types match cv::triton::warpAffine.
@@ -83,12 +82,12 @@ CV_EXPORTS void cvtColor(const DeviceImage& src, const DeviceImage& dst, int cod
  * @param device Backend device index owning both images and stream.
  * @param stream Native stream handle; 0 selects the default. Retain storage until completion.
  */
-CV_EXPORTS void warpAffine(const DeviceImage& src, const DeviceImage& dst, const double M[6],
-                           int flags, int borderMode, const Scalar& borderValue,
-                           int device, std::uintptr_t stream);
+CV_EXPORTS void warpAffine(const DeviceImage &src, const DeviceImage &dst, const double M[6],
+                           int flags, int borderMode, const Scalar &borderValue, int device,
+                           std::uintptr_t stream);
 
 //! @}
 
-}}  // namespace cv::triton
-
+}
+} // namespace cv::triton
 #endif  // OPENCV_TRITON_DEVICE_HPP

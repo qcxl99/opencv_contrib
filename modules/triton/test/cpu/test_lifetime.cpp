@@ -15,7 +15,10 @@ struct Owner
     static int deleted;
     Completion done = Completion::Error;
     int calls = 0;
-    bool failed() const { return done == Completion::Error; }
+    bool failed() const
+    {
+        return done == Completion::Error;
+    }
     bool release()
     {
         ++calls;
@@ -43,21 +46,23 @@ int main()
                                                          });
                 const int expectedQueries = !capture && life == ContextLife::Alive ? 1 : 0;
                 const auto expected = capture                     ? Reclaim::Hold
-                                    : life == ContextLife::Gone ? Reclaim::Release
-                                    : life == ContextLife::Unknown || result == Completion::Error
-                                        ? Reclaim::Error
-                                    : result == Completion::Complete ? Reclaim::Release
-                                                                     : Reclaim::Hold;
+                                      : life == ContextLife::Gone ? Reclaim::Release
+                                      : life == ContextLife::Unknown || result == Completion::Error
+                                          ? Reclaim::Error
+                                      : result == Completion::Complete ? Reclaim::Release
+                                                                       : Reclaim::Hold;
                 if (query - before != expectedQueries || decision != expected)
                 {
-                    const char* contextName = life == ContextLife::Alive ? "Alive"
-                                              : life == ContextLife::Gone ? "Gone" : "Unknown";
-                    const char* completionName = result == Completion::Complete ? "Complete"
-                                                 : result == Completion::NotReady ? "NotReady" : "Error";
+                    const char *contextName = life == ContextLife::Alive  ? "Alive"
+                                              : life == ContextLife::Gone ? "Gone"
+                                                                          : "Unknown";
+                    const char *completionName = result == Completion::Complete   ? "Complete"
+                                                 : result == Completion::NotReady ? "NotReady"
+                                                                                  : "Error";
                     std::cerr << "completionDecision: capture=" << capture
-                              << " context=" << contextName
-                              << " completion=" << completionName
-                              << " queries=" << query - before << " expectedQueries=" << expectedQueries
+                              << " context=" << contextName << " completion=" << completionName
+                              << " queries=" << query - before
+                              << " expectedQueries=" << expectedQueries
                               << " decision=" << static_cast<int>(decision)
                               << " expected=" << static_cast<int>(expected) << '\n';
                 }
@@ -85,13 +90,21 @@ int main()
     {
         waitSucceeds = success;
         assert(!releaseUpload(
-            false, ContextLife::Alive, true, true, []() { return Completion::NotReady; }, wait,
-            free, destroy));
+            false, ContextLife::Alive, true, true,
+            []()
+            {
+                return Completion::NotReady;
+            },
+            wait, free, destroy));
     }
     assert(waits == 2 && frees == 0 && destroys == 0);
     assert(!releaseUpload(
-        false, ContextLife::Alive, true, true, []() { return Completion::Error; }, wait, free,
-        destroy));
+        false, ContextLife::Alive, true, true,
+        []()
+        {
+            return Completion::Error;
+        },
+        wait, free, destroy));
     assert(!releaseUpload(
         false, ContextLife::Unknown, true, true,
         [&]()
@@ -127,11 +140,15 @@ int main()
         },
         wait, free, destroy));
     assert(releaseUpload(
-        false, ContextLife::Alive, true, true, []() { return Completion::Complete; }, wait, free,
-        destroy));
+        false, ContextLife::Alive, true, true,
+        []()
+        {
+            return Completion::Complete;
+        },
+        wait, free, destroy));
     assert(frees == 1 && destroys == 1);
     Retirement<Owner> retirement;
-    auto* owner = new Owner();
+    auto *owner = new Owner();
     retirement.dispose(owner);
     assert(retirement.size() == 1 && Owner::deleted == 0 && retirement.hasFailure());
     retirement.retry(true);
@@ -141,13 +158,15 @@ int main()
     assert(retirement.size() == 0 && Owner::deleted == 1);
     retirement.retry(false);
     assert(Owner::deleted == 1);
-    auto* waiting = new Owner(); waiting->done = Completion::NotReady;
+    auto *waiting = new Owner();
+    waiting->done = Completion::NotReady;
     retirement.dispose(waiting);
     assert(!retirement.hasFailure()); // old errors cannot poison unrelated pending uploads
-    waiting->done = Completion::Complete; retirement.retry(false);
+    waiting->done = Completion::Complete;
+    retirement.retry(false);
     PrimaryOwners<int> primaries;
     std::atomic<int> retained{0};
-    auto retain = [&](int& context, int device)
+    auto retain = [&](int &context, int device)
     {
         ++retained;
         context = device + 100;
@@ -164,7 +183,7 @@ int main()
                 int c = 0;
                 assert(primaries.get(0, c, retain) == 0 && c == 100);
             });
-    for (auto& thread : threads)
+    for (auto &thread : threads)
         thread.join();
     assert(retained == 1);
     assert(primaries.get(1, context, retain) == 0 && context == 101 && retained == 2);
@@ -178,7 +197,7 @@ int main()
     assert(setFailures == 5 && retained == 2);
     PrimaryOwners<int> retry;
     int attempts = 0;
-    auto failOnce = [&](int& c, int)
+    auto failOnce = [&](int &c, int)
     {
         c = 99;
         return ++attempts == 1 ? 7 : 0;

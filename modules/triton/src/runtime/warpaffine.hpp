@@ -16,27 +16,32 @@
 //
 // CUBIC follows genericWarp -> bicubicVec. This path computes columns from
 // absolute x without FMA; tests use the natural-width CPU destination as reference.
-#pragma once
-
+#ifndef OPENCV_TRITON_RUNTIME_WARPAFFINE_HPP
+#define OPENCV_TRITON_RUNTIME_WARPAFFINE_HPP
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
-
 #include "opencv2/core/cvdef.h"   // CV_EXPORTS
 #include "provider.hpp"
-
-namespace cv_triton_warp {
+namespace cv_triton_warp
+{
 
 // Interpolation ids, matching cv::InterpolationFlags.
-enum class Mode : int { Nearest = 0, Linear = 1, Cubic = 2 };
+enum class Mode : int
+{
+    Nearest = 0,
+    Linear = 1,
+    Cubic = 2
+};
 
-struct Request {
+struct Request
+{
     cv_triton_runtime::DeviceView src, dst;
     // The 2x3 matrix as cv::warpAffine takes it (row-major, 6 doubles).
     double M[6] = {1, 0, 0, 0, 1, 0};
-    int interpolation = 1;     // cv::INTER_LINEAR; cv::INTER_AREA normalizes to Linear
-    int border_mode = 0;       // cv::BORDER_CONSTANT
+    int interpolation = 1; // cv::INTER_LINEAR; cv::INTER_AREA normalizes to Linear
+    int border_mode = 0;   // cv::BORDER_CONSTANT
     // The border value is a Scalar: up to four components, one per channel. A scalar v means
     // Scalar(v, 0, 0, 0), a sequence means its components zero-padded to four. It stays a
     // double in the request and is converted to the output depth before launch.
@@ -45,7 +50,8 @@ struct Request {
     bool inverse_map = false;
 };
 
-struct Normalized {
+struct Normalized
+{
     Mode mode = Mode::Linear;
     int src_h = 0, src_w = 0, dst_h = 0, dst_w = 0, channels = 0;
     bool u8 = true;
@@ -68,14 +74,14 @@ struct Normalized {
 };
 
 // Source/options admission before dst allocation; no device work or reference calibration.
-cv_triton_runtime::Status validate_source(const Request& req);
+cv_triton_runtime::Status validate_source(const Request &req);
 
 // Pure output-dependent admission before allocation. Dimensions are rows then columns.
 // Reuses source rules and rejects unrepresentable sampling expressions; no CPU calibration.
-cv_triton_runtime::Status validate_output(const Request& req, int dst_h, int dst_w);
+cv_triton_runtime::Status validate_output(const Request &req, int dst_h, int dst_w);
 
 // Validation, then a cached linked-CPU arithmetic probe (no GPU). Fills every field of out.
-cv_triton_runtime::Status normalize(const Request& req, Normalized& out);
+cv_triton_runtime::Status normalize(const Request &req, Normalized &out);
 
 // The closed-form 2x3 inverse cv::warpAffine uses (D = m0*m4 - m1*m3; D = D != 0 ? 1/D : 0).
 void invert(const double M[6], double out[6]);
@@ -84,12 +90,13 @@ void invert(const double M[6], double out[6]);
 // not runtime arguments. Compared with what the JIT actually compiles by the compile helper's
 // key check at compile time -- a mismatch is a refused compilation, not a wrong result -- and
 // exercised end to end by test/test_warpaffine.cpp.
-std::string signature(const Normalized& n);
+std::string signature(const Normalized &n);
 
 // The explicit compile key's constexpr text (sorted by name).
-std::string constexprs_text(const Normalized& n);
+std::string constexprs_text(const Normalized &n);
 
 // Grid: one program per (BLOCK_H rows, BLOCK_W pixels) tile.
-void grid(const Normalized& n, unsigned out[3]);
+void grid(const Normalized &n, unsigned out[3]);
 
-}  // namespace cv_triton_warp
+} // namespace cv_triton_warp
+#endif // OPENCV_TRITON_RUNTIME_WARPAFFINE_HPP

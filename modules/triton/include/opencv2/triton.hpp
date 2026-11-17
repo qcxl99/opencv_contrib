@@ -4,14 +4,11 @@
 
 // Triton-backed image operations. See the module README and usage guides for
 // supported inputs, numerical behavior and build requirements.
-
 #ifndef OPENCV_TRITON_HPP
 #define OPENCV_TRITON_HPP
-
 #include "opencv2/core.hpp"
 #include "opencv2/core/cuda.hpp"
 #include "opencv2/imgproc.hpp"   // INTER_LINEAR / INTER_NEAREST
-
 /** @defgroup triton Triton-backed operations
  *
  * Optional GPU operations compiled on first use by Python/Triton. PyTorch is not required.
@@ -27,7 +24,10 @@
  * @see @ref tutorial_triton_validation
  */
 
-namespace cv { namespace triton {
+namespace cv
+{
+namespace triton
+{
 
 //! @addtogroup triton
 //! @{
@@ -72,19 +72,17 @@ CV_EXPORTS_W void releaseGraphResources();
  * @param interpolation INTER_NEAREST, INTER_LINEAR, INTER_CUBIC or INTER_AREA.
  * @param stream Caller stream. Retain input/output storage until it completes.
  */
-CV_EXPORTS void resize(InputArray src, OutputArray dst, Size dsize,
-                       double fx = 0, double fy = 0,
+CV_EXPORTS void resize(InputArray src, OutputArray dst, Size dsize, double fx = 0, double fy = 0,
                        int interpolation = INTER_LINEAR,
-                       cuda::Stream& stream = cuda::Stream::Null());
+                       cuda::Stream &stream = cuda::Stream::Null());
 
 /** @overload
  * @brief GpuMat form of resize.
  * The Python name is `cv2.triton.resize`; see @ref tutorial_triton_resize.
  */
-CV_EXPORTS void resize(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, Size dsize,
-                         double fx = 0, double fy = 0,
-                         int interpolation = INTER_LINEAR,
-                         cuda::Stream& stream = cuda::Stream::Null());
+CV_EXPORTS void resize(const cuda::GpuMat &src, CV_OUT cuda::GpuMat &dst, Size dsize, double fx = 0,
+                       double fy = 0, int interpolation = INTER_LINEAR,
+                       cuda::Stream &stream = cuda::Stream::Null());
 
 /** @brief Convert a GPU image between colour spaces.
  *
@@ -106,20 +104,21 @@ CV_EXPORTS void resize(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, Size d
  * @param stream Caller stream. Retain input/output storage until it completes.
  */
 CV_EXPORTS void cvtColor(InputArray src, OutputArray dst, int code,
-                         cuda::Stream& stream = cuda::Stream::Null());
+                         cuda::Stream &stream = cuda::Stream::Null());
 
 /** @overload
  * @brief GpuMat form of cvtColor.
  * The Python name is `cv2.triton.cvtColor`.
  */
-CV_EXPORTS void cvtColor(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, int code,
-                         cuda::Stream& stream = cuda::Stream::Null());
+CV_EXPORTS void cvtColor(const cuda::GpuMat &src, CV_OUT cuda::GpuMat &dst, int code,
+                         cuda::Stream &stream = cuda::Stream::Null());
 
 /** @brief Convert a CUDA GpuMat; see cvtColor for supported inputs and conversions.
  * The Python adapter accepts Ptr<cuda::Stream> so an omitted stream can select the default.
  */
-CV_EXPORTS_AS(cvtColor) void cvtColorForPython(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
-                                             int code, Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
+CV_EXPORTS_AS(cvtColor)
+void cvtColorForPython(const cuda::GpuMat &src, CV_OUT cuda::GpuMat &dst, int code,
+                       Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
 
 /** @brief Apply an affine transformation to a GPU image.
  *
@@ -147,43 +146,39 @@ CV_EXPORTS_AS(cvtColor) void cvtColorForPython(const cuda::GpuMat& src, CV_OUT c
  * @param stream Caller stream. Retain input/output storage until it completes.
  */
 CV_EXPORTS void warpAffine(InputArray src, OutputArray dst, InputArray M, Size dsize,
-                           int flags = INTER_LINEAR,
-                           int borderMode = BORDER_CONSTANT,
-                           const Scalar& borderValue = Scalar(),
-                           cuda::Stream& stream = cuda::Stream::Null());
+                           int flags = INTER_LINEAR, int borderMode = BORDER_CONSTANT,
+                           const Scalar &borderValue = Scalar(),
+                           cuda::Stream &stream = cuda::Stream::Null());
 
 /** @overload
  *
  * The form exposed to Python:
  * `cv2.triton.warpAffine(gpu_src, M, dsize[, dst[, flags[, borderMode[, borderValue[, stream]]]]]) -> dst`.
  */
-CV_EXPORTS void warpAffine(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
-                             InputArray M, Size dsize,
-                             int flags = INTER_LINEAR,
-                             int borderMode = BORDER_CONSTANT,
-                             const Scalar& borderValue = Scalar(),
-                             cuda::Stream& stream = cuda::Stream::Null());
+CV_EXPORTS void warpAffine(const cuda::GpuMat &src, CV_OUT cuda::GpuMat &dst, InputArray M,
+                           Size dsize, int flags = INTER_LINEAR, int borderMode = BORDER_CONSTANT,
+                           const Scalar &borderValue = Scalar(),
+                           cuda::Stream &stream = cuda::Stream::Null());
 
 /** @brief Resize a CUDA GpuMat; see resize for supported inputs and interpolation.
  * The Python adapter accepts Ptr<cuda::Stream> so an omitted stream can select the default.
  */
-CV_EXPORTS_AS(resize) void resizeForPython(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst, Size dsize,
-                                         double fx = 0, double fy = 0,
-                                         int interpolation = INTER_LINEAR,
-                                         Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
+CV_EXPORTS_AS(resize)
+void resizeForPython(const cuda::GpuMat &src, CV_OUT cuda::GpuMat &dst, Size dsize, double fx = 0,
+                     double fy = 0, int interpolation = INTER_LINEAR,
+                     Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
 
 /** @brief Transform a CUDA GpuMat; see warpAffine for sampling and border behavior.
  * The Python adapter accepts Ptr<cuda::Stream> so an omitted stream can select the default.
  */
-CV_EXPORTS_AS(warpAffine) void warpAffineForPython(const cuda::GpuMat& src, CV_OUT cuda::GpuMat& dst,
-                                                 InputArray M, Size dsize,
-                                                 int flags = INTER_LINEAR,
-                                                 int borderMode = BORDER_CONSTANT,
-                                                 const Scalar& borderValue = Scalar(),
-                                                 Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
+CV_EXPORTS_AS(warpAffine)
+void warpAffineForPython(const cuda::GpuMat &src, CV_OUT cuda::GpuMat &dst, InputArray M,
+                         Size dsize, int flags = INTER_LINEAR, int borderMode = BORDER_CONSTANT,
+                         const Scalar &borderValue = Scalar(),
+                         Ptr<cuda::Stream> stream = Ptr<cuda::Stream>());
 
 //! @}
 
-}}  // namespace cv::triton
-
+}
+} // namespace cv::triton
 #endif  // OPENCV_TRITON_HPP

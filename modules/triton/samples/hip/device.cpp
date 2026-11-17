@@ -10,23 +10,30 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-
 static void checked(hipError_t code)
 {
-    if (code != hipSuccess) throw std::runtime_error(hipGetErrorString(code));
+    if (code != hipSuccess)
+        throw std::runtime_error(hipGetErrorString(code));
 }
 
 struct Buffer
 {
-    void* ptr = nullptr;
+    void *ptr = nullptr;
     std::size_t bytes;
-    explicit Buffer(std::size_t size) : bytes(size) { checked(hipMalloc(&ptr, bytes)); }
-    ~Buffer() { if (ptr) (void)hipFree(ptr); }
-    Buffer(const Buffer&) = delete;
-    Buffer& operator=(const Buffer&) = delete;
+    explicit Buffer(std::size_t size) : bytes(size)
+    {
+        checked(hipMalloc(&ptr, bytes));
+    }
+    ~Buffer()
+    {
+        if (ptr)
+            (void)hipFree(ptr);
+    }
+    Buffer(const Buffer &) = delete;
+    Buffer &operator=(const Buffer &) = delete;
 };
 
-int main(int argc, char** argv)
+int main(int argc, char **argv)
 {
     hipStream_t stream = nullptr;
     try
@@ -34,14 +41,16 @@ int main(int argc, char** argv)
         const std::string op = argc > 1 ? argv[1] : "resize";
         if (op != "resize" && op != "warp" && op != "cvtcolor")
             throw std::runtime_error("usage: example_triton_device [resize|warp|cvtcolor]");
-        if (!cv::triton::haveDevice(0)) throw std::runtime_error("no usable HIP device");
+        if (!cv::triton::haveDevice(0))
+            throw std::runtime_error("no usable HIP device");
         checked(hipStreamCreate(&stream));
         const int rows = 96, cols = 128;
-        cv::Mat host(rows, cols,op == "cvtcolor" ? CV_8UC3 : CV_8UC1);
+        cv::Mat host(rows, cols, op == "cvtcolor" ? CV_8UC3 : CV_8UC1);
         for (int y = 0; y < rows; ++y)
             for (int x = 0; x < cols; ++x)
                 for (int c = 0; c < host.channels(); ++c)
-                    host.ptr<uchar>(y)[x * host.channels() + c] = static_cast<uchar>((x * 3 + y * 7 + c * 59) % 256);
+                    host.ptr<uchar>(y)[x * host.channels() + c] =
+                        static_cast<uchar>((x * 3 + y * 7 + c * 59) % 256);
         const cv::Size size = op == "resize" ? cv::Size(63, 47) : host.size();
         Buffer input(host.total() * host.elemSize()), output(static_cast<std::size_t>(size.area()));
         checked(hipMemcpyAsync(input.ptr, host.data, input.bytes, hipMemcpyHostToDevice, stream));
@@ -59,20 +68,23 @@ int main(int argc, char** argv)
         cv::Mat reference;
         if (op == "resize")
         {
-            cv::triton::resize(src, dst, size, cv::INTER_AREA, 0, reinterpret_cast<std::uintptr_t>(stream));
+            cv::triton::resize(src, dst, size, cv::INTER_AREA, 0,
+                               reinterpret_cast<std::uintptr_t>(stream));
             cv::resize(host, reference, size, 0, 0, cv::INTER_AREA);
         }
         else if (op == "cvtcolor")
         {
-            cv::triton::cvtColor(src, dst, cv::COLOR_BGR2GRAY, 0, reinterpret_cast<std::uintptr_t>(stream));
+            cv::triton::cvtColor(src, dst, cv::COLOR_BGR2GRAY, 0,
+                                 reinterpret_cast<std::uintptr_t>(stream));
             cv::cvtColor(host, reference, cv::COLOR_BGR2GRAY);
         }
         else
         {
             const double values[6] = {.9, .43589, -7, -.43589, .9, 21};
             cv::triton::warpAffine(src, dst, values, cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
-                                   cv::BORDER_REPLICATE, cv::Scalar(), 0, reinterpret_cast<std::uintptr_t>(stream));
-            cv::Mat M(2, 3, CV_64F, const_cast<double*>(values)), wide;
+                                   cv::BORDER_REPLICATE, cv::Scalar(), 0,
+                                   reinterpret_cast<std::uintptr_t>(stream));
+            cv::Mat M(2, 3, CV_64F, const_cast<double *>(values)), wide;
             // The NEAREST/LINEAR reference is the selected CPU vector path.
             cv::warpAffine(host, wide, M, cv::Size(256, size.height),
                            cv::INTER_LINEAR | cv::WARP_INVERSE_MAP, cv::BORDER_REPLICATE);
@@ -87,7 +99,7 @@ int main(int argc, char** argv)
         stream = nullptr;
         return error == 0 ? 0 : 1;
     }
-    catch (const std::exception& error)
+    catch (const std::exception &error)
     {
         if (stream)
         {

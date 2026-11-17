@@ -8,9 +8,9 @@
 #include <functional>
 #include <iostream>
 using namespace cv_triton_runtime;
-static Json& field(Json& j, const std::string& key)
+static Json &field(Json &j, const std::string &key)
 {
-    for (auto& p : j.obj)
+    for (auto &p : j.obj)
         if (p.first == key)
             return p.second;
     j.obj.emplace_back(key, Json());
@@ -23,7 +23,7 @@ static Json num(double n)
     j.num = n;
     return j;
 }
-static Json str(const char* s)
+static Json str(const char *s)
 {
     Json j;
     j.kind = Json::String;
@@ -43,7 +43,7 @@ int main()
     assert(normal.rows == 32 && normal.height == 16 && normal.mode == "INTER_LINEAR" &&
            !normal.inverse && normal.roi);
     int rejected = 0;
-    auto reject = [&](std::function<void(Json&)> mutate)
+    auto reject = [&](std::function<void(Json &)> mutate)
     {
         Json test = good;
         mutate(test);
@@ -52,29 +52,85 @@ int main()
             (void)triton_graph::parse(test);
             assert(false);
         }
-        catch (const std::runtime_error&)
+        catch (const std::runtime_error &)
         {
             ++rejected;
         }
     };
     for (double n : {32.9, 0.0, -1.0, 4097.0, 2147483648.0, std::numeric_limits<double>::infinity(),
                      std::numeric_limits<double>::quiet_NaN()})
-        reject([&](Json& j) { field(field(j, "case"), "src_h") = num(n); });
-    reject([](Json& j) { field(field(j, "case"), "src_w") = str("32"); });
-    reject([](Json& j) { field(j, "case") = num(1); });
-    reject([](Json& j) { field(j, "op") = num(1); });
-    reject([](Json& j) { field(j, "samples") = num(10.5); });
-    reject([](Json& j) { field(j, "samples") = num(0); });
-    reject([](Json& j) { field(j, "captured_calls") = num(251); });
-    reject([](Json& j) { field(j, "captured_calls") = num(1e100); });
-    reject([](Json& j) { field(j, "roi") = num(2); });
-    reject([](Json& j) { field(field(j, "case"), "inverse") = num(1); });
-    reject([](Json& j) { field(field(j, "case"), "mode") = str("bad_NEAREST"); });
-    reject([](Json& j) { field(field(j, "case"), "border") = str("BORDER_TRANSPARENT"); });
-    reject([](Json& j) { field(field(j, "case"), "borderValue") = num(0); });
-    reject([](Json& j) { field(field(j, "case"), "M") = str("123456"); });
+        reject(
+            [&](Json &j)
+            {
+                field(field(j, "case"), "src_h") = num(n);
+            });
     reject(
-        [](Json& j)
+        [](Json &j)
+        {
+            field(field(j, "case"), "src_w") = str("32");
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "case") = num(1);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "op") = num(1);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "samples") = num(10.5);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "samples") = num(0);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "captured_calls") = num(251);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "captured_calls") = num(1e100);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "roi") = num(2);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(field(j, "case"), "inverse") = num(1);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(field(j, "case"), "mode") = str("bad_NEAREST");
+        });
+    reject(
+        [](Json &j)
+        {
+            field(field(j, "case"), "border") = str("BORDER_TRANSPARENT");
+        });
+    reject(
+        [](Json &j)
+        {
+            field(field(j, "case"), "borderValue") = num(0);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(field(j, "case"), "M") = str("123456");
+        });
+    reject(
+        [](Json &j)
         {
             Json a;
             a.kind = Json::Array;
@@ -83,21 +139,45 @@ int main()
         });
     for (auto invalid : {str("1"), num(std::numeric_limits<double>::infinity()), Json()})
         reject(
-            [&](Json& j)
+            [&](Json &j)
             {
                 Json a;
                 a.kind = Json::Array;
                 a.arr = {num(1), num(0), num(0), num(0), num(1), invalid};
                 field(field(j, "case"), "M") = a;
             });
-    reject([](Json& j) { field(field(j, "case"), "id") = num(0); });
-    reject([](Json& j) { field(field(j, "case"), "channels") = num(2); });
-    reject([](Json& j) { field(j, "case").obj.emplace_back("src_h", num(32)); });
-    reject([](Json& j) { field(field(j, "case"), "ignored_option") = num(1); });
-    reject([](Json& j) { field(j, "input_path") = str(""); });
-    reject([](Json& j) { field(j, "input_sha256") = str("invalid"); });
     reject(
-        [](Json& j)
+        [](Json &j)
+        {
+            field(field(j, "case"), "id") = num(0);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(field(j, "case"), "channels") = num(2);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "case").obj.emplace_back("src_h", num(32));
+        });
+    reject(
+        [](Json &j)
+        {
+            field(field(j, "case"), "ignored_option") = num(1);
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "input_path") = str("");
+        });
+    reject(
+        [](Json &j)
+        {
+            field(j, "input_sha256") = str("invalid");
+        });
+    reject(
+        [](Json &j)
         {
             field(j, "op") = str("resize");
             field(field(j, "case"), "dst_h") = num(32);
@@ -115,7 +195,7 @@ int main()
                 (void)triton_graph::number(raw, "src_h");
                 assert(false);
             }
-            catch (const std::runtime_error&)
+            catch (const std::runtime_error &)
             {
                 ++rejected;
             }
@@ -137,7 +217,7 @@ int main()
         (void)triton_graph::product(std::numeric_limits<std::size_t>::max(), 2);
         assert(false);
     }
-    catch (const std::runtime_error&)
+    catch (const std::runtime_error &)
     {
         ++rejected;
     }

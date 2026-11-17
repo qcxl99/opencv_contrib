@@ -1,14 +1,12 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
-
 #ifndef OPENCV_TRITON_LIFETIME_HPP
 #define OPENCV_TRITON_LIFETIME_HPP
 #include <atomic>
 #include <map>
 #include <mutex>
 #include <vector>
-
 namespace cv_triton_runtime
 {
 enum class ContextLife
@@ -82,17 +80,17 @@ template <class Query> Reclaim completionDecision(bool capturing, ContextLife li
 template <class T> class Retirement
 {
     std::mutex mutex;
-    std::vector<T*> held;
+    std::vector<T *> held;
     std::atomic<std::size_t> count{0};
 
   public:
-    void hold(T* value)
+    void hold(T *value)
     {
         std::lock_guard<std::mutex> lock(mutex);
         held.push_back(value);
         count.store(held.size());
     }
-    void dispose(T* value)
+    void dispose(T *value)
     {
         if (value->release())
         {
@@ -105,13 +103,13 @@ template <class T> class Retirement
     {
         if (capturing || count.load() == 0)
             return;
-        std::vector<T*> retry;
+        std::vector<T *> retry;
         {
             std::lock_guard<std::mutex> lock(mutex);
             retry.swap(held);
             count.store(0);
         }
-        for (T* value : retry)
+        for (T *value : retry)
             dispose(value);
     }
     std::size_t size()
@@ -121,8 +119,9 @@ template <class T> class Retirement
     bool hasFailure()
     {
         std::lock_guard<std::mutex> lock(mutex);
-        for (const T* value : held)
-            if (value->failed()) return true;
+        for (const T *value : held)
+            if (value->failed())
+                return true;
         return false;
     }
 };
@@ -135,7 +134,7 @@ template <class Context> class PrimaryOwners
     std::map<int, Context> owned;
 
   public:
-    template <class Retain> int get(int device, Context& context, Retain retain)
+    template <class Retain> int get(int device, Context &context, Retain retain)
     {
         std::lock_guard<std::mutex> lock(mutex);
         auto it = owned.find(device);

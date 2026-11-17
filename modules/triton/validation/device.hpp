@@ -10,30 +10,30 @@
 #include <memory>
 #include <cstdint>
 #include "opencv2/core.hpp"
-
-namespace triton_validation {
+namespace triton_validation
+{
 bool available();
-const char* backend();
+const char *backend();
 class Stream
 {
-public:
+  public:
     struct Impl;
     explicit Stream(bool useDefault = false);
     // Wait on the host for this stream to complete.
     void wait() const;
     // Add a device-side dependency; the host does not wait for the producer.
-    void waitFor(const Stream& producer) const;
+    void waitFor(const Stream &producer) const;
     std::shared_ptr<Impl> impl;
 };
 class Image
 {
-public:
+  public:
     struct Impl;
     Image();
     Image(cv::Size size, int type);
-    Image(const Image& parent, cv::Rect roi);  // shared allocation, independent view/pitch
+    Image(const Image &parent, cv::Rect roi); // shared allocation, independent view/pitch
     // Blocking transfers used for setup/checking, outside performance cycles.
-    void upload(const cv::Mat& host);
+    void upload(const cv::Mat &host);
     cv::Mat download() const;
     // Reuse matching storage; otherwise allocate the requested size/type.
     void create(cv::Size size, int type);
@@ -43,10 +43,10 @@ public:
     std::uintptr_t address() const;
     std::shared_ptr<Impl> impl;
 };
-void resize(const Image& src, Image& dst, cv::Size size, double fx, double fy,
-            int interpolation, Stream& stream);
-void cvtColor(const Image& src, Image& dst, int code, Stream& stream);
-void warpAffine(const Image& src, Image& dst, const cv::Mat& matrix, cv::Size size,
-                int flags, int border, const cv::Scalar& value, Stream& stream);
+void resize(const Image &src, Image &dst, cv::Size size, double fx, double fy, int interpolation,
+            Stream &stream);
+void cvtColor(const Image &src, Image &dst, int code, Stream &stream);
+void warpAffine(const Image &src, Image &dst, const cv::Mat &matrix, cv::Size size, int flags,
+                int border, const cv::Scalar &value, Stream &stream);
 }
 #endif

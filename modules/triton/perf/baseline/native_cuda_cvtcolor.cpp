@@ -6,18 +6,19 @@
 // Explicit stream, preallocated output, 20 warmups, and call+completion timing
 // match the Triton rows. Sampling/rounding may differ; this is not an accuracy oracle.
 // Four existing codes are a comparison subset, not the CUDA support catalogue.
-
 #include "native_cuda_precomp.hpp"
+namespace opencv_test
+{
+namespace
+{
 
-namespace opencv_test { namespace {
-
-PERF_TEST_P(Sz_Code, NativeCudaCvtColor_Reference, testing::Combine(
-    colorPerfSizes(),
-    testing::Values((int)cv::COLOR_BGR2GRAY, (int)cv::COLOR_BGR2YUV,
-                    (int)cv::COLOR_BGR2YCrCb, (int)cv::COLOR_BGR2HSV)))
+PERF_TEST_P(Sz_Code, NativeCudaCvtColor_Reference,
+            testing::Combine(colorPerfSizes(),
+                             testing::Values((int)cv::COLOR_BGR2GRAY, (int)cv::COLOR_BGR2YUV,
+                                             (int)cv::COLOR_BGR2YCrCb, (int)cv::COLOR_BGR2HSV)))
 {
     const cv::Size size = GET_PARAM(0);
-    const int code      = GET_PARAM(1);
+    const int code = GET_PARAM(1);
 
     cv::Mat host(size, CV_8UC(3));
     declare.in(host, WARMUP_RNG);
@@ -39,4 +40,5 @@ PERF_TEST_P(Sz_Code, NativeCudaCvtColor_Reference, testing::Combine(
     CUDA_SANITY_CHECK(dst, 1e-10);
 }
 
-}} // namespace
+}
+} // namespace

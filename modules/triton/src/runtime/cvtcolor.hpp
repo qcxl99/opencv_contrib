@@ -23,34 +23,45 @@
 // test/test_cvtcolor.cpp compares the public GPU entry with the linked
 // cv::cvtColor implementation. CPU dispatch, IPP/HAL and compiler options can
 // affect the reference arithmetic. See the module documentation for limitations.
-#pragma once
-
+#ifndef OPENCV_TRITON_RUNTIME_CVTCOLOR_HPP
+#define OPENCV_TRITON_RUNTIME_CVTCOLOR_HPP
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
-
 #include "opencv2/core/cvdef.h"   // CV_EXPORTS
 #include "provider.hpp"
-
-namespace cv_triton_color {
+namespace cv_triton_color
+{
 
 // Operation ids. These are the OP constexprs of kernels/cvtcolor_cpu.py.
-enum class Op : int {
-    Gray = 0, Permute = 1, Yuv = 2, YCrCb = 3, Hsv = 4, Packed = 5, Bayer = 6,
-    Xyz = 7, Lab = 8, Luv = 9, Yuv422 = 10, Yuv420 = 11
+enum class Op : int
+{
+    Gray = 0,
+    Permute = 1,
+    Yuv = 2,
+    YCrCb = 3,
+    Hsv = 4,
+    Packed = 5,
+    Bayer = 6,
+    Xyz = 7,
+    Lab = 8,
+    Luv = 9,
+    Yuv422 = 10,
+    Yuv420 = 11
 };
 
 // Arithmetic field meanings follow OpenCV 5.0.0 imgproc colour/demosaicing symbols.
-struct CodeSpec {
-    const char* name;      // the OpenCV constant name, e.g. "BGR2YUV"
-    int code;              // the numeric cv::COLOR_* value
+struct CodeSpec
+{
+    const char *name; // the OpenCV constant name, e.g. "BGR2YUV"
+    int code;         // the numeric cv::COLOR_* value
     Op op;
-    int scn, dcn;          // source / destination channel count
-    int blue;              // blue index: 0 for a BGR-order source, 2 for an RGB-order one
-    bool inverse;          // direction: YUV/YCrCb inverse, and Packed decode (2ch -> colour)
-    int hrange;            // Hsv only: 180 for HSV, 256 for HSV_FULL (h += h<0 ? hrange : 0)
-    int perm[4];           // Permute only: source channel for each dst channel; -1 = opaque alpha
+    int scn, dcn; // source / destination channel count
+    int blue;     // blue index: 0 for a BGR-order source, 2 for an RGB-order one
+    bool inverse; // direction: YUV/YCrCb inverse, and Packed decode (2ch -> colour)
+    int hrange;   // Hsv only: 180 for HSV, 256 for HSV_FULL (h += h<0 ? hrange : 0)
+    int perm[4];  // Permute only: source channel for each dst channel; -1 = opaque alpha
     // Packed only: green-bit count, the CPU's own discriminator between the two formats
     // (color.hpp greenBits(): 6 for every BGR565 code, 5 for every BGR555 code). It is a
     // field rather than something derived from the code value because the CPU decides by
@@ -83,20 +94,22 @@ struct CodeSpec {
 // substitution and no fallback to the CPU implementation.
 // CV_EXPORTS for the same reason `all()` is: OpenCV builds with hidden visibility and the
 // accuracy test checks the coefficient rows against coeffs_for.
-CV_EXPORTS const CodeSpec* find(int code);
+CV_EXPORTS const CodeSpec *find(int code);
 // CV_EXPORTS because OpenCV builds with hidden visibility and the accuracy test reads this
 // table to prove the test's own coverage (test/test_cvtcolor.cpp, CoversEverySupportedCode).
-CV_EXPORTS const std::vector<CodeSpec>& all();
+CV_EXPORTS const std::vector<CodeSpec> &all();
 
-struct Request {
+struct Request
+{
     cv_triton_runtime::DeviceView src, dst;
     int code = 0;
 };
 
-struct Normalized {
-    const CodeSpec* spec = nullptr;
+struct Normalized
+{
+    const CodeSpec *spec = nullptr;
     int rows = 0, cols = 0;
-    long long n = 0;            // output pixels = rows * cols
+    long long n = 0; // output pixels = rows * cols
     // Both views have matching depth; normalize owns the family-specific admission.
     bool u16 = false;
     bool f32 = false;
@@ -108,15 +121,21 @@ CV_EXPORTS bool float_cpu_separate4();
 
 // Source admission used by every adapter before output allocation. A real source
 // view (pointer, shape, byte step and optional allocation span) is required; no device access.
-struct Output { const CodeSpec* spec = nullptr; int rows = 0, cols = 0; };
-cv_triton_runtime::Status resolve_output(const cv_triton_runtime::DeviceView& src, int code, Output& out);
+struct Output
+{
+    const CodeSpec *spec = nullptr;
+    int rows = 0, cols = 0;
+};
+cv_triton_runtime::Status resolve_output(const cv_triton_runtime::DeviceView &src, int code,
+                                         Output &out);
 
 // Pure checks. On success `out.spec` points into the static table.
-cv_triton_runtime::Status normalize(const Request& req, Normalized& out);
+cv_triton_runtime::Status normalize(const Request &req, Normalized &out);
 
 // The two int[256] tables RGB2HSV_b divides by, built exactly as the CPU builds them
 // (color_hsv.simd.hpp: hsv_shift = 12, round-to-nearest on a double division).
-struct HsvTables {
+struct HsvTables
+{
     std::vector<int> sdiv, hdiv;
 };
 HsvTables hsv_tables();
@@ -129,20 +148,21 @@ HsvTables hsv_tables_full();
 // Replacing those operations with host libm functions can change rounded entries.
 // The element types match kernel loads: cbrt requires int32 for values up to 37555;
 // luv uses int64 because LvToVpl_b exceeds the signed 32-bit range.
-struct LabLuvTables {
-    std::vector<int> gamma;       // 256:     sRGBGammaTab_b (or linearGammaTab_b, identical scale)
-    std::vector<int> cbrt;        // 3072:    LabCbrtTab_b
-    std::vector<int> yf;          // 512:     LabToYF_b, 2 per L
-    std::vector<int> abxz;        // 36864:   abToXZ_b, already shifted to start at index 0
-    std::vector<int> invgamma;    // 4096:    sRGBInvGammaTab_b
-    std::vector<int> lu;          // 65536:   LuToUp_b
-    std::vector<int> lv;          // 65536:   LvToVp_b
-    std::vector<long long> lvpl;  // 65536:   LvToVpl_b
-    std::vector<short> luvLut;    // 33^3*3*8: RGB2LuvLUT_s16, built only for Op::Luv forward
+struct LabLuvTables
+{
+    std::vector<int> gamma;      // 256:     sRGBGammaTab_b (or linearGammaTab_b, identical scale)
+    std::vector<int> cbrt;       // 3072:    LabCbrtTab_b
+    std::vector<int> yf;         // 512:     LabToYF_b, 2 per L
+    std::vector<int> abxz;       // 36864:   abToXZ_b, already shifted to start at index 0
+    std::vector<int> invgamma;   // 4096:    sRGBInvGammaTab_b
+    std::vector<int> lu;         // 65536:   LuToUp_b
+    std::vector<int> lv;         // 65536:   LvToVp_b
+    std::vector<long long> lvpl; // 65536:   LvToVpl_b
+    std::vector<short> luvLut;   // 33^3*3*8: RGB2LuvLUT_s16, built only for Op::Luv forward
 };
 // Built on first use and cached for the process: the Luv builder runs 33^3 softfloat
 // evaluations plus a 33^3*8 fill, and it does not depend on the code.
-const LabLuvTables& labluv_tables();
+const LabLuvTables &labluv_tables();
 
 // The nine integer coefficients of a Xyz/Lab/Luv code, replicated from the CPU's constructors
 // in color_lab.cpp (see the definition). Filled into CodeSpec::k when the table is built; zero
@@ -153,7 +173,8 @@ CV_EXPORTS void coeffs_for(int code, int out[9]);
 // The offset, in ENTRIES, of each array inside the corresponding device buffer. These are the
 // numbers the kernel hardcodes too (kernels/cvtcolor_cpu.py: T_GAMMA ... T_LV), and
 // test_cvtcolor.cpp's numeric tests are what would fail first if the two drifted apart.
-struct LabLuvLayout {
+struct LabLuvLayout
+{
     static const int gamma = 0;
     static const int cbrt = 256;
     static const int yf = 256 + 3072;
@@ -170,14 +191,15 @@ struct LabLuvLayout {
 // The runtime-argument list of the one jit function, in Triton's type strings. Constexpr
 // parameters are not runtime arguments. The compile helper checks this against
 // the signature of the compiled kernel.
-std::string signature(const Normalized& n);
+std::string signature(const Normalized &n);
 
 // The explicit compile key. Triton is given no implicit specialisation (every channel count
 // and the operation are constexprs, every other argument is do_not_specialize), so this key
 // is complete: equal keys run the same binary whatever the sizes or pointers.
-std::string constexprs_text(const Normalized& n);
-int block_size(const Normalized& n);
-int num_warps(const Normalized& n);
-void grid(const Normalized& n, int block, unsigned out[3]);   // {rows, ceil(cols/BLOCK), 1}
+std::string constexprs_text(const Normalized &n);
+int block_size(const Normalized &n);
+int num_warps(const Normalized &n);
+void grid(const Normalized &n, int block, unsigned out[3]); // {rows, ceil(cols/BLOCK), 1}
 
-}  // namespace cv_triton_color
+} // namespace cv_triton_color
+#endif // OPENCV_TRITON_RUNTIME_CVTCOLOR_HPP

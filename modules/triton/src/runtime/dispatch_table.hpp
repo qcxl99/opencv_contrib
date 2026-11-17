@@ -2,16 +2,18 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 // Private default resize launch configurations, indexed by route, layout and depth.
-#pragma once
+#ifndef OPENCV_TRITON_RUNTIME_DISPATCH_TABLE_HPP
+#define OPENCV_TRITON_RUNTIME_DISPATCH_TABLE_HPP
+namespace cv_triton_runtime
+{
 
-namespace cv_triton_runtime {
-
-struct DispatchRow {
-    const char* route;   // route_name(): copy, nearest, linear, cubic, area_fast, area
+struct DispatchRow
+{
+    const char *route; // route_name(): copy, nearest, linear, cubic, area_fast, area
     int cn;
     bool f32;
-    const char* ydir;    // "up" when dst_h > src_h, else "down"
-    bool two_by_two;     // area_fast only: ix == 2 and iy == 2
+    const char *ydir; // "up" when dst_h > src_h, else "down"
+    bool two_by_two;  // area_fast only: ix == 2 and iy == 2
     int block_h, block_w, num_warps;
 };
 
@@ -64,4 +66,5 @@ inline constexpr DispatchRow DISPATCH_TABLE[] = {
     {"area_fast", 3, true, "down", true, 1, 64, 1},
 };
 
-}  // namespace cv_triton_runtime
+} // namespace cv_triton_runtime
+#endif // OPENCV_TRITON_RUNTIME_DISPATCH_TABLE_HPP

@@ -11,16 +11,13 @@
 // CV_8U is exact, CV_16U permits one level, and CV_32F uses a per-element bound.
 // Coverage includes interpolation/borders, affine geometry, degenerate axes,
 // pitched ROIs, output reuse, guard bands and unsupported requests.
-
 #include "test_helpers.hpp"
-
 #include <cuda.h>
-
 #include <cmath>
-#include <iostream>
-#include <limits>
-
-namespace opencv_test { namespace {
+namespace opencv_test
+{
+namespace
+{
 
 using namespace triton_test;
 
@@ -31,7 +28,8 @@ namespace wa = cv_triton_warp;
 static Mat toMat6(const double m[6])
 {
     Mat M(2, 3, CV_64F);
-    for (int i = 0; i < 6; ++i) M.at<double>(i / 3, i % 3) = m[i];
+    for (int i = 0; i < 6; ++i)
+        M.at<double>(i / 3, i % 3) = m[i];
     return M;
 }
 
@@ -43,16 +41,18 @@ static Mat M6(double a, double b, double c, double d, double e, double f)
 }
 
 /** warpAffine through the module, then download. */
-static Mat gpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int border,
-                   const Scalar& bv = Scalar(), cuda::Stream* stream = nullptr)
+static Mat gpuWarp(const Mat &src, const Mat &M, Size dsize, int flags, int border,
+                   const Scalar &bv = Scalar(), cuda::Stream *stream = nullptr)
 {
     cuda::GpuMat gsrc(src), gdst;
     if (stream)
         cv::triton::warpAffine(gsrc, gdst, M, dsize, flags, border, bv, *stream);
     else
         cv::triton::warpAffine(gsrc, gdst, M, dsize, flags, border, bv);
-    if (stream) stream->waitForCompletion();
-    else cuda::Stream::Null().waitForCompletion();
+    if (stream)
+        stream->waitForCompletion();
+    else
+        cuda::Stream::Null().waitForCompletion();
     Mat out;
     gdst.download(out);
     return out;
@@ -68,15 +68,15 @@ static Mat gpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int bord
  * against the linked implementation. CUBIC instead computes coordinates from
  * absolute x in genericWarp/bicubicVec without this body/tail distinction.
  */
-static Mat cpuWarp(const Mat& src, const Mat& M, Size dsize, int flags, int border,
-                   const Scalar& bv = Scalar())
+static Mat cpuWarp(const Mat &src, const Mat &M, Size dsize, int flags, int border,
+                   const Scalar &bv = Scalar())
 {
     return warpReference(src, M, dsize, flags, border, bv);
 }
 
 /** The user-visible result at exactly `dsize`, for the one test that documents the divergence. */
-static Mat cpuWarpNatural(const Mat& src, const Mat& M, Size dsize, int flags, int border,
-                          const Scalar& bv = Scalar())
+static Mat cpuWarpNatural(const Mat &src, const Mat &M, Size dsize, int flags, int border,
+                          const Scalar &bv = Scalar())
 {
     Mat out;
     cv::warpAffine(src, out, M, dsize, flags, border, bv);
@@ -96,14 +96,16 @@ static double f32Tol(double ref_value)
 struct WarpStats
 {
     long long elements = 0;
-    long long outside = 0;        // exceeds the accuracy bound
-    long long not_identical = 0;  // bitwise different, inside or outside
+    long long outside = 0;       // exceeds the accuracy bound
+    long long not_identical = 0; // bitwise different, inside or outside
     double max_abs = 0;
-    double max_norm = 0;          // |diff| / bound, per element
-    double max_ulp = 0;           // |diff| / spacing(ref), per element
-    void merge(const WarpStats& o)
+    double max_norm = 0; // |diff| / bound, per element
+    double max_ulp = 0;  // |diff| / spacing(ref), per element
+    void merge(const WarpStats &o)
     {
-        elements += o.elements; outside += o.outside; not_identical += o.not_identical;
+        elements += o.elements;
+        outside += o.outside;
+        not_identical += o.not_identical;
         max_abs = std::max(max_abs, o.max_abs);
         max_norm = std::max(max_norm, o.max_norm);
         max_ulp = std::max(max_ulp, o.max_ulp);
@@ -121,8 +123,8 @@ static double spacing_at(float v)
 
 /** Compare CV_8U exactly, CV_16U within 1 LSB, and CV_32F within
  *  min(5e-5*max(|ref|,1), 1e-4). */
-static ::testing::AssertionResult meetsWarpContract(const Mat& got, const Mat& ref_,
-                                                    WarpStats* stats = nullptr)
+static ::testing::AssertionResult meetsWarpContract(const Mat &got, const Mat &ref_,
+                                                    WarpStats *stats = nullptr)
 {
     if (got.size() != ref_.size() || got.type() != ref_.type())
         return ::testing::AssertionFailure() << "size/type " << got.size() << "/" << got.type()
@@ -133,55 +135,63 @@ static ::testing::AssertionResult meetsWarpContract(const Mat& got, const Mat& r
     {
         if (got.depth() == CV_8U)
         {
-            const uchar* a = got.ptr<uchar>(y);
-            const uchar* b = ref_.ptr<uchar>(y);
+            const uchar *a = got.ptr<uchar>(y);
+            const uchar *b = ref_.ptr<uchar>(y);
             for (int x = 0; x < W; ++x)
             {
                 ++st.elements;
                 const double d = std::abs(double(a[x]) - b[x]);
-                if (d != 0) ++st.not_identical;
+                if (d != 0)
+                    ++st.not_identical;
                 st.max_abs = std::max(st.max_abs, d);
-                st.max_norm = std::max(st.max_norm, (d == 0 ? 0.0 : std::numeric_limits<double>::infinity()));
-                if (d != 0.0) ++st.outside;
+                st.max_norm =
+                    std::max(st.max_norm, (d == 0 ? 0.0 : std::numeric_limits<double>::infinity()));
+                if (d != 0.0)
+                    ++st.outside;
             }
         }
         else if (got.depth() == CV_16U)
         {
-            const ushort* a = got.ptr<ushort>(y);
-            const ushort* b = ref_.ptr<ushort>(y);
+            const ushort *a = got.ptr<ushort>(y);
+            const ushort *b = ref_.ptr<ushort>(y);
             for (int x = 0; x < W; ++x)
             {
                 ++st.elements;
                 const double d = std::abs(double(a[x]) - double(b[x]));
-                if (d != 0) ++st.not_identical;
+                if (d != 0)
+                    ++st.not_identical;
                 st.max_abs = std::max(st.max_abs, d);
                 st.max_norm = std::max(st.max_norm, d / 1.0);
-                if (d > 1.0) ++st.outside;
+                if (d > 1.0)
+                    ++st.outside;
             }
         }
         else
         {
-            const float* a = got.ptr<float>(y);
-            const float* b = ref_.ptr<float>(y);
+            const float *a = got.ptr<float>(y);
+            const float *b = ref_.ptr<float>(y);
             for (int x = 0; x < W; ++x)
             {
                 ++st.elements;
                 const double d = std::abs(double(a[x]) - b[x]);
                 const double bound = f32Tol(b[x]);
-                if (d != 0) ++st.not_identical;
+                if (d != 0)
+                    ++st.not_identical;
                 st.max_abs = std::max(st.max_abs, d);
                 st.max_norm = std::max(st.max_norm, d / bound);
                 st.max_ulp = std::max(st.max_ulp, d / spacing_at(b[x]));
-                if (!(d <= bound)) ++st.outside;
+                if (!(d <= bound))
+                    ++st.outside;
             }
         }
     }
-    if (stats) stats->merge(st);
+    if (stats)
+        stats->merge(st);
     if (st.outside)
-        return ::testing::AssertionFailure() << st.outside << " of " << st.elements
-                                             << " elements outside the accuracy bound; max |diff| "
-                                             << st.max_abs << ", max normalised " << st.max_norm
-                                             << ", max " << st.max_ulp << " ULP";
+        return ::testing::AssertionFailure()
+               << st.outside << " of " << st.elements
+               << " elements outside the accuracy bound; max |diff| " << st.max_abs
+               << ", max normalised " << st.max_norm << ", max " << st.max_ulp << " ULP";
     return ::testing::AssertionSuccess();
 }
 
@@ -199,7 +209,7 @@ TEST(Triton_WarpAffine, AccuracyPolicyLimits)
 
 struct WaCase
 {
-    const char* name;
+    const char *name;
     double M[6];
     int interp;
     int border;
@@ -209,19 +219,55 @@ struct WaCase
 };
 
 static const WaCase kGeoms[] = {
-    {"identity",        {1, 0, 0, 0, 1, 0},                    INTER_LINEAR,  BORDER_CONSTANT,   false, true,  Size()},
-    {"translate_int",   {1, 0, 3, 0, 1, -2},                   INTER_LINEAR,  BORDER_REPLICATE,  false, true,  Size()},
-    {"translate_sub",   {1, 0, 0.37, 0, 1, -0.62},             INTER_LINEAR,  BORDER_REPLICATE,  false, true,  Size()},
-    {"translate_half",  {1, 0, 0.5, 0, 1, 0.5},                INTER_NEAREST, BORDER_REPLICATE,  false, true,  Size()},
-    {"rotate30",        {0.8660254, -0.5, 0, 0.5, 0.8660254, 0}, INTER_LINEAR, BORDER_CONSTANT,  false, true,  Size()},
-    {"full_affine",     {0.8, -0.3, 12.5, 0.3, 0.8, -7.25},    INTER_LINEAR,  BORDER_CONSTANT,   false, true,  Size()},
-    {"scale_aniso",     {0.5, 0, 0, 0, 0.75, 0},               INTER_LINEAR,  BORDER_REFLECT_101, false, true, Size()},
-    {"shear",           {1, 0.35, 0, 0, 1, 0},                 INTER_NEAREST, BORDER_WRAP,       false, true,  Size()},
-    {"negative_scale",  {-1, 0, 40, 0, -1, 40},                INTER_LINEAR,  BORDER_CONSTANT,   false, true,  Size()},
-    {"strong_shear",    {1, 1.9, -20, 0.4, 1, -10},            INTER_LINEAR,  BORDER_REFLECT,    false, true,  Size()},
-    {"inverse_map",     {0.9, 0.43589, -14, -0.43589, 0.9, 10}, INTER_LINEAR, BORDER_CONSTANT,   true,  true,  Size()},
-    {"bigger_dst",      {1, 0, -20, 0, 1, -15},                INTER_LINEAR,  BORDER_CONSTANT,   false, false, Size(120, 90)},
-    {"far_outside",     {1, 0, -600, 0, 1, -400},              INTER_NEAREST, BORDER_CONSTANT,   false, true,  Size()},
+    {"identity", {1, 0, 0, 0, 1, 0}, INTER_LINEAR, BORDER_CONSTANT, false, true, Size()},
+    {"translate_int", {1, 0, 3, 0, 1, -2}, INTER_LINEAR, BORDER_REPLICATE, false, true, Size()},
+    {"translate_sub",
+     {1, 0, 0.37, 0, 1, -0.62},
+     INTER_LINEAR,
+     BORDER_REPLICATE,
+     false,
+     true,
+     Size()},
+    {"translate_half",
+     {1, 0, 0.5, 0, 1, 0.5},
+     INTER_NEAREST,
+     BORDER_REPLICATE,
+     false,
+     true,
+     Size()},
+    {"rotate30",
+     {0.8660254, -0.5, 0, 0.5, 0.8660254, 0},
+     INTER_LINEAR,
+     BORDER_CONSTANT,
+     false,
+     true,
+     Size()},
+    {"full_affine",
+     {0.8, -0.3, 12.5, 0.3, 0.8, -7.25},
+     INTER_LINEAR,
+     BORDER_CONSTANT,
+     false,
+     true,
+     Size()},
+    {"scale_aniso", {0.5, 0, 0, 0, 0.75, 0}, INTER_LINEAR, BORDER_REFLECT_101, false, true, Size()},
+    {"shear", {1, 0.35, 0, 0, 1, 0}, INTER_NEAREST, BORDER_WRAP, false, true, Size()},
+    {"negative_scale", {-1, 0, 40, 0, -1, 40}, INTER_LINEAR, BORDER_CONSTANT, false, true, Size()},
+    {"strong_shear", {1, 1.9, -20, 0.4, 1, -10}, INTER_LINEAR, BORDER_REFLECT, false, true, Size()},
+    {"inverse_map",
+     {0.9, 0.43589, -14, -0.43589, 0.9, 10},
+     INTER_LINEAR,
+     BORDER_CONSTANT,
+     true,
+     true,
+     Size()},
+    {"bigger_dst",
+     {1, 0, -20, 0, 1, -15},
+     INTER_LINEAR,
+     BORDER_CONSTANT,
+     false,
+     false,
+     Size(120, 90)},
+    {"far_outside", {1, 0, -600, 0, 1, -400}, INTER_NEAREST, BORDER_CONSTANT, false, true, Size()},
 };
 
 // Three geometries for the CUBIC tests: identity (weights collapse to a delta), a rotation
@@ -238,7 +284,8 @@ static const double kCubicGeoms[3][6] = {
 // LINEAR difference. Changes to CPU dispatch require revisiting the reference.
 TEST(Triton_WarpAffine, CpuRegionIsNotWidthInvariant)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
 
     const Mat M = M6(1, 1.9, -20, 0.4, 1, -10);
     const Size sz(53, 37);
@@ -254,14 +301,14 @@ TEST(Triton_WarpAffine, CpuRegionIsNotWidthInvariant)
             const Mat l64 = cpuWarpNatural(host, M, Size(128, 37), INTER_LINEAR, BORDER_CONSTANT);
             const Mat nw = cpuWarpNatural(host, M, Size(w, 37), INTER_NEAREST, BORDER_CONSTANT);
             const Mat lw = cpuWarpNatural(host, M, Size(w, 37), INTER_LINEAR, BORDER_CONSTANT);
-            worst_nearest = std::max(worst_nearest,
-                                     cvtest::norm(nw, n64(Rect(0, 0, w, 37)), NORM_INF));
-            worst_linear = std::max(worst_linear,
-                                    cvtest::norm(lw, l64(Rect(0, 0, w, 37)), NORM_INF));
+            worst_nearest =
+                std::max(worst_nearest, cvtest::norm(nw, n64(Rect(0, 0, w, 37)), NORM_INF));
+            worst_linear =
+                std::max(worst_linear, cvtest::norm(lw, l64(Rect(0, 0, w, 37)), NORM_INF));
         }
     }
-    SCOPED_TRACE(cv::format("worst over 24 seeds x 4 widths: NEAREST %g, LINEAR %g",
-                            worst_nearest, worst_linear));
+    SCOPED_TRACE(cv::format("worst over 24 seeds x 4 widths: NEAREST %g, LINEAR %g", worst_nearest,
+                            worst_linear));
     // NEAREST: an adjacent-pixel selection, so no small-error bound is available.
     EXPECT_GT(worst_nearest, 1.0)
         << "NEAREST agreed across destination widths; the reference assumes an "
@@ -273,18 +320,17 @@ TEST(Triton_WarpAffine, CpuRegionIsNotWidthInvariant)
     // The reference is stable: widening the destination does not change the crop.
     const Mat host = randomImage(sz, CV_8UC1, 101);
     const Mat v128 = cpuWarp(host, M, Size(40, 37), INTER_LINEAR, BORDER_CONSTANT);
-    const Mat v256 = cpuWarpNatural(host, M, Size(256, 37), INTER_LINEAR, BORDER_CONSTANT)(
-        Rect(0, 0, 40, 37));
+    const Mat v256 =
+        cpuWarpNatural(host, M, Size(256, 37), INTER_LINEAR, BORDER_CONSTANT)(Rect(0, 0, 40, 37));
     EXPECT_EQ(0.0, cvtest::norm(v128, v256, NORM_INF))
         << "the vector-path reference depends on how far the destination is padded";
 
     // The module follows the selected vector-path reference.
-    EXPECT_TRUE(meetsWarpContract(gpuWarp(host, M, Size(40, 37), INTER_LINEAR, BORDER_CONSTANT),
-                                  v128));
+    EXPECT_TRUE(
+        meetsWarpContract(gpuWarp(host, M, Size(40, 37), INTER_LINEAR, BORDER_CONSTANT), v128));
     EXPECT_TRUE(meetsWarpContract(gpuWarp(host, M, Size(40, 37), INTER_NEAREST, BORDER_CONSTANT),
                                   cpuWarp(host, M, Size(40, 37), INTER_NEAREST, BORDER_CONSTANT)));
 }
-
 
 // CUBIC uses the natural-width CPU reference. Its absolute-x coordinates have
 // no SIMD-body/scalar-tail split. Detect width dependence if that path changes.
@@ -304,29 +350,31 @@ TEST(Triton_WarpAffine, CpuCubicIsWidthInvariant)
                 const Mat wide = cpuWarpNatural(host, M, Size(256, 37), interp, BORDER_CONSTANT);
                 for (int w : widths)
                 {
-                    const Mat narrow = cpuWarpNatural(host, M, Size(w, 37), interp, BORDER_CONSTANT);
+                    const Mat narrow =
+                        cpuWarpNatural(host, M, Size(w, 37), interp, BORDER_CONSTANT);
                     const double d = cvtest::norm(narrow, wide(Rect(0, 0, w, 37)), NORM_INF);
                     if (interp == INTER_CUBIC)
                     {
-                        SCOPED_TRACE(cv::format("CUBIC depth=%d seed=%llu width=%d diff=%g",
-                                                depth, (unsigned long long)seed, w, d));
-                        if (d != 0) ++differing;
+                        SCOPED_TRACE(cv::format("CUBIC depth=%d seed=%llu width=%d diff=%g", depth,
+                                                (unsigned long long)seed, w, d));
+                        if (d != 0)
+                            ++differing;
                         worst = std::max(worst, d);
                     }
                 }
             }
         }
-    EXPECT_EQ(0, differing)
-        << "INTER_CUBIC differed across destination widths (worst " << worst
-        << "); the natural-width call is used as the CUBIC "
-           "reference, so this needs the reference rule revisited";
+    EXPECT_EQ(0, differing) << "INTER_CUBIC differed across destination widths (worst " << worst
+                            << "); the natural-width call is used as the CUBIC "
+                               "reference, so this needs the reference rule revisited";
 }
 
 // CUBIC through the module against the natural-width CPU call, at widths that are NOT
 // multiples of 128: a padding rule leaking into CUBIC would show up here as a mismatch.
 TEST(Triton_WarpAffine, CubicMatchesNaturalWidth)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Size sz(59, 45);
     uint64 seed = 401;
     int checked = 0;
@@ -336,9 +384,10 @@ TEST(Triton_WarpAffine, CubicMatchesNaturalWidth)
             const int type = CV_MAKETYPE(depth, cn);
             const Mat host = randomImage(sz, type, seed++);
             for (const Size ds : {Size(97, 61), Size(64, 48), Size(33, 27), Size(150, 44)})
-                for (const double* g : {kCubicGeoms[0], kCubicGeoms[1], kCubicGeoms[2]})
+                for (const double *g : {kCubicGeoms[0], kCubicGeoms[1], kCubicGeoms[2]})
                 {
-                    SCOPED_TRACE(cv::format("depth=%d cn=%d %dx%d", depth, cn, ds.width, ds.height));
+                    SCOPED_TRACE(
+                        cv::format("depth=%d cn=%d %dx%d", depth, cn, ds.width, ds.height));
                     const Mat M = toMat6(g);
                     const Mat got = gpuWarp(host, M, ds, INTER_CUBIC, BORDER_CONSTANT);
                     const Mat ref_ = cpuWarpNatural(host, M, ds, INTER_CUBIC, BORDER_CONSTANT);
@@ -351,15 +400,17 @@ TEST(Triton_WarpAffine, CubicMatchesNaturalWidth)
 
 TEST(Triton_WarpAffine, MatchesCpu)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
-    const Size sz(53, 37);                       // odd, not a multiple of the 128-wide tile
+    if (!ready())
+        throw SkipTestException("no Triton backend");
+    const Size sz(53, 37); // odd, not a multiple of the 128-wide tile
     uint64 seed = 11;
     for (int depth : {CV_8U, CV_16U, CV_32F})
         for (int cn : {1, 3, 4})
             for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_CUBIC})
-                for (const WaCase& c : kGeoms)
+                for (const WaCase &c : kGeoms)
                 {
-                    SCOPED_TRACE(cv::format("%s depth=%d cn=%d interp=%d", c.name, depth, cn, interp));
+                    SCOPED_TRACE(
+                        cv::format("%s depth=%d cn=%d interp=%d", c.name, depth, cn, interp));
                     const int type = CV_MAKETYPE(depth, cn);
                     const Mat host = randomImage(sz, type, seed++);
                     Mat M = toMat6(c.M);
@@ -375,14 +426,15 @@ TEST(Triton_WarpAffine, MatchesCpu)
 // absolute error, normalized error and reference ULP distance for each depth.
 TEST(Triton_WarpAffine, RecordsAccuracy)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Size sz(53, 37);
     WarpStats cu, cu16, cf;
     uint64 seed = 11;
     for (int depth : {CV_8U, CV_16U, CV_32F})
         for (int cn : {1, 3, 4})
             for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_CUBIC})
-                for (const WaCase& c : kGeoms)
+                for (const WaCase &c : kGeoms)
                 {
                     const int type = CV_MAKETYPE(depth, cn);
                     const Mat host = randomImage(sz, type, seed++);
@@ -402,25 +454,28 @@ TEST(Triton_WarpAffine, RecordsAccuracy)
         "  CV_8U  elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
         "  CV_16U elements %lld  not-identical %lld (%.4f%%)  max|d| %.0f  max norm %.3f\n"
         "  CV_32F elements %lld  not-identical %lld (%.4f%%)  max|d| %.3e  max norm %.3f  max %.2f ULP\n",
-        cu.elements, cu.not_identical, cu.elements ? 100.0 * cu.not_identical / double(cu.elements) : 0.0,
-        cu.max_abs, cu.max_norm,
-        cu16.elements, cu16.not_identical, cu16.elements ? 100.0 * cu16.not_identical / double(cu16.elements) : 0.0,
-        cu16.max_abs, cu16.max_norm,
-        cf.elements, cf.not_identical, cf.elements ? 100.0 * cf.not_identical / double(cf.elements) : 0.0,
-        cf.max_abs, cf.max_norm, cf.max_ulp);
+        cu.elements, cu.not_identical,
+        cu.elements ? 100.0 * cu.not_identical / double(cu.elements) : 0.0, cu.max_abs, cu.max_norm,
+        cu16.elements, cu16.not_identical,
+        cu16.elements ? 100.0 * cu16.not_identical / double(cu16.elements) : 0.0, cu16.max_abs,
+        cu16.max_norm, cf.elements, cf.not_identical,
+        cf.elements ? 100.0 * cf.not_identical / double(cf.elements) : 0.0, cf.max_abs, cf.max_norm,
+        cf.max_ulp);
     // Check both the allowed bounds and exact integer results for this fixture.
     EXPECT_EQ(0, cu.outside);
     EXPECT_EQ(0, cu16.outside);
     EXPECT_EQ(0, cf.outside);
     EXPECT_EQ(0, cu.not_identical) << "uint8 was expected to match the selected reference exactly";
-    EXPECT_EQ(0, cu16.not_identical) << "uint16 was expected to match the selected reference exactly";
+    EXPECT_EQ(0, cu16.not_identical)
+        << "uint16 was expected to match the selected reference exactly";
 }
 
 // Check per-channel Scalar values and fractional CV_32F border components.
 TEST(Triton_WarpAffine, BorderValueIsAScalar)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
-    const Mat M = M6(1, 0, -1000, 0, 1, -1000);   // everything outside
+    if (!ready())
+        throw SkipTestException("no Triton backend");
+    const Mat M = M6(1, 0, -1000, 0, 1, -1000); // everything outside
     const Size sz(9, 7);
 
     // uint8: a single scalar fills channel 0 only; a triple fills all three.
@@ -461,7 +516,8 @@ TEST(Triton_WarpAffine, BorderValueIsAScalar)
 // coordinates and behave at the tie and near-tie boundaries a float32 cannot resolve.
 TEST(Triton_WarpAffine, SubPixelCoordinates)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Size sz(64, 48);
     const Mat host8 = randomImage(sz, CV_8UC1, 21);
     const Mat hostf = randomImage(sz, CV_32FC1, 22);
@@ -472,7 +528,8 @@ TEST(Triton_WarpAffine, SubPixelCoordinates)
             SCOPED_TRACE(cv::format("shift=(%.7f, %.7f)", dx, dy));
             const Mat M = M6(1, 0, dx, 0, 1, dy);
             EXPECT_EQ(0.0, cvtest::norm(gpuWarp(host8, M, sz, INTER_NEAREST, BORDER_REPLICATE),
-                                        cpuWarp(host8, M, sz, INTER_NEAREST, BORDER_REPLICATE), NORM_INF));
+                                        cpuWarp(host8, M, sz, INTER_NEAREST, BORDER_REPLICATE),
+                                        NORM_INF));
             EXPECT_TRUE(meetsWarpContract(gpuWarp(hostf, M, sz, INTER_LINEAR, BORDER_REPLICATE),
                                           cpuWarp(hostf, M, sz, INTER_LINEAR, BORDER_REPLICATE)));
         }
@@ -480,8 +537,8 @@ TEST(Triton_WarpAffine, SubPixelCoordinates)
     // exactly, which catches a weight that does not sum to one.
     // (norm(A) alone would be the image's own maximum, not a difference -- compare to the input)
     const Mat id = M6(1, 0, 0, 0, 1, 0);
-    EXPECT_EQ(0.0, cvtest::norm(gpuWarp(hostf, id, sz, INTER_LINEAR, BORDER_CONSTANT), hostf,
-                                NORM_INF));
+    EXPECT_EQ(0.0,
+              cvtest::norm(gpuWarp(hostf, id, sz, INTER_LINEAR, BORDER_CONSTANT), hostf, NORM_INF));
 }
 
 // A singular matrix is a legal warpAffine input (D = 0), not an error: the result is a
@@ -491,43 +548,52 @@ TEST(Triton_WarpAffine, SubPixelCoordinates)
 // frozen vector reference, over every dtype/channel dispatch at known ties.
 TEST(Triton_WarpAffine, CoordinateFusionFollowsTheCpu)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
-    struct RestoreOptimized {
+    if (!ready())
+        throw SkipTestException("no Triton backend");
+    struct RestoreOptimized
+    {
         bool previous = cv::useOptimized();
-        ~RestoreOptimized() { cv::setUseOptimized(previous); }
+        ~RestoreOptimized()
+        {
+            cv::setUseOptimized(previous);
+        }
     } restore;
     const Mat M = M6(1, 1.9, -20, .4, 1, -10);
     for (bool optimized : {true, false, true})
     {
         cv::setUseOptimized(optimized);
         for (int depth : {CV_8U, CV_16U, CV_32F})
-        for (int cn : {1, 3, 4})
-        for (int mode : {INTER_NEAREST, INTER_LINEAR, INTER_CUBIC})
-        {
-            SCOPED_TRACE(cv::format("optimized=%d depth=%d cn=%d mode=%d hardwareFMA=%d",
-                                   optimized, depth, cn, mode,
-                                   cv::checkHardwareSupport(CV_CPU_FMA3)));
-            const Mat src = randomImage(Size(53, 37), CV_MAKETYPE(depth, cn), 11);
-            const Mat got = gpuWarp(src, M, Size(53, 37), mode, BORDER_CONSTANT);
-            const Mat ref = cpuWarp(src, M, Size(53, 37), mode, BORDER_CONSTANT);
-            EXPECT_TRUE(meetsWarpContract(got, ref));
-        }
+            for (int cn : {1, 3, 4})
+                for (int mode : {INTER_NEAREST, INTER_LINEAR, INTER_CUBIC})
+                {
+                    SCOPED_TRACE(cv::format("optimized=%d depth=%d cn=%d mode=%d hardwareFMA=%d",
+                                            optimized, depth, cn, mode,
+                                            cv::checkHardwareSupport(CV_CPU_FMA3)));
+                    const Mat src = randomImage(Size(53, 37), CV_MAKETYPE(depth, cn), 11);
+                    const Mat got = gpuWarp(src, M, Size(53, 37), mode, BORDER_CONSTANT);
+                    const Mat ref = cpuWarp(src, M, Size(53, 37), mode, BORDER_CONSTANT);
+                    EXPECT_TRUE(meetsWarpContract(got, ref));
+                }
     }
 }
 
 TEST(Triton_WarpAffine, SingularMatrix)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Mat host = randomImage(Size(16, 16), CV_8UC1, 31);
-    const Mat M = M6(1, 2, 5, 2, 4, 7);     // rank 1
+    const Mat M = M6(1, 2, 5, 2, 4, 7); // rank 1
     const Mat got = gpuWarp(host, M, Size(16, 16), INTER_LINEAR, BORDER_CONSTANT, Scalar(9));
-    EXPECT_EQ(0.0, cvtest::norm(got, cpuWarp(host, M, Size(16, 16), INTER_LINEAR,
-                                             BORDER_CONSTANT, Scalar(9)), NORM_INF));
+    EXPECT_EQ(0.0,
+              cvtest::norm(got,
+                           cpuWarp(host, M, Size(16, 16), INTER_LINEAR, BORDER_CONSTANT, Scalar(9)),
+                           NORM_INF));
     // With WARP_INVERSE_MAP the matrix is used as given, singular or not.
-    const Mat goti = gpuWarp(host, M, Size(16, 16), INTER_NEAREST | WARP_INVERSE_MAP,
-                             BORDER_REPLICATE);
-    EXPECT_EQ(0.0, cvtest::norm(goti, cpuWarp(host, M, Size(16, 16),
-                                              INTER_NEAREST | WARP_INVERSE_MAP, BORDER_REPLICATE),
+    const Mat goti =
+        gpuWarp(host, M, Size(16, 16), INTER_NEAREST | WARP_INVERSE_MAP, BORDER_REPLICATE);
+    EXPECT_EQ(0.0, cvtest::norm(goti,
+                                cpuWarp(host, M, Size(16, 16), INTER_NEAREST | WARP_INVERSE_MAP,
+                                        BORDER_REPLICATE),
                                 NORM_INF));
 }
 
@@ -535,7 +601,8 @@ TEST(Triton_WarpAffine, SingularMatrix)
 // and the modulo forms must still land in range rather than wrap into a valid-looking pixel.
 TEST(Triton_WarpAffine, ExtremeCoordinates)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Mat host = randomImage(Size(32, 32), CV_8UC3, 41);
     const double ts[] = {1e3, -1e3, 1e5, -1e5};
     for (double t : ts)
@@ -552,7 +619,8 @@ TEST(Triton_WarpAffine, ExtremeCoordinates)
 // A 1-pixel axis is sampled with REPLICATE whatever the requested mode, except for CONSTANT.
 TEST(Triton_WarpAffine, DegenerateAxes)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Mat row = randomImage(Size(64, 1), CV_8UC3, 51);
     const Mat col = randomImage(Size(1, 64), CV_8UC3, 52);
     const Mat M = M6(1, 0, 0.3, 0, 1, 0.2);
@@ -572,7 +640,8 @@ TEST(Triton_WarpAffine, DegenerateAxes)
 // destination ROI is written, and the result equals the CPU warp of the source ROI.
 TEST(Triton_WarpAffine, RoiAndPaddedLayout)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Size sz(41, 29);
     const Mat host = randomImage(sz, CV_8UC3, 61);
     const Mat M = M6(0.9, -0.2, 1.5, 0.2, 0.9, -1.0);
@@ -599,114 +668,126 @@ TEST(Triton_WarpAffine, RoiAndPaddedLayout)
 // the new result, which is where a "recreate always" bug hides.
 TEST(Triton_WarpAffine, ReusesOutput)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Mat host = randomImage(Size(97, 131), CV_8UC1, 71);
     const Mat M = M6(0.7, -0.3, 5.0, 0.3, 0.7, -4.0);
     cuda::GpuMat src(host), dst;
     cv::triton::warpAffine(src, dst, M, Size(97, 131), INTER_LINEAR, BORDER_CONSTANT);
     cuda::Stream::Null().waitForCompletion();
-    const void* before = dst.cudaPtr();
+    const void *before = dst.cudaPtr();
     cv::triton::warpAffine(src, dst, M, Size(97, 131), INTER_LINEAR, BORDER_CONSTANT);
     cuda::Stream::Null().waitForCompletion();
     EXPECT_EQ(before, dst.cudaPtr()) << "the output was reallocated on the second call";
     Mat got;
     dst.download(got);
-    EXPECT_EQ(0.0, cvtest::norm(got, cpuWarp(host, M, Size(97, 131), INTER_LINEAR,
-                                             BORDER_CONSTANT), NORM_INF));
+    EXPECT_EQ(0.0, cvtest::norm(got, cpuWarp(host, M, Size(97, 131), INTER_LINEAR, BORDER_CONSTANT),
+                                NORM_INF));
 }
 
 // A non-default stream: the work is ordered on it, and a CPU read after
 // waitForCompletion sees the result.
 TEST(Triton_WarpAffine, NonDefaultStream)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Mat host = randomImage(Size(73, 51), CV_32FC3, 81);
     const Mat M = M6(1.1, 0, -2.0, 0, 1.1, -1.0);
     cuda::Stream s;
     const Mat got = gpuWarp(host, M, Size(73, 51), INTER_LINEAR, BORDER_REFLECT_101, Scalar(), &s);
-    EXPECT_TRUE(meetsWarpContract(got, cpuWarp(host, M, Size(73, 51), INTER_LINEAR,
-                                               BORDER_REFLECT_101)));
+    EXPECT_TRUE(
+        meetsWarpContract(got, cpuWarp(host, M, Size(73, 51), INTER_LINEAR, BORDER_REFLECT_101)));
     EXPECT_STREQ("linear", td::runtimeStats().last_route.c_str());
 }
 
 TEST(Triton_WarpAffine, AreaIsLinear)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Size size(37, 53);
     const Mat M = M6(0.9, -0.43589, 4, 0.43589, 0.9, -2);
     for (int depth : {CV_8U, CV_16U, CV_32F})
-    for (int cn : {1, 3, 4})
-    for (int border : {BORDER_CONSTANT, BORDER_REPLICATE, BORDER_REFLECT,
-                       BORDER_REFLECT_101, BORDER_WRAP, BORDER_TRANSPARENT})
-    for (int inverse : {0, int(WARP_INVERSE_MAP)})
-    {
-        SCOPED_TRACE(cv::format("depth=%d cn=%d border=%d inverse=%d", depth, cn, border, inverse));
-        const Mat host = randomImage(size, CV_MAKETYPE(depth, cn), 810);
-        const Mat initial = randomImage(size, host.type(), 811);
-        cuda::GpuMat src(host), linear(initial), area(initial);
-        cv::triton::warpAffine(src, linear, M, size, INTER_LINEAR | inverse, border);
-        cv::triton::warpAffine(src, area, M, size, INTER_AREA | inverse, border);
-        Mat gotLinear, gotArea;
-        linear.download(gotLinear);
-        area.download(gotArea);
-        EXPECT_EQ(0.0, cvtest::norm(gotArea, gotLinear, NORM_INF));
+        for (int cn : {1, 3, 4})
+            for (int border : {BORDER_CONSTANT, BORDER_REPLICATE, BORDER_REFLECT,
+                               BORDER_REFLECT_101, BORDER_WRAP, BORDER_TRANSPARENT})
+                for (int inverse : {0, int(WARP_INVERSE_MAP)})
+                {
+                    SCOPED_TRACE(cv::format("depth=%d cn=%d border=%d inverse=%d", depth, cn,
+                                            border, inverse));
+                    const Mat host = randomImage(size, CV_MAKETYPE(depth, cn), 810);
+                    const Mat initial = randomImage(size, host.type(), 811);
+                    cuda::GpuMat src(host), linear(initial), area(initial);
+                    cv::triton::warpAffine(src, linear, M, size, INTER_LINEAR | inverse, border);
+                    cv::triton::warpAffine(src, area, M, size, INTER_AREA | inverse, border);
+                    Mat gotLinear, gotArea;
+                    linear.download(gotLinear);
+                    area.download(gotArea);
+                    EXPECT_EQ(0.0, cvtest::norm(gotArea, gotLinear, NORM_INF));
 
-        // Prefill both CPU targets too: TRANSPARENT reads their previous values.
-        Mat cpuLinear = initial.clone(), cpuArea = initial.clone();
-        cv::warpAffine(host, cpuLinear, M, size, INTER_LINEAR | inverse, border);
-        cv::warpAffine(host, cpuArea, M, size, INTER_AREA | inverse, border);
-        EXPECT_EQ(0.0, cvtest::norm(cpuArea, cpuLinear, NORM_INF));
-    }
+                    // Prefill both CPU targets too: TRANSPARENT reads their previous values.
+                    Mat cpuLinear = initial.clone(), cpuArea = initial.clone();
+                    cv::warpAffine(host, cpuLinear, M, size, INTER_LINEAR | inverse, border);
+                    cv::warpAffine(host, cpuArea, M, size, INTER_AREA | inverse, border);
+                    EXPECT_EQ(0.0, cvtest::norm(cpuArea, cpuLinear, NORM_INF));
+                }
 }
 
 TEST(Triton_WarpAffine, TransparentMatchesCpu)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     for (int depth : {CV_8U, CV_16U, CV_32F})
-    for (int cn : {1, 3, 4})
-    for (const Size& size : {Size(128, 48), Size(37, 53), Size(1, 1), Size(7, 9)})
-    for (int geometry = 0; geometry < 3; ++geometry)
-    for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_AREA})
-    {
-        SCOPED_TRACE(cv::format("depth=%d cn=%d size=%dx%d geometry=%d interp=%d",
-                               depth, cn, size.width, size.height, geometry, interp));
-        const int type = CV_MAKETYPE(depth, cn);
-        const Rect roi(3, 2, size.width, size.height);
-        const Mat backing = randomImage(Size(size.width + 8, size.height + 6), type, 820);
-        const Mat host = backing(roi);
-        const Mat initial = randomImage(size, type, 821);
-        Mat M = M6(1, 0, 0.5, 0, 1, -0.5);
-        if (geometry == 1) M = M6(0.9, 0.43589, -14, -0.43589, 0.9, 10);
-        if (geometry == 2) M = M6(1, 0, size.width + 4, 0, 1, size.height + 4);
+        for (int cn : {1, 3, 4})
+            for (const Size &size : {Size(128, 48), Size(37, 53), Size(1, 1), Size(7, 9)})
+                for (int geometry = 0; geometry < 3; ++geometry)
+                    for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_AREA})
+                    {
+                        SCOPED_TRACE(cv::format("depth=%d cn=%d size=%dx%d geometry=%d interp=%d",
+                                                depth, cn, size.width, size.height, geometry,
+                                                interp));
+                        const int type = CV_MAKETYPE(depth, cn);
+                        const Rect roi(3, 2, size.width, size.height);
+                        const Mat backing =
+                            randomImage(Size(size.width + 8, size.height + 6), type, 820);
+                        const Mat host = backing(roi);
+                        const Mat initial = randomImage(size, type, 821);
+                        Mat M = M6(1, 0, 0.5, 0, 1, -0.5);
+                        if (geometry == 1)
+                            M = M6(0.9, 0.43589, -14, -0.43589, 0.9, 10);
+                        if (geometry == 2)
+                            M = M6(1, 0, size.width + 4, 0, 1, size.height + 4);
 
-        // Use the same selected vector-path reference as cpuWarp, but preserve the initial
-        // destination. Padding an empty target would read uninitialised values at the border.
-        const int wideWidth = ((size.width + 255) / 128) * 128;
-        Mat wide = randomImage(Size(wideWidth, size.height), type, 822);
-        initial.copyTo(wide(Rect(0, 0, size.width, size.height)));
-        cv::warpAffine(host, wide, M, wide.size(), interp | WARP_INVERSE_MAP, BORDER_TRANSPARENT);
-        const Mat reference = wide(Rect(0, 0, size.width, size.height));
+                        // Use the same selected vector-path reference as cpuWarp, but preserve the initial
+                        // destination. Padding an empty target would read uninitialised values at the border.
+                        const int wideWidth = ((size.width + 255) / 128) * 128;
+                        Mat wide = randomImage(Size(wideWidth, size.height), type, 822);
+                        initial.copyTo(wide(Rect(0, 0, size.width, size.height)));
+                        cv::warpAffine(host, wide, M, wide.size(), interp | WARP_INVERSE_MAP,
+                                       BORDER_TRANSPARENT);
+                        const Mat reference = wide(Rect(0, 0, size.width, size.height));
 
-        cuda::GpuMat srcBacking(backing), src = srcBacking(roi);
-        const Mat guard = randomImage(backing.size(), type, 823);
-        Mat expectedBacking = guard.clone();
-        reference.copyTo(expectedBacking(roi));
-        cuda::GpuMat dstBacking(guard), dst = dstBacking(roi);
-        dst.upload(initial);
-        cv::triton::warpAffine(src, dst, M, size, interp | WARP_INVERSE_MAP, BORDER_TRANSPARENT);
-        Mat got, whole;
-        dst.download(got);
-        dstBacking.download(whole);
-        EXPECT_TRUE(meetsWarpContract(got, reference));
-        EXPECT_TRUE(meetsWarpContract(whole, expectedBacking));
-        // Guard bands must remain byte-identical, even for floating-point output.
-        guard(roi).copyTo(whole(roi));
-        EXPECT_EQ(0.0, cvtest::norm(whole, guard, NORM_INF));
-        if (geometry == 2)
-        {
-            EXPECT_EQ(0.0, cvtest::norm(got, initial, NORM_INF)) << "fully outside must preserve dst";
-        }
-    }
+                        cuda::GpuMat srcBacking(backing), src = srcBacking(roi);
+                        const Mat guard = randomImage(backing.size(), type, 823);
+                        Mat expectedBacking = guard.clone();
+                        reference.copyTo(expectedBacking(roi));
+                        cuda::GpuMat dstBacking(guard), dst = dstBacking(roi);
+                        dst.upload(initial);
+                        cv::triton::warpAffine(src, dst, M, size, interp | WARP_INVERSE_MAP,
+                                               BORDER_TRANSPARENT);
+                        Mat got, whole;
+                        dst.download(got);
+                        dstBacking.download(whole);
+                        EXPECT_TRUE(meetsWarpContract(got, reference));
+                        EXPECT_TRUE(meetsWarpContract(whole, expectedBacking));
+                        // Guard bands must remain byte-identical, even for floating-point output.
+                        guard(roi).copyTo(whole(roi));
+                        EXPECT_EQ(0.0, cvtest::norm(whole, guard, NORM_INF));
+                        if (geometry == 2)
+                        {
+                            EXPECT_EQ(0.0, cvtest::norm(got, initial, NORM_INF))
+                                << "fully outside must preserve dst";
+                        }
+                    }
 }
 
 // ---------------------------------------------------------------- rejection surface
@@ -732,7 +813,8 @@ TEST(Triton_WarpAffine, PureOutputAdmission)
     EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::validate_output(request, 37, 53).reason);
     request.interpolation = INTER_CUBIC;
     EXPECT_TRUE(wa::validate_output(request, 37, 53).ok());
-    request.M[0] = 1e38; request.M[2] = 0;
+    request.M[0] = 1e38;
+    request.M[2] = 0;
     EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::validate_output(request, 37, 53).reason);
     request.M[0] = 1;
     request.interpolation = INTER_AREA;
@@ -746,24 +828,29 @@ TEST(Triton_WarpAffine, HostSamplingBoundaries)
 {
     wa::Request request;
     request.src.ptr = 4096;
-    request.src.rows = 37; request.src.cols = 53; request.src.channels = 1;
+    request.src.rows = 37;
+    request.src.cols = 53;
+    request.src.channels = 1;
     request.src.step = 53;
     request.dst = request.src;
     request.dst.ptr = 16384;
     request.inverse_map = true;
     wa::Normalized normalized;
-    for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_AREA}) {
+    for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_AREA})
+    {
         request.interpolation = interp;
         request.M[2] = 2147483648.0;
         EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::normalize(request, normalized).reason);
     }
     request.interpolation = INTER_CUBIC;
     EXPECT_TRUE(wa::normalize(request, normalized).ok()); // CUBIC clamps before int32 conversion
-    request.M[0] = 1e38; request.M[2] = 0;
+    request.M[0] = 1e38;
+    request.M[2] = 0;
     EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::normalize(request, normalized).reason);
     request.M[0] = 1;
-    for (double invalid : {std::numeric_limits<double>::quiet_NaN(),
-                           std::numeric_limits<double>::infinity()}) {
+    for (double invalid :
+         {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()})
+    {
         request.M[2] = invalid;
         EXPECT_EQ(cv_triton_runtime::Reason::IndexRange, wa::normalize(request, normalized).reason);
         request.M[2] = 0;
@@ -780,9 +867,12 @@ TEST(Triton_WarpAffine, HostAreaTransparentNormalization)
 {
     wa::Request request;
     request.src.ptr = 4096;
-    request.src.rows = 1; request.src.cols = 1; request.src.channels = 1;
+    request.src.rows = 1;
+    request.src.cols = 1;
+    request.src.channels = 1;
     request.src.step = 1;
-    request.dst = request.src; request.dst.ptr = 16384;
+    request.dst = request.src;
+    request.dst.ptr = 16384;
     request.border_mode = BORDER_TRANSPARENT;
     request.interpolation = INTER_AREA;
     wa::Normalized area, linear;
@@ -800,7 +890,8 @@ TEST(Triton_WarpAffine, HostAreaTransparentNormalization)
 
 TEST(Triton_WarpAffine, RejectsWithoutFallback)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const Mat host = randomImage(Size(32, 32), CV_8UC1, 91);
     const Mat M = M6(1, 0, 0, 0, 1, 0);
     const double before = double(td::runtimeStats().launches);
@@ -822,36 +913,42 @@ TEST(Triton_WarpAffine, RejectsWithoutFallback)
     }
     // C2 and CV_16S need the CPU's other numerical path and are deliberately refused.
     for (int type : {CV_8UC2, CV_16UC2, CV_32FC2, CV_16SC1, CV_16SC3, CV_16SC4, CV_8UC(5)})
-    for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_CUBIC, INTER_AREA})
-    {
-        SCOPED_TRACE(cv::format("refused type=%d interp=%d", type, interp));
-        cuda::GpuMat src2(randomImage(Size(32, 32), type, 93)), dst2;
-        EXPECT_THROW(cv::triton::warpAffine(src2, dst2, M, Size(32, 32), interp), cv::Exception);
-    }
+        for (int interp : {INTER_NEAREST, INTER_LINEAR, INTER_CUBIC, INTER_AREA})
+        {
+            SCOPED_TRACE(cv::format("refused type=%d interp=%d", type, interp));
+            cuda::GpuMat src2(randomImage(Size(32, 32), type, 93)), dst2;
+            EXPECT_THROW(cv::triton::warpAffine(src2, dst2, M, Size(32, 32), interp),
+                         cv::Exception);
+        }
     for (int depth : {CV_8U, CV_16U, CV_32F})
-    for (int cn : {1, 3, 4})
-    {
-        const Mat initial = randomImage(Size(32, 32), CV_MAKETYPE(depth, cn), 94);
-        cuda::GpuMat src2(initial), dst2(initial);
-        EXPECT_THROW(cv::triton::warpAffine(src2, dst2, M, initial.size(), INTER_CUBIC,
-                                           BORDER_TRANSPARENT), cv::Exception);
-        Mat got;
-        dst2.download(got);
-        EXPECT_EQ(0.0, cvtest::norm(got, initial, NORM_INF));
-    }
+        for (int cn : {1, 3, 4})
+        {
+            const Mat initial = randomImage(Size(32, 32), CV_MAKETYPE(depth, cn), 94);
+            cuda::GpuMat src2(initial), dst2(initial);
+            EXPECT_THROW(cv::triton::warpAffine(src2, dst2, M, initial.size(), INTER_CUBIC,
+                                                BORDER_TRANSPARENT),
+                         cv::Exception);
+            Mat got;
+            dst2.download(got);
+            EXPECT_EQ(0.0, cvtest::norm(got, initial, NORM_INF));
+        }
     // Matrix shape and type are cv::warpAffine's own preconditions.
     {
         cuda::GpuMat src(host), dst;
         Mat bad33(3, 3, CV_64F, Scalar(0)), badint(2, 3, CV_32S, Scalar(0));
-        EXPECT_THROW(cv::triton::warpAffine(src, dst, bad33, Size(32, 32), INTER_LINEAR), cv::Exception);
-        EXPECT_THROW(cv::triton::warpAffine(src, dst, badint, Size(32, 32), INTER_LINEAR), cv::Exception);
+        EXPECT_THROW(cv::triton::warpAffine(src, dst, bad33, Size(32, 32), INTER_LINEAR),
+                     cv::Exception);
+        EXPECT_THROW(cv::triton::warpAffine(src, dst, badint, Size(32, 32), INTER_LINEAR),
+                     cv::Exception);
     }
     // Overlapping input and output: refused, not silently producing garbage.
     {
         cuda::GpuMat buf(host);
-        EXPECT_THROW(cv::triton::warpAffine(buf, buf, M, Size(32, 32), INTER_LINEAR), cv::Exception);
+        EXPECT_THROW(cv::triton::warpAffine(buf, buf, M, Size(32, 32), INTER_LINEAR),
+                     cv::Exception);
     }
     EXPECT_EQ(before, double(td::runtimeStats().launches)) << "a refused call still launched";
 }
 
-}}  // namespace opencv_test
+}
+} // namespace opencv_test

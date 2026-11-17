@@ -15,8 +15,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/triton.hpp>
-
-int main(int argc, char** argv)
+int main(int argc, char **argv)
 {
     if (!cv::triton::haveBackend())
     {
@@ -27,7 +26,11 @@ int main(int argc, char** argv)
 
     cv::Mat host = (argc > 1) ? cv::imread(argv[1], cv::IMREAD_COLOR)
                               : cv::Mat(480, 640, CV_8UC3, cv::Scalar(64, 128, 192));
-    if (host.empty()) { std::cerr << "failed to read input\n"; return 1; }
+    if (host.empty())
+    {
+        std::cerr << "failed to read input\n";
+        return 1;
+    }
 
     // Rotate by 33 degrees about the image centre, scaled by 0.8. Written out rather than
     // built with cv::getRotationMatrix2D: that lives in the geometry module in OpenCV 5.x, and a
@@ -36,9 +39,11 @@ int main(int argc, char** argv)
     const double cx = host.cols * 0.5, cy = host.rows * 0.5;
     const double a = std::cos(angle) * scale, b = std::sin(angle) * scale;
     cv::Mat M(2, 3, CV_64F);
-    M.at<double>(0, 0) = a;                  M.at<double>(0, 1) = -b;
+    M.at<double>(0, 0) = a;
+    M.at<double>(0, 1) = -b;
     M.at<double>(0, 2) = (1 - a) * cx + b * cy;
-    M.at<double>(1, 0) = b;                  M.at<double>(1, 1) = a;
+    M.at<double>(1, 0) = b;
+    M.at<double>(1, 1) = a;
     M.at<double>(1, 2) = (1 - a) * cy - b * cx;
 
     cv::cuda::GpuMat src(host), dst;
@@ -48,14 +53,15 @@ int main(int argc, char** argv)
     // work completes. The destination is created if it is empty and reused if it already has
     // the right size and type. The border value is a Scalar with one component per channel, and
     // it keeps full precision, so a CV_32F border of 0.5 would stay 0.5.
-    cv::triton::warpAffine(src, dst, M, host.size(), cv::INTER_LINEAR,
-                           cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0), stream);
-    stream.waitForCompletion();   // wait before reading the result
+    cv::triton::warpAffine(src, dst, M, host.size(), cv::INTER_LINEAR, cv::BORDER_CONSTANT,
+                           cv::Scalar(0, 0, 0), stream);
+    stream.waitForCompletion(); // wait before reading the result
 
     cv::Mat out;
     dst.download(out);
-    std::cout << "warped " << host.size() << " by 33 deg / 0.8 -> " << out.size()
-              << " (" << out.channels() << " channel)\n";
-    if (argc > 2) cv::imwrite(argv[2], out);
+    std::cout << "warped " << host.size() << " by 33 deg / 0.8 -> " << out.size() << " ("
+              << out.channels() << " channel)\n";
+    if (argc > 2)
+        cv::imwrite(argv[2], out);
     return 0;
 }

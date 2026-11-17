@@ -16,39 +16,39 @@
 namespace triton_graph
 {
 using cv_triton_runtime::Json;
-inline void require(bool value, const std::string& why)
+inline void require(bool value, const std::string &why)
 {
     if (!value)
         throw std::runtime_error("invalid graph request: " + why);
 }
-inline void fields(const Json& node, const std::set<std::string>& allowed)
+inline void fields(const Json &node, const std::set<std::string> &allowed)
 {
     require(node.kind == Json::Object, "object required");
     std::set<std::string> seen;
-    for (const auto& entry : node.obj)
+    for (const auto &entry : node.obj)
     {
         require(allowed.count(entry.first) != 0, "unsupported field " + entry.first);
         require(seen.insert(entry.first).second, "duplicate field " + entry.first);
     }
 }
-inline std::string text(const Json& j, const std::string& key, const std::string& fallback = "")
+inline std::string text(const Json &j, const std::string &key, const std::string &fallback = "")
 {
-    const auto* value = j.get(key);
+    const auto *value = j.get(key);
     if (!value)
         return fallback;
     require(value->kind == Json::String && value->str.find('\0') == std::string::npos,
             key + " must be a string without NUL");
     return value->str;
 }
-inline double finite(const Json& value, const std::string& key)
+inline double finite(const Json &value, const std::string &key)
 {
     require(value.kind == Json::Number && std::isfinite(value.num),
             key + " must be a finite number");
     return value.num;
 }
-inline int number(const Json& j, const std::string& key, int fallback = 0)
+inline int number(const Json &j, const std::string &key, int fallback = 0)
 {
-    const auto* value = j.get(key);
+    const auto *value = j.get(key);
     if (!value)
         return fallback;
     const double n = finite(*value, key);
@@ -57,9 +57,9 @@ inline int number(const Json& j, const std::string& key, int fallback = 0)
             key + " must be an int32 integer");
     return static_cast<int>(n);
 }
-inline bool boolean(const Json& j, const std::string& key, bool fallback)
+inline bool boolean(const Json &j, const std::string &key, bool fallback)
 {
-    const auto* value = j.get(key);
+    const auto *value = j.get(key);
     if (!value)
         return fallback;
     require(value->kind == Json::Bool, key + " must be boolean");
@@ -79,15 +79,15 @@ struct Request
     double matrix[6] = {1, 0, 0, 0, 1, 0};
     std::string input, inputHash, changed, changedHash;
 };
-inline Request parse(const Json& root)
+inline Request parse(const Json &root)
 {
     fields(root, {"op", "case", "captured_calls", "samples", "roi", "input_path", "input_sha256",
                   "changed_path", "changed_sha256"});
-    const auto* item = root.get("case");
+    const auto *item = root.get("case");
     require(item != nullptr, "missing case");
     fields(*item, {"src_h", "src_w", "channels", "dst_h", "dst_w", "dtype", "mode", "code", "M",
                    "inverse", "border", "borderValue", "id"});
-    const Json& c = *item;
+    const Json &c = *item;
     Request r;
     (void)text(c, "id");
     r.op = text(root, "op");
@@ -122,7 +122,7 @@ inline Request parse(const Json& root)
         r.mode = "INTER_" + r.mode;
     r.inverse = boolean(c, "inverse", false);
     r.roi = true;
-    if (const auto* roi = root.get("roi"))
+    if (const auto *roi = root.get("roi"))
     {
         if (roi->kind == Json::Bool)
             r.roi = roi->b;
@@ -137,7 +137,7 @@ inline Request parse(const Json& root)
     require(r.border == "BORDER_REPLICATE" || r.border == "BORDER_CONSTANT" ||
                 r.border == "BORDER_REFLECT_101" || r.border == "BORDER_WRAP",
             "unsupported border");
-    if (const auto* matrix = c.get("M"))
+    if (const auto *matrix = c.get("M"))
     {
         require(matrix->kind == Json::Array && matrix->arr.size() == 6, "M must have six numbers");
         for (int i = 0; i < 6; ++i)
@@ -158,7 +158,7 @@ inline Request parse(const Json& root)
     r.changed = text(root, "changed_path");
     r.changedHash = text(root, "changed_sha256");
     require(!r.input.empty() && !r.changed.empty(), "input paths required");
-    for (const auto& hash : {r.inputHash, r.changedHash})
+    for (const auto &hash : {r.inputHash, r.changedHash})
         require(hash.size() == 64 &&
                     hash.find_first_not_of("0123456789abcdef") == std::string::npos,
                 "invalid SHA256");
@@ -173,7 +173,7 @@ inline Request parse(const Json& root)
             "output allocation too large");
     return r;
 }
-inline std::string executionJson(const Request& r)
+inline std::string executionJson(const Request &r)
 {
     using cv_triton_runtime::json_quote;
     std::ostringstream out;

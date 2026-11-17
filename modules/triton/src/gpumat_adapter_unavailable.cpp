@@ -11,25 +11,30 @@
 // run here. They raise StsNotImplemented and name the entries that do run on this backend
 // (opencv2/triton/device.hpp). haveBackend() answers for the backend this module WAS built
 // for, so a caller can tell "built for hip, device present" from "no device".
-
+#include "precomp.hpp"
 #include "opencv2/triton.hpp"
 #include "opencv2/core/private.hpp"
 #include "runtime/runtime.hpp"
-
-namespace cv { namespace triton {
-
-namespace {
-
-[[noreturn]] void unavailable(const char* op)
+namespace cv
 {
-    CV_Error(Error::StsNotImplemented,
-             cv::format("cv::triton::%s (GpuMat overload) needs cv::cuda, which this build does not "
-                        "have (backend %s). Use the cv::triton::%s DeviceImage overload from opencv2/triton/device.hpp "
-                        "with device buffers and a %s stream instead.",
-                        op, runtime::name(), op, runtime::name()));
+namespace triton
+{
+
+namespace
+{
+
+[[noreturn]] void unavailable(const char *op)
+{
+    CV_Error(
+        Error::StsNotImplemented,
+        cv::format(
+            "cv::triton::%s (GpuMat overload) needs cv::cuda, which this build does not "
+            "have (backend %s). Use the cv::triton::%s DeviceImage overload from opencv2/triton/device.hpp "
+            "with device buffers and a %s stream instead.",
+            op, runtime::name(), op, runtime::name()));
 }
 
-}  // namespace
+} // namespace
 
 bool haveBackend()
 {
@@ -47,17 +52,31 @@ void releaseGraphResources()
     detail::releaseCapturePins();
 }
 
-void resize(InputArray, OutputArray, Size, double, double, int, cuda::Stream&) { unavailable("resize"); }
-void resize(const cuda::GpuMat&, cuda::GpuMat&, Size, double, double, int, cuda::Stream&) { unavailable("resize"); }
-void cvtColor(InputArray, OutputArray, int, cuda::Stream&) { unavailable("cvtColor"); }
-void cvtColor(const cuda::GpuMat&, cuda::GpuMat&, int, cuda::Stream&) { unavailable("cvtColor"); }
-void warpAffine(InputArray, OutputArray, InputArray, Size, int, int, const Scalar&, cuda::Stream&)
+void resize(InputArray, OutputArray, Size, double, double, int, cuda::Stream &)
+{
+    unavailable("resize");
+}
+void resize(const cuda::GpuMat &, cuda::GpuMat &, Size, double, double, int, cuda::Stream &)
+{
+    unavailable("resize");
+}
+void cvtColor(InputArray, OutputArray, int, cuda::Stream &)
+{
+    unavailable("cvtColor");
+}
+void cvtColor(const cuda::GpuMat &, cuda::GpuMat &, int, cuda::Stream &)
+{
+    unavailable("cvtColor");
+}
+void warpAffine(InputArray, OutputArray, InputArray, Size, int, int, const Scalar &, cuda::Stream &)
 {
     unavailable("warpAffine");
 }
-void warpAffine(const cuda::GpuMat&, cuda::GpuMat&, InputArray, Size, int, int, const Scalar&, cuda::Stream&)
+void warpAffine(const cuda::GpuMat &, cuda::GpuMat &, InputArray, Size, int, int, const Scalar &,
+                cuda::Stream &)
 {
     unavailable("warpAffine");
 }
 
-}}  // namespace cv::triton
+}
+} // namespace cv::triton

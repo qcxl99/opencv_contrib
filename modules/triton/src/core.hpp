@@ -6,13 +6,13 @@
 // Public adapters validate native buffers and streams before calling the runtime.
 #ifndef OPENCV_TRITON_CORE_INTERNAL_HPP
 #define OPENCV_TRITON_CORE_INTERNAL_HPP
-
 #include <cstddef>
 #include <cstdint>
-
 #include "opencv2/core.hpp"
-
-namespace cv { namespace triton {
+namespace cv
+{
+namespace triton
+{
 
 //! @addtogroup triton
 //! @{
@@ -29,27 +29,34 @@ namespace cv { namespace triton {
  */
 struct ImageView
 {
-    std::uintptr_t ptr;      //!< device pointer, as an integer
+    std::uintptr_t ptr; //!< device pointer, as an integer
     int rows;
     int cols;
-    int type;                //!< OpenCV type, e.g. CV_8UC3
-    std::size_t step;        //!< row pitch IN BYTES
-    int whole_rows;          //!< parent allocation height
-    int whole_cols;          //!< parent allocation width
-    int offset_y;            //!< ROI offset within the parent
+    int type;         //!< OpenCV type, e.g. CV_8UC3
+    std::size_t step; //!< row pitch IN BYTES
+    int whole_rows;   //!< parent allocation height
+    int whole_cols;   //!< parent allocation width
+    int offset_y;     //!< ROI offset within the parent
     int offset_x;
 
     ImageView()
-        : ptr(0), rows(0), cols(0), type(0), step(0),
-          whole_rows(0), whole_cols(0), offset_y(0), offset_x(0) {}
+        : ptr(0), rows(0), cols(0), type(0), step(0), whole_rows(0), whole_cols(0), offset_y(0),
+          offset_x(0)
+    {
+    }
 
     bool isRoi() const
     {
-        return offset_x != 0 || offset_y != 0 ||
-               whole_rows != rows || whole_cols != cols;
+        return offset_x != 0 || offset_y != 0 || whole_rows != rows || whole_cols != cols;
     }
-    int channels() const { return CV_MAT_CN(type); }
-    int depth() const { return CV_MAT_DEPTH(type); }
+    int channels() const
+    {
+        return CV_MAT_CN(type);
+    }
+    int depth() const
+    {
+        return CV_MAT_DEPTH(type);
+    }
 };
 
 /** @brief Device/stream handle for the core API, as plain integers.
@@ -61,10 +68,12 @@ struct ImageView
  */
 struct ExecutionContext
 {
-    int device;              //!< platform device ordinal
-    std::uintptr_t stream;   //!< platform stream handle, may be 0
+    int device;            //!< platform device ordinal
+    std::uintptr_t stream; //!< platform stream handle, may be 0
 
-    ExecutionContext() : device(-1), stream(0) {}
+    ExecutionContext() : device(-1), stream(0)
+    {
+    }
 };
 
 /** @brief Resize an image using a Triton-generated kernel -- core entry point.
@@ -92,12 +101,11 @@ struct ExecutionContext
  * @param scaleY Kernel-space vertical scale (src rows per dst pixel). 0
  *               derives it as src.rows / dsize.height; see scaleX.
  */
-void resizeCore(const ImageView& src, const ImageView& dst, Size dsize,
-                             int interpolation, const ExecutionContext& ctx,
-                             double scaleX = 0, double scaleY = 0);
+void resizeCore(const ImageView &src, const ImageView &dst, Size dsize, int interpolation,
+                const ExecutionContext &ctx, double scaleX = 0, double scaleY = 0);
 
 //! @}
 
-}}  // namespace cv::triton
-
+}
+} // namespace cv::triton
 #endif  // OPENCV_TRITON_CORE_INTERNAL_HPP

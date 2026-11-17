@@ -9,30 +9,27 @@
 // The ordering and retention tests are deterministic: a host callback blocks one stream, so the
 // upload and the launch behind it are known to be pending when the next call is made, and new
 // table buffers are poisoned, so reading a table too early produces garbage, not plausible output.
-
 #include "test_helpers.hpp"
 #include "../src/runtime/compile_protocol.hpp"
-
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <cstdio>
-#include <fstream>
 #include <thread>
-
 #include <cuda.h>
 #include <opencv2/core/cuda_stream_accessor.hpp>
-
-namespace opencv_test { namespace {
+namespace opencv_test
+{
+namespace
+{
 
 using namespace triton_test;
 
-static void CUDA_CB hostSleep(void* ms)
+static void CUDA_CB hostSleep(void *ms)
 {
-    std::this_thread::sleep_for(std::chrono::milliseconds(*static_cast<int*>(ms)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(*static_cast<int *>(ms)));
 }
 
-static void blockStream(cuda::Stream& s, int* ms)
+static void blockStream(cuda::Stream &s, int *ms)
 {
     ASSERT_EQ(CUDA_SUCCESS, cuLaunchHostFunc(cuda::StreamAccessor::getStream(s), hostSleep, ms));
 }
@@ -46,15 +43,25 @@ class HostGate
     std::condition_variable changed_;
     bool entered_ = false, released_ = false, timedOut_ = false, finished_ = false;
     std::thread watchdog_;
-public:
-    HostGate() : watchdog_([this] {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (!changed_.wait_for(lock, std::chrono::seconds(30), [this] { return released_; }))
-        {
-            timedOut_ = released_ = true;
-            changed_.notify_all();
-        }
-    }) {}
+
+  public:
+    HostGate()
+        : watchdog_(
+              [this]
+              {
+                  std::unique_lock<std::mutex> lock(mutex_);
+                  if (!changed_.wait_for(lock, std::chrono::seconds(30),
+                                         [this]
+                                         {
+                                             return released_;
+                                         }))
+                  {
+                      timedOut_ = released_ = true;
+                      changed_.notify_all();
+                  }
+              })
+    {
+    }
     ~HostGate()
     {
         release();
@@ -62,7 +69,11 @@ public:
         // An exception after submission must not destroy the callback's state
         // while it is still leaving its wait.
         std::unique_lock<std::mutex> lock(mutex_);
-        changed_.wait(lock, [this] { return !entered_ || finished_; });
+        changed_.wait(lock,
+                      [this]
+                      {
+                          return !entered_ || finished_;
+                      });
     }
     void release()
     {
@@ -73,7 +84,11 @@ public:
     bool waitEntered()
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        changed_.wait(lock, [this] { return entered_ || timedOut_; });
+        changed_.wait(lock,
+                      [this]
+                      {
+                          return entered_ || timedOut_;
+                      });
         return entered_ && !timedOut_;
     }
     bool timedOut()
@@ -81,35 +96,46 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return timedOut_;
     }
-    static void CUDA_CB callback(void* ptr)
+    static void CUDA_CB callback(void *ptr)
     {
-        HostGate& gate = *static_cast<HostGate*>(ptr);
+        HostGate &gate = *static_cast<HostGate *>(ptr);
         std::unique_lock<std::mutex> lock(gate.mutex_);
         gate.entered_ = true;
         gate.changed_.notify_all();
-        gate.changed_.wait(lock, [&gate] { return gate.released_; });
+        gate.changed_.wait(lock,
+                           [&gate]
+                           {
+                               return gate.released_;
+                           });
         gate.finished_ = true;
         gate.changed_.notify_all();
     }
 };
 
-static std::string configField(const std::string& key)
+static std::string configField(const std::string &key)
 {
     const std::string c = td::runtimeConfig();
     const std::size_t a = c.find(key + "=");
-    if (a == std::string::npos) return std::string();
+    if (a == std::string::npos)
+        return std::string();
     const std::size_t b = c.find(';', a);
-    return c.substr(a + key.size() + 1, b == std::string::npos ? std::string::npos : b - a - key.size() - 1);
+    return c.substr(a + key.size() + 1,
+                    b == std::string::npos ? std::string::npos : b - a - key.size() - 1);
 }
 
 struct Restore
 {
     // Pins are process-global and outlive the caches, so a test that captures must not leave them
     // behind for the next test in the binary.
-    ~Restore() { td::setCacheLimits(64, 256); td::setPoisonNewTables(false); td::releaseCapturePins(); }
+    ~Restore()
+    {
+        td::setCacheLimits(64, 256);
+        td::setPoisonNewTables(false);
+        td::releaseCapturePins();
+    }
 };
 
-static void runOne(const Mat& host, Size dsize, int interp, cuda::Stream& stream, cuda::GpuMat& dst)
+static void runOne(const Mat &host, Size dsize, int interp, cuda::Stream &stream, cuda::GpuMat &dst)
 {
     cuda::GpuMat src(host);
     cv::triton::resize(src, dst, dsize, 0, 0, interp, stream);
@@ -119,11 +145,12 @@ static void runOne(const Mat& host, Size dsize, int interp, cuda::Stream& stream
 // The installed module must find its resources in the install tree, not in a source or build tree.
 TEST(Triton_Runtime, ResourcesResolved)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     const std::string res = configField("resources");
     EXPECT_FALSE(res.empty());
     EXPECT_EQ(std::string::npos, td::runtimeConfig().find(";error=")) << td::runtimeConfig();
-    const char* want = std::getenv("OPENCV_TRITON_TEST_EXPECT_RESOURCES_PREFIX");
+    const char *want = std::getenv("OPENCV_TRITON_TEST_EXPECT_RESOURCES_PREFIX");
     if (want)
         EXPECT_EQ(0u, res.find(want)) << "resources " << res << " are not under " << want;
     std::cout << "runtime: " << td::runtimeConfig() << std::endl;
@@ -132,12 +159,14 @@ TEST(Triton_Runtime, ResourcesResolved)
 // Two non-default streams in flight at once, different data, the same key and tables.
 TEST(Triton_Runtime, ConcurrentStreams)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     cuda::Stream a(cudaStreamNonBlocking), b(cudaStreamNonBlocking);
     const Size ssz(321, 203), dsz(149, 87);
     for (int round = 0; round < 8; ++round)
     {
-        const Mat ha = randomImage(ssz, CV_8UC3, 1000 + round), hb = randomImage(ssz, CV_8UC3, 2000 + round);
+        const Mat ha = randomImage(ssz, CV_8UC3, 1000 + round),
+                  hb = randomImage(ssz, CV_8UC3, 2000 + round);
         cuda::GpuMat sa(ha), sb(hb), da, db;
         cv::triton::resize(sa, da, dsz, 0, 0, INTER_LINEAR, a);
         cv::triton::resize(sb, db, dsz, 0, 0, INTER_LINEAR, b);
@@ -155,12 +184,13 @@ TEST(Triton_Runtime, ConcurrentStreams)
 // stream B with the same shape must wait for that upload through its event.
 TEST(Triton_Runtime, TableUploadOrderingAcrossStreams)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     Restore restore;
     td::setPoisonNewTables(true);
-    const Size ssz(211, 97), dsz(131, 61);    // shape unique to this test: its tables are new
+    const Size ssz(211, 97), dsz(131, 61); // shape unique to this test: its tables are new
     cuda::Stream a(cudaStreamNonBlocking), b(cudaStreamNonBlocking);
-    {   // compile/load the binary beforehand, with other tables: the wait below is the upload's
+    { // compile/load the binary beforehand, with other tables: the wait below is the upload's
         cuda::GpuMat d;
         runOne(randomImage(Size(53, 41), CV_8UC3, 1), Size(23, 19), INTER_LINEAR, a, d);
     }
@@ -172,11 +202,14 @@ TEST(Triton_Runtime, TableUploadOrderingAcrossStreams)
     const auto t0 = std::chrono::steady_clock::now();
     blockStream(a, &ms);
     cv::triton::resize(sa, da, dsz, 0, 0, INTER_LINEAR, a);
-    const double returnedA = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double returnedA =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     cv::triton::resize(sb, db, dsz, 0, 0, INTER_LINEAR, b);
-    const double returnedB = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double returnedB =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     b.waitForCompletion();
-    const double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double waited =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     a.waitForCompletion();
     const td::RuntimeStats st = td::runtimeStats();
     EXPECT_EQ(1, st.table_uploads);
@@ -184,7 +217,8 @@ TEST(Triton_Runtime, TableUploadOrderingAcrossStreams)
     EXPECT_EQ(1, st.cross_stream_waits);
     // Neither call stalled the host (the module was loaded beforehand), so B's wait is the event wait.
     EXPECT_LT(returnedA, 0.5 * ms) << "the first call stalled the host: the scenario tests nothing";
-    EXPECT_LT(returnedB, 0.5 * ms) << "the second call stalled the host: the scenario tests nothing";
+    EXPECT_LT(returnedB, 0.5 * ms)
+        << "the second call stalled the host: the scenario tests nothing";
     EXPECT_GE(waited, 0.8 * ms) << "stream B did not wait for the upload behind stream A's block";
     Mat ga, gb;
     da.download(ga);
@@ -199,11 +233,13 @@ TEST(Triton_Runtime, TableUploadOrderingAcrossStreams)
 // submission and host cache operations occur while the gate is closed.
 TEST(Triton_Runtime, InFlightRetentionAndEviction)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     Restore restore;
     const Size sa(141, 83), da(67, 59), sb(123, 77), db(71, 43), sc(119, 73), dc(61, 47);
     cuda::Stream a(cudaStreamNonBlocking), b(cudaStreamNonBlocking);
-    const Mat ha = randomImage(sa, CV_8UC1, 21), hb = randomImage(sb, CV_8UC1, 22), hc = randomImage(sc, CV_8UC1, 23);
+    const Mat ha = randomImage(sa, CV_8UC1, 21), hb = randomImage(sb, CV_8UC1, 22),
+              hc = randomImage(sc, CV_8UC1, 23);
     cuda::GpuMat ga(ha), gb(hb), gc(hc), oa(da, CV_8UC1), ob(db, CV_8UC1), oc(dc, CV_8UC1);
     td::setCacheLimits(2, 3);
     td::setPoisonNewTables(true);
@@ -249,7 +285,8 @@ TEST(Triton_Runtime, InFlightRetentionAndEviction)
     td::reapCompleted();
     st = td::runtimeStats();
     EXPECT_GE(st.module_frees, 1) << "the evicted module was not released after completion";
-    EXPECT_EQ(st.table_evictions, st.table_frees) << "evicted tables were not released after completion";
+    EXPECT_EQ(st.table_evictions, st.table_frees)
+        << "evicted tables were not released after completion";
     EXPECT_EQ(0, st.pending);
     Mat ra, rb, rc;
     oa.download(ra);
@@ -260,7 +297,8 @@ TEST(Triton_Runtime, InFlightRetentionAndEviction)
     EXPECT_TRUE(meetsContract(rc, oracle(hc, dc, 0, 0, INTER_LINEAR), INTER_LINEAR));
 
     // Evicted is not lost: the same call reloads from disk, re-uploads, compiles nothing.
-    const long long compiles = st.helper_compiles, loads = st.module_loads, uploads = st.table_uploads, disk = st.disk_hits;
+    const long long compiles = st.helper_compiles, loads = st.module_loads,
+                    uploads = st.table_uploads, disk = st.disk_hits;
     cuda::GpuMat oa2;
     runOne(ha, da, INTER_NEAREST, a, oa2);
     st = td::runtimeStats();
@@ -277,12 +315,13 @@ TEST(Triton_Runtime, InFlightRetentionAndEviction)
 // value comes back.
 TEST(Triton_Runtime, ContextIsolation)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     Restore restore;
     const Size ssz(90, 70), dsz(47, 35);
     const Mat host = randomImage(ssz, CV_8UC3, 31);
     const Mat want = oracle(host, dsz, 0, 0, INTER_LINEAR);
-    {   // the primary context has this key and these tables
+    { // the primary context has this key and these tables
         cuda::GpuMat d;
         cuda::Stream s;
         runOne(host, dsz, INTER_LINEAR, s, d);
@@ -296,7 +335,7 @@ TEST(Triton_Runtime, ContextIsolation)
     {
         SCOPED_TRACE(cv::format("private context %d", round));
         CUcontext ctx = nullptr;
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxCreate(&ctx, 0, dev));     // now current
+        ASSERT_EQ(CUDA_SUCCESS, cuCtxCreate(&ctx, 0, dev)); // now current
         const std::size_t sstep = ssz.width * 3, dstep = dsz.width * 3;
         CUdeviceptr ps = 0, pd = 0;
         ASSERT_EQ(CUDA_SUCCESS, cuMemAlloc(&ps, sstep * ssz.height));
@@ -306,15 +345,16 @@ TEST(Triton_Runtime, ContextIsolation)
         td::reapCompleted();
         td::resetRuntimeStats();
         {
-            cuda::GpuMat gs(ssz.height, ssz.width, CV_8UC3, reinterpret_cast<void*>(ps), sstep);
-            cuda::GpuMat gd(dsz.height, dsz.width, CV_8UC3, reinterpret_cast<void*>(pd), dstep);
+            cuda::GpuMat gs(ssz.height, ssz.width, CV_8UC3, reinterpret_cast<void *>(ps), sstep);
+            cuda::GpuMat gd(dsz.height, dsz.width, CV_8UC3, reinterpret_cast<void *>(pd), dstep);
             cv::triton::resize(gs, gd, dsz, 0, 0, INTER_LINEAR);
             ASSERT_EQ(CUDA_SUCCESS, cuCtxSynchronize());
         }
         const td::RuntimeStats st = td::runtimeStats();
         EXPECT_EQ(1, st.module_loads) << "the module of another context was reused";
         EXPECT_EQ(1, st.table_uploads) << "the tables of another context were reused";
-        EXPECT_EQ(0, st.helper_compiles) << "the binary is the same; only its loading is per context";
+        EXPECT_EQ(0, st.helper_compiles)
+            << "the binary is the same; only its loading is per context";
         Mat got(dsz, CV_8UC3);
         ASSERT_EQ(CUDA_SUCCESS, cuMemcpyDtoH(got.data, pd, dstep * dsz.height));
         EXPECT_TRUE(meetsContract(got, want, INTER_LINEAR));
@@ -322,7 +362,7 @@ TEST(Triton_Runtime, ContextIsolation)
         EXPECT_EQ(0, td::runtimeStats().pending);
         cuMemFree(ps);
         cuMemFree(pd);
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxDestroy(ctx));             // its cache entries are now stale
+        ASSERT_EQ(CUDA_SUCCESS, cuCtxDestroy(ctx)); // its cache entries are now stale
         ASSERT_EQ(CUDA_SUCCESS, cuCtxSetCurrent(primary));
     }
     // Stale entries are dropped without touching the destroyed context, and the primary still works.
@@ -338,8 +378,10 @@ TEST(Triton_Runtime, ContextIsolation)
 
 TEST(Triton_Runtime, SecondDevice)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
-    if (cv::cuda::getCudaEnabledDeviceCount() < 2) throw SkipTestException("one visible device");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
+    if (cv::cuda::getCudaEnabledDeviceCount() < 2)
+        throw SkipTestException("one visible device");
     const int home = cv::cuda::getDevice();
     const Mat host = randomImage(Size(77, 55), CV_32FC3, 41);
     const Mat want = oracle(host, Size(39, 28), 0, 0, INTER_LINEAR);
@@ -363,7 +405,8 @@ TEST(Triton_Runtime, SecondDevice)
 // of the runtime, and a corrupted one on disk is rejected and rebuilt, not loaded.
 TEST(Triton_Runtime, ArtifactIntegrity)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     Restore restore;
     const Mat host = randomImage(Size(93, 67), CV_32FC1, 51);
     const Size dsz(41, 37);
@@ -440,7 +483,8 @@ TEST(Triton_Runtime, ArtifactIntegrity)
 // API, since applications cannot access private runtime resource functions.
 TEST(Triton_Runtime, PublicGraphResourceRelease)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     Restore restore;
     cv::triton::releaseGraphResources();
     td::reapCompleted();
@@ -457,8 +501,8 @@ TEST(Triton_Runtime, PublicGraphResourceRelease)
     CUstream raw = cuda::StreamAccessor::getStream(s);
     CUgraph graph = nullptr;
     ASSERT_EQ(CUDA_SUCCESS, cuStreamBeginCapture(raw, CU_STREAM_CAPTURE_MODE_GLOBAL));
-    ASSERT_NO_THROW(cv::triton::warpAffine(src, dst, cv::Mat::eye(2, 3, CV_64F), sz,
-                                           INTER_LINEAR, BORDER_REPLICATE, Scalar(), s));
+    ASSERT_NO_THROW(cv::triton::warpAffine(src, dst, cv::Mat::eye(2, 3, CV_64F), sz, INTER_LINEAR,
+                                           BORDER_REPLICATE, Scalar(), s));
     ASSERT_EQ(CUDA_SUCCESS, cuStreamEndCapture(raw, &graph));
     ASSERT_NE(nullptr, graph);
 
@@ -474,8 +518,8 @@ TEST(Triton_Runtime, PublicGraphResourceRelease)
     EXPECT_EQ(0, st.capture_pin_holds) << "the public entry did not release the pin";
 
     // Still usable afterwards: releasing must not poison the runtime.
-    cv::triton::warpAffine(src, dst, cv::Mat::eye(2, 3, CV_64F), sz, INTER_LINEAR,
-                           BORDER_REPLICATE, Scalar(), s);
+    cv::triton::warpAffine(src, dst, cv::Mat::eye(2, 3, CV_64F), sz, INTER_LINEAR, BORDER_REPLICATE,
+                           Scalar(), s);
     s.waitForCompletion();
     Mat got, want;
     dst.download(got);
@@ -485,20 +529,22 @@ TEST(Triton_Runtime, PublicGraphResourceRelease)
 
 TEST(Triton_Runtime, CaptureSurvivesEviction)
 {
-    if (!ready()) throw SkipTestException("no Triton backend");
+    if (!ready())
+        throw SkipTestException("no Triton backend");
     Restore restore;
     td::releaseCapturePins();
     td::reapCompleted();
 
-    const Size sz(257, 131);          // width not a multiple of the 256 block: exercises masking
+    const Size sz(257, 131); // width not a multiple of the 256 block: exercises masking
     cuda::Stream s(cudaStreamNonBlocking);
     const Mat hostA = randomImage(sz, CV_8UC3, 71);
     const Mat hostB = randomImage(sz, CV_8UC3, 72);
-    Mat wantB;   // filled below, after the capture
+    Mat wantB; // filled below, after the capture
     cuda::GpuMat srcA(hostA), srcB(hostB);
     cuda::GpuMat dst(sz, CV_8UC1);
 
-    for (int i = 0; i < 3; ++i) cv::triton::cvtColor(srcA, dst, COLOR_BGR2GRAY, s);
+    for (int i = 0; i < 3; ++i)
+        cv::triton::cvtColor(srcA, dst, COLOR_BGR2GRAY, s);
     s.waitForCompletion();
 
     CUstream raw = cuda::StreamAccessor::getStream(s);
@@ -532,7 +578,7 @@ TEST(Triton_Runtime, CaptureSurvivesEviction)
     td::reapCompleted();
     st = td::runtimeStats();
     EXPECT_GE(st.module_evictions + st.table_evictions, 1) << "nothing was evicted: the test "
-                                                             "would not exercise the pin";
+                                                              "would not exercise the pin";
     // `module_frees == 0` would be the wrong assertion here, because the eviction traffic above
     // loads and drops modules of its own, and those are free to be released. The evidence that
     // the PINNED resource survived is `deferred`: a resource evicted while its use count is
@@ -611,25 +657,31 @@ TEST(Triton_Runtime, ScratchArgumentsAreConditional)
     ok.format = "cubin";
     ok.global_scratch_bytes = 0;
     ok.profile_scratch_bytes = 0;
-    ok.abi = {{"src", "*u8", "u64", false}, {"W", "i32", "u32", false},
-              {"global_scratch", "*i8", "u64", true}, {"profile_scratch", "*i8", "u64", true}};
+    ok.abi = {{"src", "*u8", "u64", false},
+              {"W", "i32", "u32", false},
+              {"global_scratch", "*i8", "u64", true},
+              {"profile_scratch", "*i8", "u64", true}};
     std::string why;
     EXPECT_TRUE(cv_triton_runtime::launch_abi_ok(ok, why)) << why;
     Manifest m = ok;
     m.compiler = "triton-9.9.9";
-    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "a compiler whose ABI was not validated";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why))
+        << "a compiler whose ABI was not validated";
     // The format is a key PART, not a decoration: "hsaco" is a legitimately validated ABI for
     // the same version string (flagtree's HIP build), while an empty or unknown format is not
     // validated at all -- and must not pass by falling back to the compiler string alone.
     m = ok;
     m.format.clear();
-    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "no binary format cannot be validated";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why))
+        << "no binary format cannot be validated";
     m = ok;
     m.format = "exe";
-    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "an unknown binary format is not validated";
+    EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why))
+        << "an unknown binary format is not validated";
     m = ok;
     m.format = "hsaco";
-    EXPECT_TRUE(cv_triton_runtime::launch_abi_ok(m, why)) << "the HIP format is validated for the same ABI";
+    EXPECT_TRUE(cv_triton_runtime::launch_abi_ok(m, why))
+        << "the HIP format is validated for the same ABI";
     m = ok;
     m.global_scratch_bytes = 1024;
     EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "the kernel needs scratch memory";
@@ -644,4 +696,5 @@ TEST(Triton_Runtime, ScratchArgumentsAreConditional)
     EXPECT_FALSE(cv_triton_runtime::launch_abi_ok(m, why)) << "not the expected trailing pointers";
 }
 
-}}  // namespace
+}
+} // namespace

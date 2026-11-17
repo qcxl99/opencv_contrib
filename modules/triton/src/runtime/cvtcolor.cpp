@@ -13,8 +13,11 @@
 // Reverse HSV/HLS and forward linear Luv are not implemented. Their CPU floating
 // point paths can differ between vector blocks and scalar tails; the conversion
 // table below lists the supported alternatives explicitly.
+// Standalone CPU controls and test support do not use library-private headers.
+#ifdef __OPENCV_BUILD
+#include "../precomp.hpp"
+#endif
 #include "cvtcolor.hpp"
-
 #include <algorithm>
 #include <cfloat>
 #include <cfenv>
@@ -29,21 +32,21 @@
 #include <cstring>
 #include <mutex>
 #include <sstream>
-
 // The tables below are cvRound() of a softfloat/softdouble evaluation, and the CPU builds them
 // the same way. Using the same primitives is the only way the two agree: a std::pow/lrint build
 // disagrees on a handful of entries, and every pixel that reads one is then off by one. This is
 // the same header modules/imgproc/src/color_lab.cpp itself includes.
 #include "opencv2/core/softfloat.hpp"
-
 // Arithmetic source references: OpenCV 5.0.0 imgproc colour/demosaicing symbols.
-namespace cv_triton_color {
+namespace cv_triton_color
+{
 
 using cv_triton_runtime::Code;
 using cv_triton_runtime::Reason;
 using cv_triton_runtime::Status;
 
-namespace {
+namespace
+{
 
 // Leading columns: name, code, op, scn, dcn, blue, inverse, hrange, perm[].
 // Trailing family-specific fields use CodeSpec defaults when omitted; labels on
@@ -51,12 +54,12 @@ namespace {
 // perm[] selects source channels; -1 writes opaque alpha (255, 65535 or 1 by depth).
 const CodeSpec TABLE[] = {
     // ---- channel permutes
-    {"BGR2BGRA",     0,  Op::Permute, 3, 4, 0, false, 180, {0, 1, 2, -1}},
-    {"BGRA2BGR",     1,  Op::Permute, 4, 3, 0, false, 180, {0, 1, 2, -1}},
-    {"BGR2RGBA",     2,  Op::Permute, 3, 4, 0, false, 180, {2, 1, 0, -1}},
-    {"RGBA2BGR",     3,  Op::Permute, 4, 3, 0, false, 180, {2, 1, 0, -1}},
-    {"BGR2RGB",      4,  Op::Permute, 3, 3, 0, false, 180, {2, 1, 0, -1}},
-    {"BGRA2RGBA",    5,  Op::Permute, 4, 4, 0, false, 180, {2, 1, 0, 3}},
+    {"BGR2BGRA", 0, Op::Permute, 3, 4, 0, false, 180, {0, 1, 2, -1}},
+    {"BGRA2BGR", 1, Op::Permute, 4, 3, 0, false, 180, {0, 1, 2, -1}},
+    {"BGR2RGBA", 2, Op::Permute, 3, 4, 0, false, 180, {2, 1, 0, -1}},
+    {"RGBA2BGR", 3, Op::Permute, 4, 3, 0, false, 180, {2, 1, 0, -1}},
+    {"BGR2RGB", 4, Op::Permute, 3, 3, 0, false, 180, {2, 1, 0, -1}},
+    {"BGRA2RGBA", 5, Op::Permute, 4, 4, 0, false, 180, {2, 1, 0, 3}},
     // ---- gray -> color (src has ONE channel; perm 0 reads it for all three outputs)
     //
     // COLOR_GRAY2RGB is an alias of COLOR_GRAY2BGR (both 8) and GRAY2RGBA of GRAY2BGRA (both 9):
@@ -71,13 +74,13 @@ const CodeSpec TABLE[] = {
     // is accepted and produces the 4-channel result), while this table pins dcn per row. Adding a
     // dstCn parameter here would be a public-API change; the supported form is the code's own
     // channel count.
-    {"GRAY2BGR",      8,  Op::Permute, 1, 3, 0, false, 180, {0, 0, 0, -1}},
-    {"GRAY2RGBA",     9,  Op::Permute, 1, 4, 0, false, 180, {0, 0, 0, -1}},
+    {"GRAY2BGR", 8, Op::Permute, 1, 3, 0, false, 180, {0, 0, 0, -1}},
+    {"GRAY2RGBA", 9, Op::Permute, 1, 4, 0, false, 180, {0, 0, 0, -1}},
     // ---- to gray (blue index selects channel order; OpenCV accepts both)
-    {"BGR2GRAY",     6,  Op::Gray, 3, 1, 0, false, 180, {0, 0, 0, 0}},
-    {"RGB2GRAY",     7,  Op::Gray, 3, 1, 2, false, 180, {0, 0, 0, 0}},
-    {"BGRA2GRAY",    10, Op::Gray, 4, 1, 0, false, 180, {0, 0, 0, 0}},
-    {"RGBA2GRAY",    11, Op::Gray, 4, 1, 2, false, 180, {0, 0, 0, 0}},
+    {"BGR2GRAY", 6, Op::Gray, 3, 1, 0, false, 180, {0, 0, 0, 0}},
+    {"RGB2GRAY", 7, Op::Gray, 3, 1, 2, false, 180, {0, 0, 0, 0}},
+    {"BGRA2GRAY", 10, Op::Gray, 4, 1, 0, false, 180, {0, 0, 0, 0}},
+    {"RGBA2GRAY", 11, Op::Gray, 4, 1, 2, false, 180, {0, 0, 0, 0}},
     // YUV2GRAY_UYVY / _YUY2 (123 / 124). These are NOT a conversion: color.cpp calls
     // cvtColorYUV2Gray_ch, which is `extractChannel(_src, _dst, coi)` with coi = 1 for UYVY and
     // 0 for YUY2 (color_yuv.dispatch.cpp). So they are a plain channel copy, they accept
@@ -95,24 +98,127 @@ const CodeSpec TABLE[] = {
     //
     // No encode direction: color -> NV12/I420/YV12 would have to produce a taller buffer, and
     // that is the same interface question in reverse. It stays refused.
-    {"YUV2BGR_NV12", 91, Op::Yuv420, 1, 3, 0, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 0},
-    {"YUV2RGB_NV12", 90, Op::Yuv420, 1, 3, 2, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 0},
-    {"YUV2BGRA_NV12", 95, Op::Yuv420, 1, 4, 0, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 0},
-    {"YUV2RGBA_NV12", 94, Op::Yuv420, 1, 4, 2, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 0},
-    {"YUV2BGR_NV21", 93, Op::Yuv420, 1, 3, 0, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 1},
-    {"YUV2RGB_NV21", 92, Op::Yuv420, 1, 3, 2, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 1},
-    {"YUV2BGRA_NV21", 97, Op::Yuv420, 1, 4, 0, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 1},
-    {"YUV2RGBA_NV21", 96, Op::Yuv420, 1, 4, 2, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 1},
-
+    {"YUV2BGR_NV12",
+     91,
+     Op::Yuv420,
+     1,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     0},
+    {"YUV2RGB_NV12",
+     90,
+     Op::Yuv420,
+     1,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     0},
+    {"YUV2BGRA_NV12",
+     95,
+     Op::Yuv420,
+     1,
+     4,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     0},
+    {"YUV2RGBA_NV12",
+     94,
+     Op::Yuv420,
+     1,
+     4,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     0},
+    {"YUV2BGR_NV21",
+     93,
+     Op::Yuv420,
+     1,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     1},
+    {"YUV2RGB_NV21",
+     92,
+     Op::Yuv420,
+     1,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     1},
+    {"YUV2BGRA_NV21",
+     97,
+     Op::Yuv420,
+     1,
+     4,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     1},
+    {"YUV2RGBA_NV21",
+     96,
+     Op::Yuv420,
+     1,
+     4,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     1},
 
     // ---- YCrCb
-    {"BGR2YCrCb",    36, Op::YCrCb, 3, 3, 0, false, 180, {0, 0, 0, 0}},
-    {"RGB2YCrCb",    37, Op::YCrCb, 3, 3, 2, false, 180, {0, 0, 0, 0}},
-    {"YCrCb2BGR",    38, Op::YCrCb, 3, 3, 0, true,  180, {0, 0, 0, 0}},
-    {"YCrCb2RGB",    39, Op::YCrCb, 3, 3, 2, true,  180, {0, 0, 0, 0}},
+    {"BGR2YCrCb", 36, Op::YCrCb, 3, 3, 0, false, 180, {0, 0, 0, 0}},
+    {"RGB2YCrCb", 37, Op::YCrCb, 3, 3, 2, false, 180, {0, 0, 0, 0}},
+    {"YCrCb2BGR", 38, Op::YCrCb, 3, 3, 0, true, 180, {0, 0, 0, 0}},
+    {"YCrCb2RGB", 39, Op::YCrCb, 3, 3, 2, true, 180, {0, 0, 0, 0}},
     // ---- HSV, integer path, hue range 0..180
-    {"BGR2HSV",      40, Op::Hsv, 3, 3, 0, false, 180, {0, 0, 0, 0}},
-    {"RGB2HSV",      41, Op::Hsv, 3, 3, 2, false, 180, {0, 0, 0, 0}},
+    {"BGR2HSV", 40, Op::Hsv, 3, 3, 0, false, 180, {0, 0, 0, 0}},
+    {"RGB2HSV", 41, Op::Hsv, 3, 3, 2, false, 180, {0, 0, 0, 0}},
     // ---- HSV, full hue range 0..255: same code, a different div table
     {"BGR2HSV_FULL", 66, Op::Hsv, 3, 3, 0, false, 256, {0, 0, 0, 0}},
     {"RGB2HSV_FULL", 67, Op::Hsv, 3, 3, 2, false, 256, {0, 0, 0, 0}},
@@ -127,16 +233,94 @@ const CodeSpec TABLE[] = {
     // YUV2GRAY_UYVY/YUY2 (123/124) are NOT here: the CPU implements those as a plain
     // extractChannel (color_yuv.dispatch.cpp), which accepts ODD widths and is a channel
     // copy, not a conversion -- so they are served by the Permute rows below.
-    {"YUV2RGB_UYVY", 107, Op::Yuv422, 2, 3, 2, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 0},
-    {"YUV2BGR_UYVY", 108, Op::Yuv422, 2, 3, 0, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 0},
-    {"YUV2RGB_YUY2", 115, Op::Yuv422, 2, 3, 2, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 1},
-    {"YUV2BGR_YUY2", 116, Op::Yuv422, 2, 3, 0, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 1},
-    {"YUV2RGB_YVYU", 117, Op::Yuv422, 2, 3, 2, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 2},
-    {"YUV2BGR_YVYU", 118, Op::Yuv422, 2, 3, 0, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 2},
-    {"BGR2YUV",      82, Op::Yuv, 3, 3, 0, false, 180, {0, 0, 0, 0}},
-    {"RGB2YUV",      83, Op::Yuv, 3, 3, 2, false, 180, {0, 0, 0, 0}},
-    {"YUV2BGR",      84, Op::Yuv, 3, 3, 0, true,  180, {0, 0, 0, 0}},
-    {"YUV2RGB",      85, Op::Yuv, 3, 3, 2, true,  180, {0, 0, 0, 0}},
+    {"YUV2RGB_UYVY",
+     107,
+     Op::Yuv422,
+     2,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     0},
+    {"YUV2BGR_UYVY",
+     108,
+     Op::Yuv422,
+     2,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     0},
+    {"YUV2RGB_YUY2",
+     115,
+     Op::Yuv422,
+     2,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     1},
+    {"YUV2BGR_YUY2",
+     116,
+     Op::Yuv422,
+     2,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     1},
+    {"YUV2RGB_YVYU",
+     117,
+     Op::Yuv422,
+     2,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     2},
+    {"YUV2BGR_YVYU",
+     118,
+     Op::Yuv422,
+     2,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     0,
+     0,
+     true,
+     {0, 0, 0, 0, 0, 0, 0, 0, 0},
+     2},
+    {"BGR2YUV", 82, Op::Yuv, 3, 3, 0, false, 180, {0, 0, 0, 0}},
+    {"RGB2YUV", 83, Op::Yuv, 3, 3, 2, false, 180, {0, 0, 0, 0}},
+    {"YUV2BGR", 84, Op::Yuv, 3, 3, 0, true, 180, {0, 0, 0, 0}},
+    {"YUV2RGB", 85, Op::Yuv, 3, 3, 2, true, 180, {0, 0, 0, 0}},
     // ---- packed 5x5 RGB (codes 12..31)
     //
     // THE LAYOUT FACT THAT DECIDES EVERYTHING HERE: OpenCV 5.x represents a 5x5-packed image as
@@ -159,26 +343,26 @@ const CodeSpec TABLE[] = {
     // (CvtHelper<Set<3,4>,...>): the table has one source channel count per code, the same way
     // BGR2BGRA is scn=3 and BGRA2BGRA does not exist. The 4-channel rows are the ones whose
     // code name says A, and they are the only place alpha reaches the packed word.
-    {"BGR2BGR565",   12, Op::Packed, 3, 2, 0, false, 180, {0, 0, 0, 0}, 6},
-    {"RGB2BGR565",   13, Op::Packed, 3, 2, 2, false, 180, {0, 0, 0, 0}, 6},
-    {"BGRA2BGR565",  16, Op::Packed, 4, 2, 0, false, 180, {0, 0, 0, 0}, 6},
-    {"RGBA2BGR565",  17, Op::Packed, 4, 2, 2, false, 180, {0, 0, 0, 0}, 6},
-    {"GRAY2BGR565",  20, Op::Packed, 1, 2, 0, false, 180, {0, 0, 0, 0}, 6},
-    {"BGR5652BGR",   14, Op::Packed, 2, 3, 0, true,  180, {0, 0, 0, 0}, 6},
-    {"BGR5652RGB",   15, Op::Packed, 2, 3, 2, true,  180, {0, 0, 0, 0}, 6},
-    {"BGR5652BGRA",  18, Op::Packed, 2, 4, 0, true,  180, {0, 0, 0, 0}, 6},
-    {"BGR5652RGBA",  19, Op::Packed, 2, 4, 2, true,  180, {0, 0, 0, 0}, 6},
-    {"BGR5652GRAY",  21, Op::Packed, 2, 1, 0, true,  180, {0, 0, 0, 0}, 6},
-    {"BGR2BGR555",   22, Op::Packed, 3, 2, 0, false, 180, {0, 0, 0, 0}, 5},
-    {"RGB2BGR555",   23, Op::Packed, 3, 2, 2, false, 180, {0, 0, 0, 0}, 5},
-    {"BGRA2BGR555",  26, Op::Packed, 4, 2, 0, false, 180, {0, 0, 0, 0}, 5},
-    {"RGBA2BGR555",  27, Op::Packed, 4, 2, 2, false, 180, {0, 0, 0, 0}, 5},
-    {"GRAY2BGR555",  30, Op::Packed, 1, 2, 0, false, 180, {0, 0, 0, 0}, 5},
-    {"BGR5552BGR",   24, Op::Packed, 2, 3, 0, true,  180, {0, 0, 0, 0}, 5},
-    {"BGR5552RGB",   25, Op::Packed, 2, 3, 2, true,  180, {0, 0, 0, 0}, 5},
-    {"BGR5552BGRA",  28, Op::Packed, 2, 4, 0, true,  180, {0, 0, 0, 0}, 5},
-    {"BGR5552RGBA",  29, Op::Packed, 2, 4, 2, true,  180, {0, 0, 0, 0}, 5},
-    {"BGR5552GRAY",  31, Op::Packed, 2, 1, 0, true,  180, {0, 0, 0, 0}, 5},
+    {"BGR2BGR565", 12, Op::Packed, 3, 2, 0, false, 180, {0, 0, 0, 0}, 6},
+    {"RGB2BGR565", 13, Op::Packed, 3, 2, 2, false, 180, {0, 0, 0, 0}, 6},
+    {"BGRA2BGR565", 16, Op::Packed, 4, 2, 0, false, 180, {0, 0, 0, 0}, 6},
+    {"RGBA2BGR565", 17, Op::Packed, 4, 2, 2, false, 180, {0, 0, 0, 0}, 6},
+    {"GRAY2BGR565", 20, Op::Packed, 1, 2, 0, false, 180, {0, 0, 0, 0}, 6},
+    {"BGR5652BGR", 14, Op::Packed, 2, 3, 0, true, 180, {0, 0, 0, 0}, 6},
+    {"BGR5652RGB", 15, Op::Packed, 2, 3, 2, true, 180, {0, 0, 0, 0}, 6},
+    {"BGR5652BGRA", 18, Op::Packed, 2, 4, 0, true, 180, {0, 0, 0, 0}, 6},
+    {"BGR5652RGBA", 19, Op::Packed, 2, 4, 2, true, 180, {0, 0, 0, 0}, 6},
+    {"BGR5652GRAY", 21, Op::Packed, 2, 1, 0, true, 180, {0, 0, 0, 0}, 6},
+    {"BGR2BGR555", 22, Op::Packed, 3, 2, 0, false, 180, {0, 0, 0, 0}, 5},
+    {"RGB2BGR555", 23, Op::Packed, 3, 2, 2, false, 180, {0, 0, 0, 0}, 5},
+    {"BGRA2BGR555", 26, Op::Packed, 4, 2, 0, false, 180, {0, 0, 0, 0}, 5},
+    {"RGBA2BGR555", 27, Op::Packed, 4, 2, 2, false, 180, {0, 0, 0, 0}, 5},
+    {"GRAY2BGR555", 30, Op::Packed, 1, 2, 0, false, 180, {0, 0, 0, 0}, 5},
+    {"BGR5552BGR", 24, Op::Packed, 2, 3, 0, true, 180, {0, 0, 0, 0}, 5},
+    {"BGR5552RGB", 25, Op::Packed, 2, 3, 2, true, 180, {0, 0, 0, 0}, 5},
+    {"BGR5552BGRA", 28, Op::Packed, 2, 4, 0, true, 180, {0, 0, 0, 0}, 5},
+    {"BGR5552RGBA", 29, Op::Packed, 2, 4, 2, true, 180, {0, 0, 0, 0}, 5},
+    {"BGR5552GRAY", 31, Op::Packed, 2, 1, 0, true, 180, {0, 0, 0, 0}, 5},
     // ---- Bayer bilinear demosaic (codes 46-49, 86, 139), 8U and 16U
     //
     // The four BGR codes are ONE kernel with the 2x2 pattern phase shifted. The CPU derives that
@@ -194,10 +378,10 @@ const CodeSpec TABLE[] = {
     // Bayer2GRAY is a separate kernel with its own coefficients, dcn pinned to 1.
     //
     // VNG (62) and EA (135) are intentionally absent -- see the header.
-    {"BayerBG2BGR",  46, Op::Bayer, 1, 3, -1, false, 180, {0, 0, 0, 0}, 0, 0},
-    {"BayerGB2BGR",  47, Op::Bayer, 1, 3, -1, false, 180, {0, 0, 0, 0}, 0, 1},
-    {"BayerRG2BGR",  48, Op::Bayer, 1, 3,  1, false, 180, {0, 0, 0, 0}, 0, 0},
-    {"BayerGR2BGR",  49, Op::Bayer, 1, 3,  1, false, 180, {0, 0, 0, 0}, 0, 1},
+    {"BayerBG2BGR", 46, Op::Bayer, 1, 3, -1, false, 180, {0, 0, 0, 0}, 0, 0},
+    {"BayerGB2BGR", 47, Op::Bayer, 1, 3, -1, false, 180, {0, 0, 0, 0}, 0, 1},
+    {"BayerRG2BGR", 48, Op::Bayer, 1, 3, 1, false, 180, {0, 0, 0, 0}, 0, 0},
+    {"BayerGR2BGR", 49, Op::Bayer, 1, 3, 1, false, 180, {0, 0, 0, 0}, 0, 1},
     {"BayerBG2GRAY", 86, Op::Bayer, 1, 1, -1, false, 180, {0, 0, 0, 0}, 0, 0},
     {"BayerBG2BGRA", 139, Op::Bayer, 1, 4, -1, false, 180, {0, 0, 0, 0}, 0, 0},
     // ---- XYZ and the Lab/Luv families (codes 32-35, 44/45, 56/57, 58/59, 74-81)
@@ -213,35 +397,271 @@ const CodeSpec TABLE[] = {
     //
     // Forward linear Luv (COLOR_LBGR2Luv and COLOR_LRGB2Luv) is not implemented.
     // Its CPU vector and scalar paths can produce different rounded results.
-    {"BGR2XYZ", 32, Op::Xyz, 3, 3, 0, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"RGB2XYZ", 33, Op::Xyz, 3, 3, 2, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"XYZ2BGR", 34, Op::Xyz, 3, 3, 0, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"XYZ2RGB", 35, Op::Xyz, 3, 3, 2, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"BGR2Lab", 44, Op::Lab, 3, 3, 0, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"RGB2Lab", 45, Op::Lab, 3, 3, 2, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"Lab2BGR", 56, Op::Lab, 3, 3, 0, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"Lab2RGB", 57, Op::Lab, 3, 3, 2, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"BGR2Luv", 50, Op::Luv, 3, 3, 0, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"RGB2Luv", 51, Op::Luv, 3, 3, 2, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"Luv2BGR", 58, Op::Luv, 3, 3, 0, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"Luv2RGB", 59, Op::Luv, 3, 3, 2, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/true, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
+    {"BGR2XYZ",
+     32,
+     Op::Xyz,
+     3,
+     3,
+     0,
+     false,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"RGB2XYZ",
+     33,
+     Op::Xyz,
+     3,
+     3,
+     2,
+     false,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"XYZ2BGR",
+     34,
+     Op::Xyz,
+     3,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"XYZ2RGB",
+     35,
+     Op::Xyz,
+     3,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"BGR2Lab",
+     44,
+     Op::Lab,
+     3,
+     3,
+     0,
+     false,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"RGB2Lab",
+     45,
+     Op::Lab,
+     3,
+     3,
+     2,
+     false,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"Lab2BGR",
+     56,
+     Op::Lab,
+     3,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"Lab2RGB",
+     57,
+     Op::Lab,
+     3,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"BGR2Luv",
+     50,
+     Op::Luv,
+     3,
+     3,
+     0,
+     false,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"RGB2Luv",
+     51,
+     Op::Luv,
+     3,
+     3,
+     2,
+     false,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"Luv2BGR",
+     58,
+     Op::Luv,
+     3,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"Luv2RGB",
+     59,
+     Op::Luv,
+     3,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/true,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
     // The linear variants: srgb = false. LBGR2Lab/LRGB2Lab differ from the sRGB codes ONLY in
     // the transfer function (linearGammaTab_b[i] == i << 3), which the kernel folds into a shift.
-    {"LBGR2Lab", 74, Op::Lab, 3, 3, 0, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/false, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"LRGB2Lab", 75, Op::Lab, 3, 3, 2, false, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/false, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"Lab2LBGR", 78, Op::Lab, 3, 3, 0, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/false, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"Lab2LRGB", 79, Op::Lab, 3, 3, 2, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/false, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"Luv2LBGR", 80, Op::Luv, 3, 3, 0, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/false, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
-    {"Luv2LRGB", 81, Op::Luv, 3, 3, 2, true, 180, {0, 0, 0, 0}, /*gb=*/0, /*swg=*/0, /*srgb=*/false, /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0}, /*ord=*/0},
+    {"LBGR2Lab",
+     74,
+     Op::Lab,
+     3,
+     3,
+     0,
+     false,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/false,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"LRGB2Lab",
+     75,
+     Op::Lab,
+     3,
+     3,
+     2,
+     false,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/false,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"Lab2LBGR",
+     78,
+     Op::Lab,
+     3,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/false,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"Lab2LRGB",
+     79,
+     Op::Lab,
+     3,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/false,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"Luv2LBGR",
+     80,
+     Op::Luv,
+     3,
+     3,
+     0,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/false,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
+    {"Luv2LRGB",
+     81,
+     Op::Luv,
+     3,
+     3,
+     2,
+     true,
+     180,
+     {0, 0, 0, 0},
+     /*gb=*/0,
+     /*swg=*/0,
+     /*srgb=*/false,
+     /*k=*/{0, 0, 0, 0, 0, 0, 0, 0, 0},
+     /*ord=*/0},
 };
 
-Status prepared() {
+Status prepared()
+{
     Status s;
     s.code = Code::Prepared;
     return s;
 }
 
-Status unsupported(Reason r, std::string msg) {
+Status unsupported(Reason r, std::string msg)
+{
     Status s;
     s.code = Code::Unsupported;
     s.reason = r;
@@ -249,52 +669,74 @@ Status unsupported(Reason r, std::string msg) {
     return s;
 }
 
-}  // namespace
+} // namespace
 
-namespace {
+namespace
+{
 
 // The rows above are literals; the Xyz/Lab/Luv coefficients are not, because the CPU computes
 // them from softdouble in its constructors (coeffs_for). They are filled ONCE, here, so a row's
 // `k` is available to every reader -- constexprs_text, the launch, and the test -- without any
 // of them having to know how the numbers are made.
-std::vector<CodeSpec> buildTable() {
+std::vector<CodeSpec> buildTable()
+{
     std::vector<CodeSpec> v(TABLE, TABLE + sizeof(TABLE) / sizeof(TABLE[0]));
-    for (CodeSpec& c : v)
+    for (CodeSpec &c : v)
         if (c.op == Op::Xyz || c.op == Op::Lab || c.op == Op::Luv)
             coeffs_for(c.code, c.k);
     return v;
 }
 
-const std::vector<CodeSpec>& table() {
+const std::vector<CodeSpec> &table()
+{
     static const std::vector<CodeSpec> v = buildTable();
     return v;
 }
 
-}  // namespace
+} // namespace
 
-const CodeSpec* find(int code) {
-    for (const CodeSpec& c : table())
-        if (c.code == code) return &c;
+const CodeSpec *find(int code)
+{
+    for (const CodeSpec &c : table())
+        if (c.code == code)
+            return &c;
     return nullptr;
 }
 
-const std::vector<CodeSpec>& all() {
+const std::vector<CodeSpec> &all()
+{
     return table();
 }
 
-namespace {
+namespace
+{
 // Volatile stores enforce one binary32 rounding per operation even in FMA builds.
-float separate_mul(float a, float b) { volatile float v = a * b; return v; }
-float separate_add(float a, float b) { volatile float v = a + b; return v; }
-float separate_sub(float a, float b) { volatile float v = a - b; return v; }
+float separate_mul(float a, float b)
+{
+    volatile float v = a * b;
+    return v;
+}
+float separate_add(float a, float b)
+{
+    volatile float v = a + b;
+    return v;
+}
+float separate_sub(float a, float b)
+{
+    volatile float v = a - b;
+    return v;
+}
 
-cv::Mat separate4_model(const cv::Mat& src, const CodeSpec& c) {
+cv::Mat separate4_model(const cv::Mat &src, const CodeSpec &c)
+{
     cv::Mat dst(src.rows, src.cols, CV_MAKETYPE(CV_32F, c.dcn));
     for (int y = 0; y < src.rows; ++y)
-        for (int x = 0; x < src.cols; ++x) {
-            const float* s = src.ptr<float>(y) + x * c.scn;
-            float* d = dst.ptr<float>(y) + x * c.dcn;
-            if (c.op == Op::Gray || !c.inverse) {
+        for (int x = 0; x < src.cols; ++x)
+        {
+            const float *s = src.ptr<float>(y) + x * c.scn;
+            float *d = dst.ptr<float>(y) + x * c.dcn;
+            if (c.op == Op::Gray || !c.inverse)
+            {
                 const float a = separate_mul(s[0], c.blue == 0 ? .114f : .299f);
                 const float b = separate_mul(s[1], .587f);
                 const float e = separate_mul(s[2], c.blue == 0 ? .299f : .114f);
@@ -302,13 +744,19 @@ cv::Mat separate4_model(const cv::Mat& src, const CodeSpec& c) {
                                     ? separate_add(a, separate_add(b, e))
                                     : separate_add(separate_add(a, b), e);
                 d[0] = v;
-                if (c.op != Op::Gray) {
+                if (c.op != Op::Gray)
+                {
                     const bool uv = c.op == Op::Yuv;
-                    const float cr = separate_add(separate_mul(separate_sub(s[c.blue ^ 2], v), uv ? .877f : .713f), .5f);
-                    const float cb = separate_add(separate_mul(separate_sub(s[c.blue], v), uv ? .492f : .564f), .5f);
-                    d[uv ? 2 : 1] = cr; d[uv ? 1 : 2] = cb;
+                    const float cr = separate_add(
+                        separate_mul(separate_sub(s[c.blue ^ 2], v), uv ? .877f : .713f), .5f);
+                    const float cb = separate_add(
+                        separate_mul(separate_sub(s[c.blue], v), uv ? .492f : .564f), .5f);
+                    d[uv ? 2 : 1] = cr;
+                    d[uv ? 1 : 2] = cb;
                 }
-            } else {
+            }
+            else
+            {
                 const bool uv = c.op == Op::Yuv;
                 const float cr = separate_sub(s[uv ? 2 : 1], .5f);
                 const float cb = separate_sub(s[uv ? 1 : 2], .5f);
@@ -316,48 +764,58 @@ cv::Mat separate4_model(const cv::Mat& src, const CodeSpec& c) {
                 d[1] = separate_add(separate_add(s[0], separate_mul(cb, uv ? -.395f : -.344f)),
                                     separate_mul(cr, uv ? -.581f : -.714f));
                 d[c.blue ^ 2] = separate_add(s[0], separate_mul(cr, uv ? 1.140f : 1.403f));
-                if (c.dcn == 4) d[3] = 1.f;
+                if (c.dcn == 4)
+                    d[3] = 1.f;
             }
         }
     return dst;
 }
 
 using FloatControls = std::tuple<bool, bool, bool, int, unsigned>;
-FloatControls float_controls() {
-    unsigned fp=0;
+FloatControls float_controls()
+{
+    unsigned fp = 0;
 #if defined(__SSE__)
-    fp=_mm_getcsr() & 0xe040u;
+    fp = _mm_getcsr() & 0xe040u;
 #endif
-    return std::make_tuple(cv::useOptimized(), cv::ipp::useIPP(),
-                           cv::ipp::useIPP_NotExact(), std::fegetround(), fp);
+    return std::make_tuple(cv::useOptimized(), cv::ipp::useIPP(), cv::ipp::useIPP_NotExact(),
+                           std::fegetround(), fp);
 }
 
-bool identify_separate4() {
+bool identify_separate4()
+{
     // A fixture match identifies only the tested finite normal domain. It is not a
     // universal guarantee for other HALs, nonfinite inputs, overflow or subnormals.
     int codes = 0;
-    for (const CodeSpec& c : all()) {
-        if (c.op != Op::Gray && c.op != Op::Yuv && c.op != Op::YCrCb) continue;
+    for (const CodeSpec &c : all())
+    {
+        if (c.op != Op::Gray && c.op != Op::Yuv && c.op != Op::YCrCb)
+            continue;
         ++codes;
         for (int w : {1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 65})
-            for (bool roi : {false, true}) {
+            for (bool roi : {false, true})
+            {
                 cv::Mat parent(5, w + 7, CV_MAKETYPE(CV_32F, c.scn));
                 cv::RNG rng(0x932500 + c.code * 31 + w);
                 rng.fill(parent, cv::RNG::UNIFORM, -2., 2.);
                 cv::Mat src = parent(cv::Rect(2, 1, w, 3));
-                if (!roi) src = src.clone();
+                if (!roi)
+                    src = src.clone();
                 for (int y = 0; y < src.rows; ++y)
                     for (int x = 0; x < w; ++x)
                         for (int k = 0; k < c.scn; ++k)
-                            src.ptr<float>(y)[x*c.scn+k] *= (x+y)%3 ? 32767.5f : 1.f;
+                            src.ptr<float>(y)[x * c.scn + k] *= (x + y) % 3 ? 32767.5f : 1.f;
                 const cv::Mat expected = separate4_model(src, c);
                 cv::Mat actual;
                 cv::cvtColor(src, actual, c.code);
-                if (actual.size() != expected.size() || actual.type() != expected.type()) return false;
+                if (actual.size() != expected.size() || actual.type() != expected.type())
+                    return false;
                 for (int y = 0; y < actual.rows; ++y)
-                    for (int x = 0; x < actual.cols * actual.channels(); ++x) {
+                    for (int x = 0; x < actual.cols * actual.channels(); ++x)
+                    {
                         const float a = actual.ptr<float>(y)[x], b = expected.ptr<float>(y)[x];
-                        if (!std::isfinite(a) || !std::isfinite(b) || a != b) return false;
+                        if (!std::isfinite(a) || !std::isfinite(b) || a != b)
+                            return false;
                     }
             }
     }
@@ -365,26 +823,39 @@ bool identify_separate4() {
 }
 } // namespace
 
-bool float_cpu_separate4() {
+bool float_cpu_separate4()
+{
     // IPP controls can be thread-local: cache by their values, not by a process
     // default. Never mutate caller controls. Do not publish an unstable probe.
     static std::mutex mutex;
     static std::map<FloatControls, bool> cache;
     const FloatControls before = float_controls();
-    if (std::get<3>(before) != FE_TONEAREST || std::get<4>(before) != 0) return false;
+    if (std::get<3>(before) != FE_TONEAREST || std::get<4>(before) != 0)
+        return false;
     std::lock_guard<std::mutex> lock(mutex);
-    if (float_controls() != before) return false;
+    if (float_controls() != before)
+        return false;
     const auto found = cache.find(before);
-    if (found != cache.end()) return found->second && float_controls() == before;
+    if (found != cache.end())
+        return found->second && float_controls() == before;
     bool matches = false;
-    try { matches = identify_separate4(); } catch (const cv::Exception&) { return false; }
-    if (float_controls() != before) return false;
+    try
+    {
+        matches = identify_separate4();
+    }
+    catch (const cv::Exception &)
+    {
+        return false;
+    }
+    if (float_controls() != before)
+        return false;
     cache.emplace(before, matches);
     return matches;
 }
 
-Status resolve_output(const cv_triton_runtime::DeviceView& s, int code, Output& out) {
-    const CodeSpec* spec = find(code);
+Status resolve_output(const cv_triton_runtime::DeviceView &s, int code, Output &out)
+{
+    const CodeSpec *spec = find(code);
     if (!spec)
         return unsupported(Reason::Interpolation,
                            "cvtColor code " + std::to_string(code) +
@@ -413,8 +884,7 @@ Status resolve_output(const cv_triton_runtime::DeviceView& s, int code, Output& 
     const bool u16 = s.type == cv_triton_runtime::ElemType::U16;
     const bool bayer = spec->op == Op::Bayer;
     const bool serves16U = bayer || spec->op == Op::Gray || spec->op == Op::Yuv ||
-                           spec->op == Op::YCrCb ||
-                           (spec->op == Op::Permute && spec->scn == 1);
+                           spec->op == Op::YCrCb || (spec->op == Op::Permute && spec->scn == 1);
     const bool f32 = s.type == cv_triton_runtime::ElemType::F32;
     // CV_32F copies preserve source bits. Arithmetic conversions allow
     // |got-ref| <= 8*2^-24*max(1,|ref|,max|input channels at this pixel|), accounting
@@ -423,12 +893,13 @@ Status resolve_output(const cv_triton_runtime::DeviceView& s, int code, Output& 
     // only before calling extractChannel. Do not invent a 32F cvtColor extension.
     const bool f32_exact_copy = f32 && ((spec->op == Op::Permute && spec->scn != 2) ||
                                         (spec->op == Op::Gray && spec->inverse));
-    const bool f32_arithmetic = f32 && (spec->op == Op::Gray ||
-                                        spec->op == Op::Yuv || spec->op == Op::YCrCb);
+    const bool f32_arithmetic =
+        f32 && (spec->op == Op::Gray || spec->op == Op::Yuv || spec->op == Op::YCrCb);
     if (!u8 && !(serves16U && u16) && !f32_exact_copy && !f32_arithmetic)
-        return unsupported(Reason::DepthOrChannels,
-                           std::string(spec->name) +
-                           ": unsupported depth or mismatched src/dst depths for this conversion");
+        return unsupported(
+            Reason::DepthOrChannels,
+            std::string(spec->name) +
+                ": unsupported depth or mismatched src/dst depths for this conversion");
     if (s.channels != spec->scn)
         return unsupported(Reason::DepthOrChannels,
                            std::string(spec->name) + " needs a " + std::to_string(spec->scn) +
@@ -446,22 +917,26 @@ Status resolve_output(const cv_triton_runtime::DeviceView& s, int code, Output& 
     if (spec->op == Op::Yuv420)
     {
         if (s.cols % 2 != 0 || s.rows % 3 != 0)
-            return unsupported(Reason::EmptyOrSize,
-                               std::string(spec->name) + ": the 4:2:0 source must have an even "
-                               "width and a height divisible by 3 (got " +
-                               std::to_string(s.cols) + "x" + std::to_string(s.rows) + ")");
+            return unsupported(Reason::EmptyOrSize, std::string(spec->name) +
+                                                        ": the 4:2:0 source must have an even "
+                                                        "width and a height divisible by 3 (got " +
+                                                        std::to_string(s.cols) + "x" +
+                                                        std::to_string(s.rows) + ")");
     }
     const Status source = cv_triton_runtime::validate_view(s, "src");
-    if (!source.ok()) return source;
+    if (!source.ok())
+        return source;
     const int rows = spec->op == Op::Yuv420 ? (s.rows / 3) * 2 : s.rows;
     const Status output = cv_triton_runtime::validate_output_shape(rows, s.cols, spec->dcn);
-    if (!output.ok()) return output;
+    if (!output.ok())
+        return output;
     if (static_cast<long long>(rows) * s.cols > 0x7fffffffLL)
         return unsupported(Reason::IndexRange, "pixel count exceeds int32 indexing");
     // Admission precedes output allocation in every adapter. uv_rs is i32,
     // while the pointer arithmetic itself is 64-bit.
-    if (spec->op == Op::Yuv420 && static_cast<unsigned long long>(rows) *
-        (s.step / cv_triton_runtime::elem_size(s.type)) > 0x7fffffffULL)
+    if (spec->op == Op::Yuv420 &&
+        static_cast<unsigned long long>(rows) * (s.step / cv_triton_runtime::elem_size(s.type)) >
+            0x7fffffffULL)
         return unsupported(Reason::IndexRange, "4:2:0 chroma-plane offset exceeds int32 indexing");
     out.spec = spec;
     out.cols = s.cols;
@@ -469,27 +944,36 @@ Status resolve_output(const cv_triton_runtime::DeviceView& s, int code, Output& 
     return prepared();
 }
 
-Status normalize(const Request& req, Normalized& out) {
+Status normalize(const Request &req, Normalized &out)
+{
     const cv_triton_runtime::DeviceView &s = req.src, &d = req.dst;
     Output expected;
     const Status resolved = resolve_output(s, req.code, expected);
-    if (!resolved.ok()) return resolved;
-    const CodeSpec* spec = expected.spec;
+    if (!resolved.ok())
+        return resolved;
+    const CodeSpec *spec = expected.spec;
     if (s.type != d.type)
-        return unsupported(Reason::DepthOrChannels, std::string(spec->name) +
-                           ": unsupported depth or mismatched src/dst depths for this conversion");
+        return unsupported(
+            Reason::DepthOrChannels,
+            std::string(spec->name) +
+                ": unsupported depth or mismatched src/dst depths for this conversion");
     if (d.channels != spec->dcn)
-        return unsupported(Reason::DepthOrChannels, std::string(spec->name) + " writes " +
-                           std::to_string(spec->dcn) + " channels, dst has " + std::to_string(d.channels));
+        return unsupported(Reason::DepthOrChannels,
+                           std::string(spec->name) + " writes " + std::to_string(spec->dcn) +
+                               " channels, dst has " + std::to_string(d.channels));
     if (d.rows != expected.rows || d.cols != expected.cols)
-        return unsupported(Reason::EmptyOrSize, std::string(spec->name) + " writes " +
-                           std::to_string(expected.cols) + "x" + std::to_string(expected.rows) +
-                           ", dst is " + std::to_string(d.cols) + "x" + std::to_string(d.rows));
-    if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
+        return unsupported(Reason::EmptyOrSize,
+                           std::string(spec->name) + " writes " + std::to_string(expected.cols) +
+                               "x" + std::to_string(expected.rows) + ", dst is " +
+                               std::to_string(d.cols) + "x" + std::to_string(d.rows));
+    if (!(s.ctx == d.ctx))
+        return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
     const Status destination = cv_triton_runtime::validate_view(d, "dst");
-    if (!destination.ok()) return destination;
+    if (!destination.ok())
+        return destination;
     if (cv_triton_runtime::views_overlap(s, d))
-        return unsupported(Reason::InPlaceOrOverlap, "src and dst overlap (in-place is not supported)");
+        return unsupported(Reason::InPlaceOrOverlap,
+                           "src and dst overlap (in-place is not supported)");
     // The pixel count and the launch geometry are the DESTINATION's: grid() emits one program per
     // `n.rows` row, so leaving rows at the source height launches 1.5x the programs for a 4:2:0
     // decode and writes rows past the end of dst.
@@ -505,27 +989,31 @@ Status normalize(const Request& req, Normalized& out) {
     return prepared();
 }
 
-HsvTables hsv_tables() {
+HsvTables hsv_tables()
+{
     // color_hsv.simd.hpp: hsv_shift = 12; sdiv = (255<<12)/i, hdiv = (range<<12)/(6*i),
     // both saturate_cast<int> of a double division, i = 1..255, entry 0 is 0.
     HsvTables t;
     t.sdiv.resize(256, 0);
     t.hdiv.resize(256, 0);
-    for (int i = 1; i < 256; ++i) {
-        t.sdiv[i] = static_cast<int>(std::lrint(1044480.0 / i));          // (255 << 12) / i
-        t.hdiv[i] = static_cast<int>(std::lrint(737280.0 / (6.0 * i)));  // (180 << 12) / (6 i)
+    for (int i = 1; i < 256; ++i)
+    {
+        t.sdiv[i] = static_cast<int>(std::lrint(1044480.0 / i));        // (255 << 12) / i
+        t.hdiv[i] = static_cast<int>(std::lrint(737280.0 / (6.0 * i))); // (180 << 12) / (6 i)
     }
     return t;
 }
 
-HsvTables hsv_tables_full() {
+HsvTables hsv_tables_full()
+{
     // hdiv for the 0..255 hue range: (256 << 12) / (6 i).
     HsvTables t;
     t.sdiv.resize(256, 0);
     t.hdiv.resize(256, 0);
-    for (int i = 1; i < 256; ++i) {
+    for (int i = 1; i < 256; ++i)
+    {
         t.sdiv[i] = static_cast<int>(std::lrint(1044480.0 / i));
-        t.hdiv[i] = static_cast<int>(std::lrint(1048576.0 / (6.0 * i)));  // (256 << 12) / (6 i)
+        t.hdiv[i] = static_cast<int>(std::lrint(1048576.0 / (6.0 * i))); // (256 << 12) / (6 i)
     }
     return t;
 }
@@ -534,25 +1022,27 @@ HsvTables hsv_tables_full() {
 // XYZ / Lab / Luv constants, replicated from modules/imgproc/src/color_lab.cpp.
 // Every value below is quoted from that file rather than re-derived, because the CPU's numbers
 // are the specification here, not the textbook ones.
-namespace {
+namespace
+{
 
-const int kLabShift = 12;      // == xyz_shift (color.simd_helpers.hpp), color_lab.cpp
-const int kGammaShift = 3;     // color_lab.cpp
-const int kLabShift2 = 15;     // lab_shift + gamma_shift (color_lab.cpp)
+const int kLabShift = 12;  // == xyz_shift (color.simd_helpers.hpp), color_lab.cpp
+const int kGammaShift = 3; // color_lab.cpp
+const int kLabShift2 = 15; // lab_shift + gamma_shift (color_lab.cpp)
 const int kInvGammaShift = 12;
 const int kInvGammaTabSize = 1 << kInvGammaShift;
-const int kLabCbrtTabSizeB = 256 * 3 / 2 * (1 << kGammaShift);   // 3072
+const int kLabCbrtTabSizeB = 256 * 3 / 2 * (1 << kGammaShift); // 3072
 const int kLabBaseShift = 14;
 const int kLabBase = 1 << kLabBaseShift;
 const int kLutBase = 1 << 14;
-const int kLabLutDim = 33;                                       // (1 << 5) + 1
+const int kLabLutDim = 33; // (1 << 5) + 1
 const int kMinAB = -8145;
 
 using cv::softdouble;
 using cv::softfloat;
 
 // color_lab.cpp (applyGamma / applyInvGamma inside a softdouble evaluation).
-softfloat applyGamma(softfloat x) {
+softfloat applyGamma(softfloat x)
+{
     static const softdouble threshold = softdouble(809) / softdouble(20000);
     static const softdouble lowScale = softdouble(323) / softdouble(25);
     static const softdouble power = softdouble(12) / softdouble(5);
@@ -561,14 +1051,16 @@ softfloat applyGamma(softfloat x) {
     return xd <= threshold ? xd / lowScale
                            : pow((xd + xshift) / (softdouble::one() + xshift), power);
 }
-softfloat applyInvGamma(softfloat x) {
+softfloat applyInvGamma(softfloat x)
+{
     static const softdouble threshold = softdouble(7827) / softdouble(2500000);
     static const softdouble lowScale = softdouble(323) / softdouble(25);
     static const softdouble power = softdouble(12) / softdouble(5);
     static const softdouble xshift = softdouble(11) / softdouble(200);
     const softdouble xd = x;
-    return xd <= threshold ? xd * lowScale
-                           : pow(xd, softdouble::one() / power) * (softdouble::one() + xshift) - xshift;
+    return xd <= threshold
+               ? xd * lowScale
+               : pow(xd, softdouble::one() / power) * (softdouble::one() + xshift) - xshift;
 }
 
 // D65 and the sRGB matrices as raw bit patterns (color_lab.cpp). Raw and not
@@ -598,16 +1090,18 @@ const int kXYZ2sRGB_i[9] = {13273, -6296, -2042, -3970, 7684, 170, 228, -836, 43
 // softfloat, not a softdouble, because `dd` was declared softfloat and std::max therefore
 // returns softfloat -- so the double-valued reciprocal is ROUNDED TO FLOAT before it is used.
 // That is why the value is 2.571912... and not the textbook 1/(0.9505+15+3*1.0888) = 0.0526.
-void whiteChroma(softfloat& un, softfloat& vn) {
+void whiteChroma(softfloat &un, softfloat &vn)
+{
     softfloat dd = D65[0] + D65[1] * softdouble(15) + D65[2] * softdouble(3);
     dd = softfloat::one() / std::max(dd, softfloat::eps());
     un = dd * softfloat(13 * 4) * D65[0];
     vn = dd * softfloat(13 * 9) * D65[1];
 }
 
-}  // namespace
+} // namespace
 
-void coeffs_for(int code, int out[9]) {
+void coeffs_for(int code, int out[9])
+{
     // The CPU builds these in the FUNCTOR CONSTRUCTORS from softdouble at run time -- they are
     // not literals in the source (except XYZ's), so replicating the constructor is the only way
     // to get them.
@@ -619,11 +1113,12 @@ void coeffs_for(int code, int out[9]) {
     // (B,G,R for a BGR destination). Getting this wrong is not subtle numerically but IS subtle
     // to read: a transposed or row-permuted colour matrix still looks like a colour matrix.
     std::fill(out, out + 9, 0);
-    const bool forward = (code == 44 || code == 45 || code == 74 || code == 75 ||   // BGR/RGB -> Lab
-                          code == 50 || code == 51);                                // BGR/RGB -> Luv
+    const bool forward = (code == 44 || code == 45 || code == 74 || code == 75 || // BGR/RGB -> Lab
+                          code == 50 || code == 51);                              // BGR/RGB -> Luv
     const bool xyz = (code == 32 || code == 33);
     const bool xyzInv = (code == 34 || code == 35);
-    const bool luv = (code == 50 || code == 51 || code == 58 || code == 59 || code == 80 || code == 81);
+    const bool luv =
+        (code == 50 || code == 51 || code == 58 || code == 59 || code == 80 || code == 81);
     // blueIdx = swapBlue(code) ? 2 : 0. swapBlue is false for the BGR/XYZ codes and true for
     // their RGB twins (color.hpp), which is what makes the two directions of the SAME code
     // family differ.
@@ -632,39 +1127,47 @@ void coeffs_for(int code, int out[9]) {
     const int blueIdx = rgbCode ? 2 : 0;
     static const softdouble lshift(1 << kLabShift);
 
-    if (xyz) {
+    if (xyz)
+    {
         // RGB2XYZ_i<uchar> (color_lab.cpp): the int table with swapBlueCoeffsCols for
         // blueIdx == 0. Column 0 of the CPU's array is then the coefficient of `b` = src[0], so
         // the CPU's order already IS our slot order and no extra work is needed beyond the swap.
-        for (int r = 0; r < 3; ++r) {
-            const int* row = kSRGB2XYZ_i + 3 * r;
+        for (int r = 0; r < 3; ++r)
+        {
+            const int *row = kSRGB2XYZ_i + 3 * r;
             out[3 * r + 0] = (blueIdx == 0) ? row[2] : row[0];
             out[3 * r + 1] = row[1];
             out[3 * r + 2] = (blueIdx == 0) ? row[0] : row[2];
         }
         return;
     }
-    if (xyzInv) {
+    if (xyzInv)
+    {
         // XYZ2RGB_i<uchar> (color_lab.cpp) applies swapBlueCoeffsRows when blueIdx == 0 --
         // ROWS, not columns, and blueIdx 0 is the BGR-output code. The CPU writes dst[0] from
         // flat row 0, so a row swap moves which destination channel each matrix row feeds.
-        for (int r = 0; r < 3; ++r) {
+        for (int r = 0; r < 3; ++r)
+        {
             const int srcRow = (blueIdx == 0) ? 2 - r : r;
-            for (int c = 0; c < 3; ++c) out[3 * r + c] = kXYZ2sRGB_i[3 * srcRow + c];
+            for (int c = 0; c < 3; ++c)
+                out[3 * r + c] = kXYZ2sRGB_i[3 * srcRow + c];
         }
         return;
     }
 
-    if (forward) {
+    if (forward)
+    {
         // RGB2Lab_b's constructor (color_lab.cpp). c[] is indexed by the LOGICAL
         // channel R, G, B and the constructor writes slot (blueIdx^2) for c[0], 1 for c[1],
         // blueIdx for c[2]. Our slot k reads src[k], which is the CPU's `b` for k = 0 whatever
         // blueIdx is (the CPU reads src[0] as b, src[1] as g, src[2] as r, and only the
         // coefficient placement changes). So slot 0 must carry the b coefficient: c[2] when
         // blueIdx == 0, c[0] when blueIdx == 2.
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 3; ++i)
+        {
             softdouble c[3];
-            for (int j = 0; j < 3; ++j) c[j] = kSRGB2XYZ_D65[i * 3 + j];
+            for (int j = 0; j < 3; ++j)
+                c[j] = kSRGB2XYZ_D65[i * 3 + j];
             const softdouble w = D65[i];
             out[3 * i + 0] = cvRound(lshift * c[blueIdx == 0 ? 2 : 0] / w);
             out[3 * i + 1] = cvRound(lshift * c[1] / w);
@@ -684,49 +1187,61 @@ void coeffs_for(int code, int out[9]) {
     // column order is (0,1,2) and for blueIdx 2 it is reversed to (2,1,0). Since the CPU writes
     // dst[r] from flat row r, blueIdx 2 exchanges which destination channel the outer columns
     // feed, which is the `row` reversal below.
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3; ++i)
+    {
         softdouble c[3];
-        for (int j = 0; j < 3; ++j) c[j] = kXYZ2sRGB_D65[i + j * 3];
+        for (int j = 0; j < 3; ++j)
+            c[j] = kXYZ2sRGB_D65[i + j * 3];
         // Lab scales by the white point; Luv does not (its white point is fixed at D65 and was
         // already folded into un/vn when the tables were built).
         const softdouble w = luv ? softdouble::one() : D65[i];
-        for (int j = 0; j < 3; ++j) {
+        for (int j = 0; j < 3; ++j)
+        {
             const int dstRow = (blueIdx == 2) ? j : 2 - j;
             out[dstRow * 3 + i] = cvRound(lshift * c[j] * w);
         }
     }
 }
 
-namespace {
+namespace
+{
 
-LabLuvTables buildLabLuvTables() {
+LabLuvTables buildLabLuvTables()
+{
     LabLuvTables t;
     t.gamma.resize(256);
-    for (int i = 0; i < 256; ++i) {
+    for (int i = 0; i < 256; ++i)
+    {
         const softfloat x = softfloat(i) / softfloat(255);
         t.gamma[i] = cvRound(softfloat(255 * (1 << kGammaShift)) * applyGamma(x));
     }
     t.cbrt.resize(kLabCbrtTabSizeB);
     {
         // cbTabScale = 1/(255*8): the argument is i/2040 and the result is scaled by 2^15.
-        static const softfloat cbTabScale(softfloat::one() / (softfloat(255) * softfloat(1 << kGammaShift)));
+        static const softfloat cbTabScale(softfloat::one() /
+                                          (softfloat(255) * softfloat(1 << kGammaShift)));
         static const softfloat lthresh = softfloat(216) / softfloat(24389);
         static const softfloat lscale = softfloat(841) / softfloat(108);
         static const softfloat lbias = softfloat(16) / softfloat(116);
         static const softfloat lshift2(1 << kLabShift2);
-        for (int i = 0; i < kLabCbrtTabSizeB; ++i) {
+        for (int i = 0; i < kLabCbrtTabSizeB; ++i)
+        {
             const softfloat x = cbTabScale * softfloat(i);
             t.cbrt[i] = cvRound(lshift2 * (x < lthresh ? mulAdd(x, lscale, lbias) : cbrt(x)));
         }
     }
     t.yf.resize(256 * 2);
-    for (int i = 0; i < 256; ++i) {
+    for (int i = 0; i < 256; ++i)
+    {
         int y, ify;
-        if (i <= 20) {   // 8 * 255 / 100 == 20.4: the CIE piecewise breakpoint on the 0..255 scale
+        if (i <= 20)
+        { // 8 * 255 / 100 == 20.4: the CIE piecewise breakpoint on the 0..255 scale
             y = cvRound(softfloat(i * kLutBase * 20 * 9) / softfloat(17 * 29 * 29 * 29));
-            ify = cvRound(softfloat((int)kLutBase) *
-                          (softfloat(16) / softfloat(116) + softfloat(i * 5) / softfloat(3 * 17 * 29)));
-        } else {
+            ify = cvRound(softfloat((int)kLutBase) * (softfloat(16) / softfloat(116) +
+                                                      softfloat(i * 5) / softfloat(3 * 17 * 29)));
+        }
+        else
+        {
             const softfloat fy = softfloat(i * 100 * kLutBase) / softfloat(255 * 116) +
                                  softfloat(16 * kLutBase) / softfloat(116);
             ify = cvRound(fy);
@@ -736,15 +1251,19 @@ LabLuvTables buildLabLuvTables() {
         t.yf[i * 2 + 1] = ify;
     }
     t.abxz.resize(kLabBase * 9 / 4);
-    for (int i = kMinAB; i < kLabBase * 9 / 4 + kMinAB; ++i) {
+    for (int i = kMinAB; i < kLabBase * 9 / 4 + kMinAB; ++i)
+    {
         int v;
         // The two branches are f^-1 and t^3, meeting at 6/29 * BASE = 3389.73.
-        if (i <= 3390) v = i * 108 / 841 - kLutBase * 16 / 116 * 108 / 841;
-        else v = i * i / kLutBase * i / kLutBase;
+        if (i <= 3390)
+            v = i * 108 / 841 - kLutBase * 16 / 116 * 108 / 841;
+        else
+            v = i * i / kLutBase * i / kLutBase;
         t.abxz[i - kMinAB] = v;
     }
     t.invgamma.resize(kInvGammaTabSize);
-    for (int i = 0; i < kInvGammaTabSize; ++i) {
+    for (int i = 0; i < kInvGammaTabSize; ++i)
+    {
         static const softfloat invScale = softfloat::one() / softfloat(kInvGammaTabSize);
         t.invgamma[i] = cvRound(softfloat(255) * applyInvGamma(invScale * softfloat(i)));
     }
@@ -761,18 +1280,23 @@ LabLuvTables buildLabLuvTables() {
         static const softfloat vLow(-140), vHigh(122);
         const softfloat uRange = uHigh - uLow, vRange = vHigh - vLow;
         const softfloat oneof4 = softfloat::one() / softfloat(4);
-        for (int LL = 0; LL < 256; ++LL) {
+        for (int LL = 0; LL < 256; ++LL)
+        {
             const softfloat L = softfloat(LL * 100) / softfloat(255);
-            for (int uu = 0; uu < 256; ++uu) {
+            for (int uu = 0; uu < 256; ++uu)
+            {
                 const softfloat u = softfloat(uu) * uRange / softfloat(255) + uLow;
                 const softfloat up = softfloat(9) * (u + L * un);
                 t.lu[LL * 256 + uu] = cvRound(up * softfloat(kLutBase / 1024));
             }
-            for (int vv = 0; vv < 256; ++vv) {
+            for (int vv = 0; vv < 256; ++vv)
+            {
                 const softfloat v = softfloat(vv) * vRange / softfloat(255) + vLow;
                 softfloat vp = oneof4 / (v + L * vn);
-                if (vp > oneof4) vp = oneof4;
-                if (vp < -oneof4) vp = -oneof4;
+                if (vp > oneof4)
+                    vp = oneof4;
+                if (vp < -oneof4)
+                    vp = -oneof4;
                 const int ivp = cvRound(vp * softfloat(kLutBase * 1024));
                 t.lv[LL * 256 + vv] = ivp;
                 // The CPU computes `int vpl = ivp*LL` in int32 and only then widens. Max |ivp*LL|
@@ -806,7 +1330,8 @@ LabLuvTables buildLabLuvTables() {
         // the white point only for Lab (scaleWhite), and the Luv block uses `coeffs`, which is
         // sRGB2XYZ_D65 with R and B swapped (color_lab.cpp).
         softfloat c[9];
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 3; ++i)
+        {
             softfloat s0 = kSRGB2XYZ_D65[i * 3 + 0];
             softfloat s1 = kSRGB2XYZ_D65[i * 3 + 1];
             softfloat s2 = kSRGB2XYZ_D65[i * 3 + 2];
@@ -816,11 +1341,13 @@ LabLuvTables buildLabLuvTables() {
         }
 
         softfloat gammaTab[kLabLutDim];
-        for (int n = 0; n < kLabLutDim; ++n) gammaTab[n] = applyGamma(softfloat(n) / lld);
+        for (int n = 0; n < kLabLutDim; ++n)
+            gammaTab[n] = applyGamma(softfloat(n) / lld);
 
         for (int p = 0; p < kLabLutDim; ++p)
             for (int q = 0; q < kLabLutDim; ++q)
-                for (int r = 0; r < kLabLutDim; ++r) {
+                for (int r = 0; r < kLabLutDim; ++r)
+                {
                     const int idx = p * 3 + q * kLabLutDim * 3 + r * kLabLutDim * kLabLutDim * 3;
                     const softfloat R = gammaTab[p], G = gammaTab[q], B = gammaTab[r];
                     const softfloat X = R * c[0] + G * c[1] + B * c[2];
@@ -829,7 +1356,8 @@ LabLuvTables buildLabLuvTables() {
                     // Luv's L uses the CIE branch on Y directly (not squared, unlike Lab's L).
                     softfloat L = Y < lthresh ? mulAdd(Y, lscale, lbias) : cbrt(Y);
                     L = L * f116 - f16;
-                    const softfloat d = softfloat(4 * 13) / std::max(X + f15 * Y + f3 * Z, softfloat(FLT_EPSILON));
+                    const softfloat d =
+                        softfloat(4 * 13) / std::max(X + f15 * Y + f3 * Z, softfloat(FLT_EPSILON));
                     const softfloat u = L * (X * d - un);
                     const softfloat v = L * (f9of4 * Y * d - vn);
                     prev[idx] = (short)cvRound(lbase * L / f100);
@@ -845,11 +1373,14 @@ LabLuvTables buildLabLuvTables() {
                 for (int r = 0; r < kLabLutDim; ++r)
                     for (int pp = 0; pp < 2; ++pp)
                         for (int qq = 0; qq < 2; ++qq)
-                            for (int rr = 0; rr < 2; ++rr) {
+                            for (int rr = 0; rr < 2; ++rr)
+                            {
                                 const long long idxold =
                                     static_cast<long long>(std::min(p + pp, kLabLutDim - 1)) * 3 +
-                                    static_cast<long long>(std::min(q + qq, kLabLutDim - 1)) * kLabLutDim * 3 +
-                                    static_cast<long long>(std::min(r + rr, kLabLutDim - 1)) * kLabLutDim * kLabLutDim * 3;
+                                    static_cast<long long>(std::min(q + qq, kLabLutDim - 1)) *
+                                        kLabLutDim * 3 +
+                                    static_cast<long long>(std::min(r + rr, kLabLutDim - 1)) *
+                                        kLabLutDim * kLabLutDim * 3;
                                 const long long idxnew =
                                     static_cast<long long>(p) * 3 * 8 +
                                     static_cast<long long>(q) * kLabLutDim * 3 * 8 +
@@ -863,16 +1394,18 @@ LabLuvTables buildLabLuvTables() {
     return t;
 }
 
-}  // namespace
+} // namespace
 
-const LabLuvTables& labluv_tables() {
+const LabLuvTables &labluv_tables()
+{
     // One process-wide build. The CPU builds these once too (initLabTabs' static local), and the
     // values do not depend on the code, the image or the device.
     static const LabLuvTables t = buildLabLuvTables();
     return t;
 }
 
-std::string signature(const Normalized& n) {
+std::string signature(const Normalized &n)
+{
     std::ostringstream o;
     // Order matters: this must be the kernel's own parameter order
     // (_cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, ...)), and the compile
@@ -887,25 +1420,25 @@ std::string signature(const Normalized& n) {
     // so the kernel states it as `ES` and divides by the same constant.
     // The pointer type must follow the element type, not just the "is it 16-bit" question: a 32F
     // buffer read through a *u8 pointer would interpret float storage as byte samples.
-    const char* t = n.u16 ? "u16" : (n.f32 ? "fp32" : "u8");
+    const char *t = n.u16 ? "u16" : (n.f32 ? "fp32" : "u8");
     // uv_rs is the chroma plane base in ELEMENTS from `src`, i.e. H * src_rs (the Y plane's
     // height times the row pitch). It is a runtime argument like the strides, and it is only read
     // by Op::Yuv420; every other op ignores it, so one signature serves all codes.
-    o << "src:*" << t << ", dst:*" << t << ", cols:i32, src_rs:i32, dst_rs:i32, sdiv:*i32, hdiv:*i32"
+    o << "src:*" << t << ", dst:*" << t
+      << ", cols:i32, src_rs:i32, dst_rs:i32, sdiv:*i32, hdiv:*i32"
       << ", uv_rs:i32, rows:i32, t32:*i32, t16:*i16, t64:*i64";
     return o.str();
 }
 
-std::string constexprs_text(const Normalized& n) {
-    const CodeSpec& s = *n.spec;
+std::string constexprs_text(const Normalized &n)
+{
+    const CodeSpec &s = *n.spec;
     std::ostringstream o;
-    o << "BLOCK=" << block_size(n) << ",BLUE=" << s.blue << ",DCN=" << s.dcn
-      << ",GB=" << s.gb
+    o << "BLOCK=" << block_size(n) << ",BLUE=" << s.blue << ",DCN=" << s.dcn << ",GB=" << s.gb
       << ",I0=" << s.perm[0] << ",I1=" << s.perm[1] << ",I2=" << s.perm[2] << ",I3=" << s.perm[3]
       << ",HR=" << s.hrange << ",INV=" << (s.inverse ? 1 : 0) << ",OP=" << static_cast<int>(s.op)
-      << ",SCN=" << s.scn
-      << ",SWG=" << s.swg << ",U16=" << (n.u16 ? 1 : 0) << ",F32=" << (n.f32 ? 1 : 0)
-      << ",F32_CPU_SEPARATE4=" << (n.f32_cpu_separate4 ? 1 : 0)
+      << ",SCN=" << s.scn << ",SWG=" << s.swg << ",U16=" << (n.u16 ? 1 : 0)
+      << ",F32=" << (n.f32 ? 1 : 0) << ",F32_CPU_SEPARATE4=" << (n.f32_cpu_separate4 ? 1 : 0)
       << ",ORD=" << s.ord;
     // The nine coefficients are constexprs for the same reason the channel counts are: they
     // come from the CODE, so C++ computes them exactly and they belong in the key. The kernel
@@ -913,11 +1446,13 @@ std::string constexprs_text(const Normalized& n) {
     // not read them has zeros there anyway (CodeSpec's default), so this costs nothing and keeps
     // one constexpr name set for all codes, which is what the compile helper requires.
     o << ",SRGB=" << (s.srgb ? 1 : 0);
-    for (int i = 0; i < 9; ++i) o << ",E" << i << "=" << s.k[i];
+    for (int i = 0; i < 9; ++i)
+        o << ",E" << i << "=" << s.k[i];
     return o.str();
 }
 
-int block_size(const Normalized& n) {
+int block_size(const Normalized &n)
+{
     // Output pixels per program along the row. A tuning constant: the grid is (rows,
     // ceil(cols/BLOCK)), so this is the only shape the kernel depends on and it stays fixed
     // to keep one binary per (SCN, DCN, OP, ...) rather than one per image size. 256 covers a
@@ -927,12 +1462,14 @@ int block_size(const Normalized& n) {
     return 256;
 }
 
-int num_warps(const Normalized& n) {
+int num_warps(const Normalized &n)
+{
     (void)n;
     return 4;
 }
 
-void grid(const Normalized& n, int block, unsigned out[3]) {
+void grid(const Normalized &n, int block, unsigned out[3])
+{
     // One program per (row, column block). Rows go on x because y is limited to 65535 on
     // every supported SM generation and y would be the unbounded axis for a tall image.
     const long long b = block > 0 ? block : 256;
@@ -941,4 +1478,4 @@ void grid(const Normalized& n, int block, unsigned out[3]) {
     out[2] = 1;
 }
 
-}  // namespace cv_triton_color
+} // namespace cv_triton_color

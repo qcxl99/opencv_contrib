@@ -1,15 +1,19 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
-
 #ifndef OPENCV_TRITON_VALIDATION_CVTCOLOR_CASES_HPP
 #define OPENCV_TRITON_VALIDATION_CVTCOLOR_CASES_HPP
 #include "opencv2/imgproc.hpp"
-namespace opencv_test { namespace triton_test { namespace cvt_cases {
+namespace opencv_test
+{
+namespace triton_test
+{
+namespace cvt_cases
+{
 struct CvtCase
 {
     int code;
-    const char* name;
+    const char *name;
     int scn, dcn;
     // CPU conversions preserve depth. Additional 16U and 32F combinations are
     // listed in their respective tables below.
@@ -186,14 +190,26 @@ const CvtCase kCases32F[] = {
 
 // Device/perf fixtures use this table as their shape/depth owner. A missing row
 // must fail fixture setup rather than guessing a channel count or video layout.
-inline const CvtCase* find(int code, int depth)
+inline const CvtCase *find(int code, int depth)
 {
     if (depth == CV_8U)
-        for (const auto& row : kCases) { if (row.code == code) return &row; }
+        for (const auto &row : kCases)
+        {
+            if (row.code == code)
+                return &row;
+        }
     if (depth == CV_16U)
-        for (const auto& row : kCases16U) { if (row.code == code) return &row; }
+        for (const auto &row : kCases16U)
+        {
+            if (row.code == code)
+                return &row;
+        }
     if (depth == CV_32F)
-        for (const auto& row : kCases32F) { if (row.code == code) return &row; }
+        for (const auto &row : kCases32F)
+        {
+            if (row.code == code)
+                return &row;
+        }
     return nullptr;
 }
 
@@ -203,9 +219,11 @@ inline bool floatArithmetic(int code)
            code == cv::COLOR_BGRA2GRAY || code == cv::COLOR_RGBA2GRAY ||
            code == cv::COLOR_BGR2YCrCb || code == cv::COLOR_RGB2YCrCb ||
            code == cv::COLOR_YCrCb2BGR || code == cv::COLOR_YCrCb2RGB ||
-           code == cv::COLOR_BGR2YUV || code == cv::COLOR_RGB2YUV ||
-           code == cv::COLOR_YUV2BGR || code == cv::COLOR_YUV2RGB;
+           code == cv::COLOR_BGR2YUV || code == cv::COLOR_RGB2YUV || code == cv::COLOR_YUV2BGR ||
+           code == cv::COLOR_YUV2RGB;
 }
 
-}}}
+}
+}
+}
 #endif

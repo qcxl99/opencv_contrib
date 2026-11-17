@@ -2,11 +2,13 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
+// Standalone CPU controls and test support do not use library-private headers.
+#ifdef __OPENCV_BUILD
+#include "../precomp.hpp"
+#endif
 #include "warpaffine.hpp"
-
 #include "opencv2/core/utility.hpp"   // cv::useOptimized
 #include "opencv2/imgproc.hpp"        // cv::INTER_AREA (the CPU rewrite this follows)
-
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -14,20 +16,23 @@
 #include <mutex>
 #include <tuple>
 #include <limits>
-
-namespace cv_triton_warp {
+namespace cv_triton_warp
+{
 
 using cv_triton_runtime::Reason;
 using cv_triton_runtime::Status;
 
-namespace {
-Status prepared() {
+namespace
+{
+Status prepared()
+{
     Status s;
     s.code = cv_triton_runtime::Code::Prepared;
     return s;
 }
 
-Status unsupported(Reason r, std::string msg) {
+Status unsupported(Reason r, std::string msg)
+{
     Status s;
     s.code = cv_triton_runtime::Code::Unsupported;
     s.reason = r;
@@ -46,7 +51,8 @@ bool reference_fused(int depth, int channels)
     const auto key = std::make_tuple(depth, channels, cv::useOptimized());
     std::lock_guard<std::mutex> lock(mutex);
     const auto found = cache.find(key);
-    if (found != cache.end()) return found->second;
+    if (found != cache.end())
+        return found->second;
 
     cv::Mat ids(37, 53, CV_MAKETYPE(CV_16U, channels));
     for (int y = 0; y < ids.rows; ++y)
@@ -59,20 +65,21 @@ bool reference_fused(int depth, int channels)
     if (depth == CV_8U)
         for (int y = 0; y < source.rows; ++y)
             for (int x = 0; x < source.cols * channels; ++x)
-                source.ptr<unsigned char>(y)[x] = static_cast<unsigned char>(ids.ptr<unsigned short>(y)[x] % 251 + 1);
+                source.ptr<unsigned char>(y)[x] =
+                    static_cast<unsigned char>(ids.ptr<unsigned short>(y)[x] % 251 + 1);
 
     // Fixed probes are independent of the user's matrix, seed or expected image.
-    const double probes[][6] = {{1, 1.9, -20, .4, 1, -10},
-                                {.9, .43589, -14, -.43589, .9, 10}};
+    const double probes[][6] = {{1, 1.9, -20, .4, 1, -10}, {.9, .43589, -14, -.43589, .9, 10}};
     bool matches[2] = {true, true};
-    for (const auto& matrix : probes)
+    for (const auto &matrix : probes)
     {
         double sampling[6];
         invert(matrix, sampling);
         float a[6];
-        for (int i = 0; i < 6; ++i) a[i] = static_cast<float>(sampling[i]);
+        for (int i = 0; i < 6; ++i)
+            a[i] = static_cast<float>(sampling[i]);
         cv::Mat reference;
-        cv::warpAffine(source, reference, cv::Mat(2, 3, CV_64F, const_cast<double*>(matrix)),
+        cv::warpAffine(source, reference, cv::Mat(2, 3, CV_64F, const_cast<double *>(matrix)),
                        cv::Size(256, 37), cv::INTER_NEAREST, cv::BORDER_CONSTANT);
         cv::Mat src64, ref64;
         source.convertTo(src64, CV_MAKETYPE(CV_64F, channels));
@@ -92,7 +99,8 @@ bool reference_fused(int depth, int channels)
                     for (int c = 0; c < channels; ++c)
                     {
                         const double predicted = ix >= 0 && ix < 53 && iy >= 0 && iy < 37
-                            ? src64.ptr<double>(iy)[ix * channels + c] : 0;
+                                                     ? src64.ptr<double>(iy)[ix * channels + c]
+                                                     : 0;
                         if (predicted != ref64.ptr<double>(y)[x * channels + c])
                             matches[fused] = false;
                     }
@@ -111,7 +119,7 @@ bool is_border(int b)
     // CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT. TRANSPARENT preserves outside
     // nearest samples; LINEAR/AREA use the old destination for each outside tap.
 }
-}  // namespace
+} // namespace
 
 void invert(const double M[6], double out[6])
 {
@@ -127,13 +135,15 @@ void invert(const double M[6], double out[6])
 }
 
 // Matrix rules shared by pre-allocation admission and the final planner.
-static Status sampling_matrix(const Request& req, double out[6])
+static Status sampling_matrix(const Request &req, double out[6])
 {
     for (int i = 0; i < 6; ++i)
         if (!std::isfinite(req.M[i]))
             return unsupported(Reason::IndexRange, "matrix entries must be finite");
-    if (req.inverse_map) std::copy(req.M, req.M + 6, out);
-    else invert(req.M, out);
+    if (req.inverse_map)
+        std::copy(req.M, req.M + 6, out);
+    else
+        invert(req.M, out);
     for (int i = 0; i < 6; ++i)
         if (!std::isfinite(out[i]) ||
             std::abs(out[i]) > static_cast<double>(std::numeric_limits<float>::max()))
@@ -141,9 +151,9 @@ static Status sampling_matrix(const Request& req, double out[6])
     return prepared();
 }
 
-Status validate_source(const Request& req)
+Status validate_source(const Request &req)
 {
-    const cv_triton_runtime::DeviceView& s = req.src;
+    const cv_triton_runtime::DeviceView &s = req.src;
 
     // OpenCV's warpAffine rewrites AREA to LINEAR before selecting its kernel.
     const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
@@ -159,70 +169,85 @@ Status validate_source(const Request& req)
     // every supported dtype/channel, ROI guards and inside/partial/outside geometries.
     // CUBIC + TRANSPARENT remains outside the implemented subset.
     if (req.border_mode == cv::BORDER_TRANSPARENT && req.interpolation == cv::INTER_CUBIC)
-        return unsupported(Reason::Interpolation,
-                           "cv::triton::warpAffine: BORDER_TRANSPARENT with INTER_CUBIC is not "
-                           "served; TRANSPARENT works with INTER_NEAREST, INTER_LINEAR and INTER_AREA");
+        return unsupported(
+            Reason::Interpolation,
+            "cv::triton::warpAffine: BORDER_TRANSPARENT with INTER_CUBIC is not "
+            "served; TRANSPARENT works with INTER_NEAREST, INTER_LINEAR and INTER_AREA");
     if (!is_border(req.border_mode))
-        return unsupported(Reason::Interpolation,
-                           "cv::triton::warpAffine: border mode " + std::to_string(req.border_mode) +
-                               " is not one of CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT");
+        return unsupported(
+            Reason::Interpolation,
+            "cv::triton::warpAffine: border mode " + std::to_string(req.border_mode) +
+                " is not one of CONSTANT/REPLICATE/REFLECT/WRAP/REFLECT_101/TRANSPARENT");
     if (s.type != cv_triton_runtime::ElemType::U8 && s.type != cv_triton_runtime::ElemType::U16 &&
         s.type != cv_triton_runtime::ElemType::F32)
         return unsupported(Reason::DepthOrChannels,
                            "cv::triton::warpAffine: CV_8U, CV_16U and CV_32F only");
     if (s.channels != 1 && s.channels != 3 && s.channels != 4)
         return unsupported(Reason::DepthOrChannels, "channels must be 1, 3 or 4");
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i)
+    {
         if (!std::isfinite(req.border[i]))
             return unsupported(Reason::IndexRange, "border components must be finite");
         if (s.type == cv_triton_runtime::ElemType::F32 &&
             std::abs(req.border[i]) > std::numeric_limits<float>::max())
-            return unsupported(Reason::IndexRange, "float32 border components exceed finite float32 range");
+            return unsupported(Reason::IndexRange,
+                               "float32 border components exceed finite float32 range");
     }
     double matrix[6];
     return sampling_matrix(req, matrix);
 }
 
-Status validate_output(const Request& req, int dst_h, int dst_w)
+Status validate_output(const Request &req, int dst_h, int dst_w)
 {
     const Status admitted = validate_source(req);
-    if (!admitted.ok()) return admitted;
+    if (!admitted.ok())
+        return admitted;
     const Status output = cv_triton_runtime::validate_output_shape(dst_h, dst_w, req.src.channels);
-    if (!output.ok()) return output;
+    if (!output.ok())
+        return output;
     double matrix[6];
     const Status prepared_matrix = sampling_matrix(req, matrix);
-    if (!prepared_matrix.ok()) return prepared_matrix;
+    if (!prepared_matrix.ok())
+        return prepared_matrix;
     // Bound each float multiply/add term before calibration or allocation.
     // The conservative absolute-term bound covers both fused/split forms;
     // CUBIC clamps before integer conversion, other modes need an int32 margin.
     const double rounding = 1.0 + 8.0 * std::numeric_limits<float>::epsilon();
-    for (int row = 0; row < 2; ++row) {
+    for (int row = 0; row < 2; ++row)
+    {
         const int i = row * 3;
         const double bound = std::abs(matrix[i]) * (dst_w - 1) +
                              std::abs(matrix[i + 1]) * (dst_h - 1) + std::abs(matrix[i + 2]);
         if (!std::isfinite(bound) || bound > std::numeric_limits<float>::max() / rounding)
-            return unsupported(Reason::IndexRange, "sampling coordinate expression exceeds finite float32 range");
+            return unsupported(Reason::IndexRange,
+                               "sampling coordinate expression exceeds finite float32 range");
         if (req.interpolation != cv::INTER_CUBIC && bound > 2147483392.0 / rounding)
             return unsupported(Reason::IndexRange, "sampling coordinates exceed safe int32 range");
     }
     return prepared();
 }
 
-Status normalize(const Request& req, Normalized& out)
+Status normalize(const Request &req, Normalized &out)
 {
     const cv_triton_runtime::DeviceView &s = req.src, &d = req.dst;
     const Status admitted = validate_output(req, d.rows, d.cols);
-    if (!admitted.ok()) return admitted;
+    if (!admitted.ok())
+        return admitted;
     const int interp = req.interpolation == cv::INTER_AREA ? cv::INTER_LINEAR : req.interpolation;
     if (s.type != d.type || s.channels != d.channels)
-        return unsupported(Reason::TypeMismatch, "src and dst must have the same depth and channel count");
-    if (!(s.ctx == d.ctx)) return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
+        return unsupported(Reason::TypeMismatch,
+                           "src and dst must have the same depth and channel count");
+    if (!(s.ctx == d.ctx))
+        return unsupported(Reason::ContextMismatch, "src and dst belong to different contexts");
     Status valid = cv_triton_runtime::validate_view(s, "src");
-    if (!valid.ok()) return valid;
+    if (!valid.ok())
+        return valid;
     valid = cv_triton_runtime::validate_view(d, "dst");
-    if (!valid.ok()) return valid;
+    if (!valid.ok())
+        return valid;
     if (cv_triton_runtime::views_overlap(s, d))
-        return unsupported(Reason::InPlaceOrOverlap, "src and dst overlap (in-place is not supported)");
+        return unsupported(Reason::InPlaceOrOverlap,
+                           "src and dst overlap (in-place is not supported)");
 
     out.mode = interp == 0 ? Mode::Nearest : (interp == 1 ? Mode::Linear : Mode::Cubic);
     out.u8 = s.type == cv_triton_runtime::ElemType::U8;
@@ -233,20 +258,27 @@ Status normalize(const Request& req, Normalized& out)
     out.dst_w = d.cols;
     out.channels = s.channels;
     const Status matrix = sampling_matrix(req, out.A);
-    if (!matrix.ok()) return matrix;
+    if (!matrix.ok())
+        return matrix;
 
     out.border_mode_code = req.border_mode;
     out.border_x = req.border_mode;
     out.border_y = req.border_mode;
     // A degenerate transparent axis must still detect missing taps and preserve
     // their old destination contribution; it cannot become a replicate axis.
-    if (req.border_mode != cv::BORDER_CONSTANT && req.border_mode != cv::BORDER_TRANSPARENT) {
-        if (out.src_w <= 1) out.border_x = 1;
-        if (out.src_h <= 1) out.border_y = 1;
+    if (req.border_mode != cv::BORDER_CONSTANT && req.border_mode != cv::BORDER_TRANSPARENT)
+    {
+        if (out.src_w <= 1)
+            out.border_x = 1;
+        if (out.src_h <= 1)
+            out.border_y = 1;
     }
-    for (int i = 0; i < 4; ++i) {
-        out.border[i] = (out.u8 || out.u16) ?
-            std::max(0.0,std::min(out.u8 ? 255.0 : 65535.0,std::nearbyint(req.border[i]))) : req.border[i];
+    for (int i = 0; i < 4; ++i)
+    {
+        out.border[i] =
+            (out.u8 || out.u16)
+                ? std::max(0.0, std::min(out.u8 ? 255.0 : 65535.0, std::nearbyint(req.border[i])))
+                : req.border[i];
     }
 
     // One tile of output pixels per program. The runtime may select a
@@ -260,7 +292,7 @@ Status normalize(const Request& req, Normalized& out)
     return prepared();
 }
 
-std::string signature(const Normalized& n)
+std::string signature(const Normalized &n)
 {
     // Must match the kernel's own parameter order:
     //   (src, dst, M00..M12, src_h, src_w, dst_h, dst_w, <constexprs>)
@@ -274,7 +306,7 @@ std::string signature(const Normalized& n)
     // does.
     // The pointer types are concrete per dtype ("*u8" / "*fp32"), not a placeholder: the
     // compile helper maps each token to a Triton type and has no generic form.
-    const char* t = n.u8 ? "u8" : (n.u16 ? "u16" : "fp32");
+    const char *t = n.u8 ? "u8" : (n.u16 ? "u16" : "fp32");
     std::ostringstream o;
     o << "src:*" << t << ", dst:*" << t
       << ", M00:fp32, M01:fp32, M02:fp32, M10:fp32, M11:fp32, M12:fp32, "
@@ -283,12 +315,11 @@ std::string signature(const Normalized& n)
     return o.str();
 }
 
-std::string constexprs_text(const Normalized& n)
+std::string constexprs_text(const Normalized &n)
 {
     std::ostringstream o;
     o << "BLOCK_H=" << n.block_h << ",BLOCK_W=" << n.block_w << ",BORDER=" << n.border_mode_code
-      << ",BORDER_X=" << n.border_x
-      << ",BORDER_Y=" << n.border_y << ",FUSED=" << (n.fused ? 1 : 0)
+      << ",BORDER_X=" << n.border_x << ",BORDER_Y=" << n.border_y << ",FUSED=" << (n.fused ? 1 : 0)
       << ",TRANSPARENT=" << (n.border_mode_code == cv::BORDER_TRANSPARENT ? 1 : 0);
     // U8/U16 exist only on the kernels that convert their loads (LINEAR, CUBIC); the NEAREST
     // kernel copies the element unchanged, so its dtype is carried by the pointer type alone
@@ -299,7 +330,7 @@ std::string constexprs_text(const Normalized& n)
     return o.str();
 }
 
-void grid(const Normalized& n, unsigned out[3])
+void grid(const Normalized &n, unsigned out[3])
 {
     const int bh = n.block_h > 0 ? n.block_h : 1;
     const int bw = n.block_w > 0 ? n.block_w : 128;
@@ -308,4 +339,4 @@ void grid(const Normalized& n, unsigned out[3])
     out[2] = 1;
 }
 
-}  // namespace cv_triton_warp
+} // namespace cv_triton_warp
