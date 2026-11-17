@@ -2,8 +2,8 @@ Triton resize {#tutorial_triton_resize}
 =============
 
 [API reference][triton-api].
-[CUDA first use][cuda-first-use].
-[HIP first use][hip-first-use].
+[CUDA setup][cuda-setup].
+[HIP setup][hip-setup].
 
 Supported inputs
 ----------------
@@ -80,15 +80,15 @@ cv::triton::releaseGraphResources().
 @cond
 -->
 [triton-api]: ../include/opencv2/triton.hpp
-[cuda-first-use]: ../tutorials/cuda-first-use.markdown
-[hip-first-use]: ../tutorials/hip-first-use.markdown
+[cuda-setup]: ../tutorials/cuda_setup.markdown
+[hip-setup]: ../tutorials/hip_setup.markdown
 [runtime-toolchain]: maintenance.markdown#runtime-toolchain
 [runtime-architecture]: maintenance.markdown#architecture
 <!--
 @endcond
 [triton-api]: @ref triton
-[cuda-first-use]: @ref tutorial_triton_cuda_first_use
-[hip-first-use]: @ref tutorial_triton_hip_first_use
+[cuda-setup]: @ref tutorial_triton_cuda_first_use
+[hip-setup]: @ref tutorial_triton_hip_first_use
 [runtime-toolchain]: @ref triton_runtime_toolchain
 [runtime-architecture]: @ref triton_architecture
 @cond

@@ -1,5 +1,5 @@
-HIP build and first use {#tutorial_triton_hip_first_use}
-=======================
+Building and using the HIP backend {#tutorial_triton_hip_first_use}
+==================================
 
 Build the HIP backend and call the C++ `DeviceImage` overloads. The caller owns
 storage and passes a native stream. Python provides backend queries and explicit

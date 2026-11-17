@@ -141,8 +141,8 @@ enabled. Nothing is compiled by Triton during the OpenCV build. On first use,
 `tools/compile_helper.py` runs in a separate Python process using the configured
 Triton 3.6.0 compiler. The C++ execution path does not embed an interpreter.
 Build commands and toolkit examples are maintained in
-[CUDA first use][cuda-first-use] and
-[HIP first use][hip-first-use].
+[CUDA setup][cuda-setup] and
+[HIP setup][hip-setup].
 
 The compile key includes source identity, kernel signature, compile-time
 parameters, launch options, target and compiler version. The runtime checks
@@ -305,14 +305,14 @@ completion/teardown, and do not silently rerun the request elsewhere.
 <!--
 @cond
 -->
-[cuda-first-use]: ../tutorials/cuda-first-use.markdown
-[hip-first-use]: ../tutorials/hip-first-use.markdown
+[cuda-setup]: ../tutorials/cuda_setup.markdown
+[hip-setup]: ../tutorials/hip_setup.markdown
 [colour-numerics]: cvtcolor.markdown#numerical-behavior
 [warp-numerics]: warpaffine.markdown#cpu-reference-and-accuracy
 <!--
 @endcond
-[cuda-first-use]: @ref tutorial_triton_cuda_first_use
-[hip-first-use]: @ref tutorial_triton_hip_first_use
+[cuda-setup]: @ref tutorial_triton_cuda_first_use
+[hip-setup]: @ref tutorial_triton_hip_first_use
 [colour-numerics]: @ref colour-numerics
 [warp-numerics]: @ref warp-numerics
 @cond

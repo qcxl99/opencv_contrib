@@ -91,8 +91,8 @@ Enabled CUDA and HIP
 
 Use separate build/install directories, standard `BUILD_TESTS`,
 `BUILD_PERF_TESTS`, `BUILD_EXAMPLES`, and the corresponding backend toolkit.
-Use [CUDA first use][cuda-first-use] for CUDA build/install commands and
-[HIP first use][hip-first-use] for HIP, including DTK/ROCm differences.
+Use [CUDA setup][cuda-setup] for CUDA build/install commands and
+[HIP setup][hip-setup] for HIP, including DTK/ROCm differences.
 Results from one machine or architecture do not validate another. Include
 `python3,python_bindings_generator,ts` in BUILD_LIST when validating wrappers
 and tests; select compatible Python development headers/library and NumPy.
@@ -143,13 +143,13 @@ operation and backend it exercised.
 <!--
 @cond
 -->
-[cuda-first-use]: ../tutorials/cuda-first-use.markdown
-[hip-first-use]: ../tutorials/hip-first-use.markdown
+[cuda-setup]: ../tutorials/cuda_setup.markdown
+[hip-setup]: ../tutorials/hip_setup.markdown
 [runtime-toolchain]: maintenance.markdown#runtime-toolchain
 <!--
 @endcond
-[cuda-first-use]: @ref tutorial_triton_cuda_first_use
-[hip-first-use]: @ref tutorial_triton_hip_first_use
+[cuda-setup]: @ref tutorial_triton_cuda_first_use
+[hip-setup]: @ref tutorial_triton_hip_first_use
 [runtime-toolchain]: @ref triton_runtime_toolchain
 @cond
 -->

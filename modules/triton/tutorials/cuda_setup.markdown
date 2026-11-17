@@ -1,5 +1,5 @@
-CUDA build and first use {#tutorial_triton_cuda_first_use}
-========================
+Building and using the CUDA backend {#tutorial_triton_cuda_first_use}
+===================================
 
 Build the CUDA backend, run the public GpuMat entries and check the installation.
 Choose a CUDA toolkit, driver and Triton compiler that support the actual device.

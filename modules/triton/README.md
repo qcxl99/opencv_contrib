@@ -26,8 +26,8 @@ print(result.shape)  # (48, 64, 3)
 Keep `src` and `dst` alive until the stream completes. This CUDA example needs
 OpenCV built with this module; ordinary `cv.resize` calls keep their existing behavior.
 
-To build and install, follow [CUDA first use](tutorials/cuda-first-use.markdown)
-or [HIP first use](tutorials/hip-first-use.markdown). Enable
+To build and install, follow [CUDA setup](tutorials/cuda_setup.markdown)
+or [HIP setup](tutorials/hip_setup.markdown). Enable
 `BUILD_opencv_triton=ON` and select the intended backend. Those guides own the
 complete dependency, CMake and installation commands. A first-call walkthrough
 assumes the environment is ready; a source build takes additional time.
@@ -76,7 +76,7 @@ device-buffer wrapper is provided.
 
 | Reader task | Start here |
 |---|---|
-| Build, install and run | [CUDA tutorial](tutorials/cuda-first-use.markdown), [HIP tutorial](tutorials/hip-first-use.markdown) |
+| Build, install and run | [CUDA tutorial](tutorials/cuda_setup.markdown), [HIP tutorial](tutorials/hip_setup.markdown) |
 | Select options and compare numbers | [resize](doc/resize.markdown), [cvtColor](doc/cvtcolor.markdown), [warpAffine](doc/warpaffine.markdown) |
 | Use C++ signatures | [GpuMat API](include/opencv2/triton.hpp), [DeviceImage API](include/opencv2/triton/device.hpp) |
 | Understand source, JIT/cache and resource lifetime | [maintenance guide](doc/maintenance.markdown) |
