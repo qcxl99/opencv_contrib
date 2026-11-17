@@ -1,9 +1,9 @@
 Triton resize {#tutorial_triton_resize}
 =============
 
-@see @ref triton "Triton API reference".
-@see @ref tutorial_triton_cuda_first_use "CUDA build and first use".
-@see @ref tutorial_triton_hip_first_use "HIP / DTK and ROCm build and first use".
+[API reference][triton-api].
+[CUDA first use][cuda-first-use].
+[HIP first use][hip-first-use].
 
 Supported inputs
 ----------------
@@ -26,6 +26,11 @@ channel counts are unsupported. There is no CPU or `cv::cuda` fallback.
 
 Numerical behavior
 ------------------
+
+CPU compatibility gives callers a stated result when moving an existing CPU
+image-processing step to GPU. GPU libraries can use different coordinates and
+rounding rules, so the module names a specific reference rather than treating
+all implementations as interchangeable.
 
 The reference is the generic OpenCV 5.0.0 CPU resize algorithm with 128-bit SIMD,
 without FMA, IPP or HAL substitutions. `CV_8U` output is bit-exact against this
@@ -65,7 +70,27 @@ form requires explicit `dsize`.
 Runtime and deployment
 ----------------------
 
-See @ref triton_runtime_toolchain for compiler interpreters, launch ABI, cache
+See [runtime compilation and cache][runtime-toolchain] for compiler interpreters, launch ABI, cache
 keys, persisted artifacts and resource relocation. For graph capture and
-asynchronous resource ownership, see @ref triton_architecture and
+asynchronous resource ownership, see [architecture and ownership][runtime-architecture] and
 cv::triton::releaseGraphResources().
+
+<!-- Link targets: GitHub source paths; Doxygen page labels in the hidden block. -->
+<!--
+@cond
+-->
+[triton-api]: ../include/opencv2/triton.hpp
+[cuda-first-use]: ../tutorials/cuda-first-use.markdown
+[hip-first-use]: ../tutorials/hip-first-use.markdown
+[runtime-toolchain]: maintenance.markdown#runtime-toolchain
+[runtime-architecture]: maintenance.markdown#architecture
+<!--
+@endcond
+[triton-api]: @ref triton
+[cuda-first-use]: @ref tutorial_triton_cuda_first_use
+[hip-first-use]: @ref tutorial_triton_hip_first_use
+[runtime-toolchain]: @ref triton_runtime_toolchain
+[runtime-architecture]: @ref triton_architecture
+@cond
+-->
+<!-- @endcond -->

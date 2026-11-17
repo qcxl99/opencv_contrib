@@ -133,6 +133,8 @@ def entry_valid(d: str, text: str, digest: str) -> tuple[bool, str]:
 
 
 def ptx_params(ptx: str) -> tuple[str, list[str]]:
+    # Inspect compiled ABI order, including compiler-added parameters; do not infer it
+    # from the source signature. The C++ loader independently checks this manifest.
     m = re.search(r"\.entry\s+(\w+)\s*\((.*?)\)", ptx, re.S)
     if not m:
         raise HelperError("abi_mismatch", "no .entry in the PTX")
@@ -352,6 +354,8 @@ def serve(raw: bytes) -> dict:
     final = os.path.join(cache, digest)
     lock = os.open(os.path.join(cache, f"{digest}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
     try:
+        # One publisher per key. Readers accept only a complete manifest/binary pair;
+        # syncing the temporary directory before rename avoids publishing partial files.
         fcntl.flock(lock, fcntl.LOCK_EX)
         fault("after_lock")
         for stale in glob.glob(os.path.join(cache, f".tmp-{digest}-*")):   # left by a killed helper

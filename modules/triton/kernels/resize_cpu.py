@@ -2,7 +2,10 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# Resize kernels for runtime compilation.
+# GPU resize kernels reproducing the selected OpenCV CPU sampling and rounding.
+# The cpu prefix describes numerical behavior; every kernel here runs on the GPU.
+# src/dst_rs and src/dst_bs are row/batch strides in typed elements, not bytes.
+# xofs/yofs hold source pixel/row indices; ax/by/byf hold interpolation weights.
 
 import triton
 import triton.language as tl
@@ -36,6 +39,8 @@ def _cpu_tile(dst_h, W, cn: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.con
 def _resize_cpu_nearest_kernel(src, dst, xofs, yofs, dst_h, W, cn: tl.constexpr,
                         src_rs, dst_rs, src_bs, dst_bs,
                         BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    # e indexes destination channel values; px indexes pixels and m masks the row tail.
+    # W = output width * cn. so includes the channel, while sb/db select the batch.
     e = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
     m = e < W
     px = e // cn
@@ -61,6 +66,7 @@ def _cpu_hlin(rp, o0, o1, a0, a1, inside, m, U8: tl.constexpr):
     inside selects the two-tap region; beyond it the clamped value is copied.
     U8 retains coefficients scaled by 2048; float operations round separately.
     """
+    # rp is a source row pointer; o0/o1 are element offsets and a0/a1 are tap weights.
     v0 = tl.load(rp + o0, mask=m, other=0)
     v1 = tl.load(rp + o1, mask=m, other=0)
     if U8:
@@ -80,6 +86,7 @@ def _cpu_hcub(rp, c0, c1, c2, c3, a0, a1, a2, a3, m, U8: tl.constexpr):
     U8 keeps the integer coefficient scale for the vertical pass; float sums
     round separately in the CPU order ((t0 + t1) + t2) + t3.
     """
+    # c0..c3 are clamped element offsets; a0..a3 are the corresponding tap weights.
     v0 = tl.load(rp + c0, mask=m, other=0)
     v1 = tl.load(rp + c1, mask=m, other=0)
     v2 = tl.load(rp + c2, mask=m, other=0)
@@ -113,6 +120,9 @@ def _resize_cpu_sep_kernel(src, dst, xofs, ax, yofs, by, byf,
                     BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
     """Generic separable path: LINEAR / AREA-upscale emulation (KSIZE=2), CUBIC (KSIZE=4).
     Row-sliding: see the comment above _resize_cpu_nearest_kernel."""
+    # xofs/yofs are source base indices; CUBIC starts one pixel/row before the base.
+    # ax/by carry fixed-point weights for U8; byf carries floating vertical weights.
+    # r0 is the first destination row of this tile.
     e = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
     m = e < W
     pm = m

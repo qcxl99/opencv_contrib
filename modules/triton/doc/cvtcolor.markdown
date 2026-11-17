@@ -40,41 +40,59 @@ from `opencv2/triton/device.hpp`, with preallocated output and a native stream
 handle. The complete allocation/upload/download example is
 `samples/hip/device.cpp` (`example_triton_device cvtcolor`).
 
+<a id="numerical-behavior"></a>
+<a id="colour-numerics"></a>
 Numerical behavior
 ------------------
 
-Integer conversions and float channel copies compare exactly against the
-linked OpenCV CPU implementation. Finite float gray/YUV/YCrCb arithmetic uses
-`8 * 2^-24 * max(1, abs(ref), input_scale)` as the absolute error bound for
-each output element. Here, `input_scale` is the largest absolute input-channel
-value at the corresponding pixel. Another pixel's magnitude does not increase
-the allowance. IPP or custom HAL substitutions can change CPU results.
+The module compares colour conversions with the linked OpenCV CPU implementation
+so users have an explicit compatibility target for existing CPU pipelines.
+CPU dispatch, IPP or a custom HAL can change the reference arithmetic.
+Integer conversions and float channel copies require exact numerical equality;
+this is distinct from the tolerance used for floating-point colour arithmetic.
 
-When the linked CPU implementation rounds multiplication and addition separately
-and processes groups of four values, the runtime selects matching GPU arithmetic.
-The accuracy suite then requires absolute error at most `1e-4` as well as the
-scaled bound. Identification executes
-small directed fixtures against the actual linked `cv::cvtColor`; it never sends
-user images to CPU or substitutes probe output for user output. The process-local
-cache distinguishes optimization, IPP/exactness and floating rounding controls;
-unstable probes or non-default rounding do not identify a profile. Explicit
-rounded GPU operations and per-row vector-body/scalar-tail grouping preserve
-this expression instead of relying on compiler FMA contraction settings.
+For finite float gray/YUV/YCrCb calculations, the test allows a small rounding
+error **per output element**, scaled by that pixel's input and reference values:
 
-Directed accuracy fixtures include unit/255 scale and adjacent signed values
-through `2*65535`, short rows, vector-boundary widths and pitched ROIs.
-They do not establish a universal bound for overflow, subnormals, other HALs
-or changed arithmetic environments. An unidentified profile uses the fused path
-and the scaled bound without the additional absolute cap. Copy paths remain exact.
+`abs(got - ref) <= 8 * 2^-24 * max(1, abs(ref), input_scale)`.
 
+Here `got` and `ref` are one GPU and CPU output component, and `input_scale` is
+the largest absolute input component at the same pixel. All values use the
+conversion's channel units; the bound is an absolute channel-value difference,
+not a percentage or a whole-image maximum. With values bounded by 1, the bound
+is about `9.54e-7`. A distant bright pixel does not enlarge it. This accounts for
+float32 operation grouping; it is not a universal error proof for overflow,
+subnormals or arbitrary arithmetic environments.
+
+A CPU arithmetic **profile** records an identified evaluation pattern. Fixed
+probes of `cv::cvtColor` check whether multiplication/addition round separately
+and rows use groups of four values followed by scalar tails. When that pattern
+is identified, the GPU follows it and the accuracy test also imposes an absolute
+`1e-4` ceiling: **both** bounds must hold. See
+`float_cpu_separate4` in `src/runtime/cvtcolor.cpp` and
+`meetsCvtContract` in `validation/reference.hpp`.
+
+If identification fails, controls change during probing, or rounding is not the
+supported default, `float_cpu_separate4()` returns false. The GPU then uses its
+fused multiply-add path; tests apply the scaled bound without the extra `1e-4`
+cap. “Unidentified” does not mean the CPU was proved to use FMA, or that exact
+agreement with that build was established. The process-local result is keyed
+by optimization, IPP/exactness and rounding controls. These bounded probes do
+not compute user images on CPU. Copy paths retain exact comparison.
+
+Directed fixtures include unit/255 scales and mixed signed values through
+`2*65535`, short rows, vector-boundary widths and pitched ROIs. Their results
+apply to the tested build and inputs.
+
+Bindings, streams and checks
+----------------------------
 
 CUDA provides GpuMat Python bindings. The HIP `DeviceImage` overload is C++ only.
 All three Python GpuMat adapters (resize, cvtColor and warpAffine) return
 catchable `StsNotImplemented` on HIP, including default/`None` streams.
 
-Calls are asynchronous. Callers retain their images and order producers and
-consumers. The runtime keeps compiled modules and HSV/Lab/Luv tables alive
-until submitted work finishes.
+Callers retain images and order producers and consumers; the runtime retains
+its modules and lookup tables. See [resource lifetime][resource-cleanup].
 
 Warm operations support graph capture. After all graphs using these resources
 are destroyed or will never be replayed again, call
@@ -89,11 +107,14 @@ compilation and allocation are excluded. Public-call wall time includes host
 submission and synchronization; it is not isolated kernel or graph time.
 
 
+<a id="conversion-codes"></a>
 Supported conversion codes
 --------------------------
 
 Each row names one numeric code. OpenCV enum aliases with the same value are
 also accepted; aliases do not add conversions. Depth support is specific to each row.
+
+### Channel order and grayscale
 
 | Conversion code | Source → output channels | Depths |
 |---|---|---|
@@ -109,6 +130,11 @@ also accepted; aliases do not add conversions. Depth support is specific to each
 | `COLOR_RGB2GRAY` | 3 → 1 | 8U, 16U, 32F |
 | `COLOR_BGRA2GRAY` | 4 → 1 | 8U, 16U, 32F |
 | `COLOR_RGBA2GRAY` | 4 → 1 | 8U, 16U, 32F |
+
+### Video decode and luma extraction
+
+| Conversion code | Source → output channels | Depths |
+|---|---|---|
 | `COLOR_YUV2GRAY_UYVY` | 2 → 1 | 8U |
 | `COLOR_YUV2GRAY_YUY2` | 2 → 1 | 8U |
 | `COLOR_YUV2BGR_NV12` | 1 → 3 | 8U |
@@ -119,24 +145,39 @@ also accepted; aliases do not add conversions. Depth support is specific to each
 | `COLOR_YUV2RGB_NV21` | 1 → 3 | 8U |
 | `COLOR_YUV2BGRA_NV21` | 1 → 4 | 8U |
 | `COLOR_YUV2RGBA_NV21` | 1 → 4 | 8U |
-| `COLOR_BGR2YCrCb` | 3 → 3 | 8U, 16U, 32F |
-| `COLOR_RGB2YCrCb` | 3 → 3 | 8U, 16U, 32F |
-| `COLOR_YCrCb2BGR` | 3 → 3 | 8U, 16U, 32F |
-| `COLOR_YCrCb2RGB` | 3 → 3 | 8U, 16U, 32F |
-| `COLOR_BGR2HSV` | 3 → 3 | 8U |
-| `COLOR_RGB2HSV` | 3 → 3 | 8U |
-| `COLOR_BGR2HSV_FULL` | 3 → 3 | 8U |
-| `COLOR_RGB2HSV_FULL` | 3 → 3 | 8U |
 | `COLOR_YUV2RGB_UYVY` | 2 → 3 | 8U |
 | `COLOR_YUV2BGR_UYVY` | 2 → 3 | 8U |
 | `COLOR_YUV2RGB_YUY2` | 2 → 3 | 8U |
 | `COLOR_YUV2BGR_YUY2` | 2 → 3 | 8U |
 | `COLOR_YUV2RGB_YVYU` | 2 → 3 | 8U |
 | `COLOR_YUV2BGR_YVYU` | 2 → 3 | 8U |
+
+### YUV and YCrCb
+
+| Conversion code | Source → output channels | Depths |
+|---|---|---|
+| `COLOR_BGR2YCrCb` | 3 → 3 | 8U, 16U, 32F |
+| `COLOR_RGB2YCrCb` | 3 → 3 | 8U, 16U, 32F |
+| `COLOR_YCrCb2BGR` | 3 → 3 | 8U, 16U, 32F |
+| `COLOR_YCrCb2RGB` | 3 → 3 | 8U, 16U, 32F |
 | `COLOR_BGR2YUV` | 3 → 3 | 8U, 16U, 32F |
 | `COLOR_RGB2YUV` | 3 → 3 | 8U, 16U, 32F |
 | `COLOR_YUV2BGR` | 3 → 3 | 8U, 16U, 32F |
 | `COLOR_YUV2RGB` | 3 → 3 | 8U, 16U, 32F |
+
+### Forward HSV
+
+| Conversion code | Source → output channels | Depths |
+|---|---|---|
+| `COLOR_BGR2HSV` | 3 → 3 | 8U |
+| `COLOR_RGB2HSV` | 3 → 3 | 8U |
+| `COLOR_BGR2HSV_FULL` | 3 → 3 | 8U |
+| `COLOR_RGB2HSV_FULL` | 3 → 3 | 8U |
+
+### Packed BGR565 and BGR555
+
+| Conversion code | Source → output channels | Depths |
+|---|---|---|
 | `COLOR_BGR2BGR565` | 3 → 2 | 8U |
 | `COLOR_RGB2BGR565` | 3 → 2 | 8U |
 | `COLOR_BGRA2BGR565` | 4 → 2 | 8U |
@@ -157,12 +198,22 @@ also accepted; aliases do not add conversions. Depth support is specific to each
 | `COLOR_BGR5552BGRA` | 2 → 4 | 8U |
 | `COLOR_BGR5552RGBA` | 2 → 4 | 8U |
 | `COLOR_BGR5552GRAY` | 2 → 1 | 8U |
+
+### Bilinear Bayer
+
+| Conversion code | Source → output channels | Depths |
+|---|---|---|
 | `COLOR_BayerBG2BGR` | 1 → 3 | 8U, 16U |
 | `COLOR_BayerGB2BGR` | 1 → 3 | 8U, 16U |
 | `COLOR_BayerRG2BGR` | 1 → 3 | 8U, 16U |
 | `COLOR_BayerGR2BGR` | 1 → 3 | 8U, 16U |
 | `COLOR_BayerBG2GRAY` | 1 → 1 | 8U, 16U |
 | `COLOR_BayerBG2BGRA` | 1 → 4 | 8U, 16U |
+
+### XYZ, Lab and Luv
+
+| Conversion code | Source → output channels | Depths |
+|---|---|---|
 | `COLOR_BGR2XYZ` | 3 → 3 | 8U |
 | `COLOR_RGB2XYZ` | 3 → 3 | 8U |
 | `COLOR_XYZ2BGR` | 3 → 3 | 8U |
@@ -181,3 +232,15 @@ also accepted; aliases do not add conversions. Depth support is specific to each
 | `COLOR_Lab2LRGB` | 3 → 3 | 8U |
 | `COLOR_Luv2LBGR` | 3 → 3 | 8U |
 | `COLOR_Luv2LRGB` | 3 → 3 | 8U |
+
+<!-- Link targets: GitHub source paths; Doxygen page labels in the hidden block. -->
+<!--
+@cond
+-->
+[resource-cleanup]: maintenance.markdown#cleanup
+<!--
+@endcond
+[resource-cleanup]: @ref cleanup
+@cond
+-->
+<!-- @endcond -->

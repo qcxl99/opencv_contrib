@@ -1,6 +1,10 @@
 # This file is part of OpenCV project.
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
+#
+# HIP GPU fast path: convert four aligned uint8 BGR pixels to grayscale per lane.
+# The generator appends this fragment to cvtcolor_cpu_hip.py, inheriting its imports.
+# Host predicates check width/alignment; row strides count uint8 elements (bytes).
 
 
 @triton.jit(do_not_specialize=['src', 'dst', 'cols', 'src_rs', 'dst_rs'])

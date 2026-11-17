@@ -2,7 +2,10 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# Affine warp kernels for runtime compilation.
+# GPU affine sampling with the selected OpenCV CPU coordinate and rounding rules.
+# The cpu prefix describes the arithmetic, not where execution takes place.
+# M maps destination pixels to source coordinates after host-side inversion if needed.
+# Row strides count typed elements; border indices are source pixel indices.
 
 import triton
 import triton.language as tl

@@ -41,6 +41,7 @@ enum class Op : int {
     Xyz = 7, Lab = 8, Luv = 9, Yuv422 = 10, Yuv420 = 11
 };
 
+// Arithmetic field meanings follow OpenCV 5.0.0 imgproc colour/demosaicing symbols.
 struct CodeSpec {
     const char* name;      // the OpenCV constant name, e.g. "BGR2YUV"
     int code;              // the numeric cv::COLOR_* value
@@ -56,7 +57,7 @@ struct CodeSpec {
     // passing 6 or 5 down to the invoker -- the code number is not consulted there.
     int gb = 0;
     // Bayer only: Start_with_green, as Bayer2RGB_/Bayer2Gray_ derive it from the code
-    // (demosaicing.cpp:1049-1050, :777-783). It is a field for the same reason `gb` is -- the
+    // (demosaicing.cpp). It is a field for the same reason `gb` is -- the
     // invoker is handed it already resolved and never sees the code number. Bayer's other phase
     // value, Blue, needs no new field: it is exactly -1 for BG/GB and +1 for RG/GR, which is the
     // `blue` above under a different meaning (0/2 is a channel index, +-1 a polarity), and no
@@ -73,7 +74,7 @@ struct CodeSpec {
     // scaling. Zero for every other operation.
     int k[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     // Yuv422 only: which byte slot holds chroma U within the 4-byte macropixel -- 0 for UYVY,
-    // 1 for YUY2, 2 for YVYU (color_yuv.simd.hpp:1722-1730). Keep this field
+    // 1 for YUY2, 2 for YVYU (color_yuv.simd.hpp). Keep this field
     // last to preserve the positional initializers of preceding fields.
     int ord = 0;
 };
@@ -158,7 +159,7 @@ struct LabLuvLayout {
     static const int yf = 256 + 3072;
     static const int abxz = 256 + 3072 + 512;
     // abToXZ_b is LAB_BASE*9/4 = 36864 entries, not the 11264 the index RANGE suggests: the CPU
-    // allocates for i = minABvalue .. minABvalue + LAB_BASE*9/4 (color_lab.cpp:1062-1063), and
+    // allocates for i = minABvalue .. minABvalue + LAB_BASE*9/4 (color_lab.cpp), and
     // the valid indices run to ~23000, so the array cannot be sized from the observed values.
     static const int invgamma = abxz + 36864;
     static const int lu = invgamma + 4096;

@@ -36,6 +36,7 @@
 // the same header modules/imgproc/src/color_lab.cpp itself includes.
 #include "opencv2/core/softfloat.hpp"
 
+// Arithmetic source references: OpenCV 5.0.0 imgproc colour/demosaicing symbols.
 namespace cv_triton_color {
 
 using cv_triton_runtime::Code;
@@ -77,9 +78,9 @@ const CodeSpec TABLE[] = {
     {"RGB2GRAY",     7,  Op::Gray, 3, 1, 2, false, 180, {0, 0, 0, 0}},
     {"BGRA2GRAY",    10, Op::Gray, 4, 1, 0, false, 180, {0, 0, 0, 0}},
     {"RGBA2GRAY",    11, Op::Gray, 4, 1, 2, false, 180, {0, 0, 0, 0}},
-    // YUV2GRAY_UYVY / _YUY2 (123 / 124). These are NOT a conversion: color.cpp:382-384 calls
+    // YUV2GRAY_UYVY / _YUY2 (123 / 124). These are NOT a conversion: color.cpp calls
     // cvtColorYUV2Gray_ch, which is `extractChannel(_src, _dst, coi)` with coi = 1 for UYVY and
-    // 0 for YUY2 (color_yuv.dispatch.cpp:400-405). So they are a plain channel copy, they accept
+    // 0 for YUY2 (color_yuv.dispatch.cpp). So they are a plain channel copy, they accept
     // ODD widths (no parity assert anywhere on this path), and they are served by Permute with a
     // single source channel. COLOR_YUV2GRAY_YVYU is the same value 124 -- a synonym to YUY2,
     // and safe only because both extract Y.
@@ -124,7 +125,7 @@ const CodeSpec TABLE[] = {
     // (0 UYVY, 1 YUY2, 2 YVYU).
     //
     // YUV2GRAY_UYVY/YUY2 (123/124) are NOT here: the CPU implements those as a plain
-    // extractChannel (color_yuv.dispatch.cpp:400-405), which accepts ODD widths and is a channel
+    // extractChannel (color_yuv.dispatch.cpp), which accepts ODD widths and is a channel
     // copy, not a conversion -- so they are served by the Permute rows below.
     {"YUV2RGB_UYVY", 107, Op::Yuv422, 2, 3, 2, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 0},
     {"YUV2BGR_UYVY", 108, Op::Yuv422, 2, 3, 0, true, 180, {0, 0, 0, 0}, 0, 0, true, {0,0,0,0,0,0,0,0,0}, 0},
@@ -149,7 +150,7 @@ const CodeSpec TABLE[] = {
     // colour), exactly as YUV uses it. The format is `gb`, the green-bit count the CPU itself
     // passes down (color.hpp greenBits()): 6 for 565, 5 for 555.
     //
-    // Bit fields (color_rgb.simd.hpp:266-289 unpack, :381-389 pack, verified over all 65536
+    // Bit fields (color_rgb.simd.hpp unpack,  pack, verified over all 65536
     // words):   565 b=(v<<3)&0xF8 g=(v>>3)&0xFC r=(v>>8)&0xF8, alpha 255
     //           555 b=(v<<3)&0xF8 g=(v>>2)&0xF8 r=(v>>7)&0xF8, bit15 = 1-bit alpha
     // Note the 555 green is NOT bit-replicated: full scale is 248, not 255.
@@ -181,7 +182,7 @@ const CodeSpec TABLE[] = {
     // ---- Bayer bilinear demosaic (codes 46-49, 86, 139), 8U and 16U
     //
     // The four BGR codes are ONE kernel with the 2x2 pattern phase shifted. The CPU derives that
-    // phase from the code (demosaicing.cpp:1047-1050) and never consults it again, so the phase
+    // phase from the code (demosaicing.cpp) and never consults it again, so the phase
     // is a constexpr here too: `blue` carries Bayer2RGB_'s Blue (-1 for BG/GB, +1 for RG/GR) and
     // `swg` its Start_with_green (1 for GB/GR, 0 for BG/RG).
     //
@@ -190,7 +191,7 @@ const CodeSpec TABLE[] = {
     //
     // BayerBG2BGR at dcn=4 is a distinct CPU call path (_dst created with 4 channels and the
     // invoker's `dcn == 4` arms) and so is a distinct row, not a rerun of the 3-channel one.
-    // Bayer2GRAY is a separate kernel with its own coefficients (:775-776), dcn pinned to 1.
+    // Bayer2GRAY is a separate kernel with its own coefficients, dcn pinned to 1.
     //
     // VNG (62) and EA (135) are intentionally absent -- see the header.
     {"BayerBG2BGR",  46, Op::Bayer, 1, 3, -1, false, 180, {0, 0, 0, 0}, 0, 0},
@@ -202,7 +203,7 @@ const CodeSpec TABLE[] = {
     // ---- XYZ and the Lab/Luv families (codes 32-35, 44/45, 56/57, 58/59, 74-81)
     //
     // All CV_8U, all integer, and the sRGB-vs-linear split is the `srgb` flag: the CPU's is_sRGB
-    // is true for exactly the non-L codes (color.hpp:42-52). The Luv forward sRGB direction is
+    // is true for exactly the non-L codes (color.hpp). The Luv forward sRGB direction is
     // the one deliberate approximation in this group -- a trilinear LUT, not the CIE formula;
     // see kernels/cvtcolor_cpu.py.
     //
@@ -393,15 +394,15 @@ Status resolve_output(const cv_triton_runtime::DeviceView& s, int code, Output& 
     // CPU path is the SAME integer formula at both depths, i.e. the same coefficient tables with
     // only the container widened:
     //
-    //   Op::Bayer    demosaicing.cpp:1796-1803 hands both depths to the same template, and the
+    //   Op::Bayer    demosaicing.cpp hands both depths to the same template, and the
     //                16U SIMD interpolator is a stub (the plain scalar loop).
     //   Op::Gray     RGB2Gray<ushort> uses BY15/GY15/RY15 and gray_shift=15 like the uchar
-    //                specialisation (color_rgb.simd.hpp:812-910 vs :711-840).
+    //                specialisation (color_rgb.simd.hpp).
     //   Op::Yuv      RGB2YCrCb_i<ushort> / YCrCb2RGB_i<ushort>, yuv_shift = 14
-    //   Op::YCrCb    (color_yuv.simd.hpp:254-396, :907-1000). Only the chroma bias
+    //   Op::YCrCb    (color_yuv.simd.hpp). Only the chroma bias
     //                (ColorChannel<T>::half() << shift) and the clamp (255 -> 65535) differ.
     //   Op::Permute  ONLY the gray->colour rows (scn == 1): Gray2RGB is a pure copy with
-    //                alpha = ColorChannel<T>::max() (color_rgb.simd.hpp:402-448).
+    //                alpha = ColorChannel<T>::max() (color_rgb.simd.hpp).
     //
     // Everything else stays 8U, and the colour permutes do NOT get 16U as a side effect: the
     // scn == 1 condition is what keeps BGR2BGRA and the YUV2GRAY_* extractChannel rows out.
@@ -438,7 +439,7 @@ Status resolve_output(const cv_triton_runtime::DeviceView& s, int code, Output& 
     // The expected destination size depends on the code. Most conversions keep it; a 4:2:0 decode
     // (NV12/NV21) takes ONE CV_8UC1 of (3H/2) x W and produces H x W, because the CPU's
     // CvtHelper FROM_YUV asserts `sz.width % 2 == 0 && sz.height % 3 == 0` and sets
-    // `dstSz = Size(sz.width, sz.height * 2 / 3)` (color.simd_helpers.hpp:113-116). Checking
+    // `dstSz = Size(sz.width, sz.height * 2 / 3)` (color.simd_helpers.hpp). Checking
     // equality for those codes would reject every legal call, and -- worse -- a relaxed check
     // alone would accept a same-height destination and read the chroma plane out of range, so
     // the size is validated against the rule rather than merely not-equality.
@@ -535,9 +536,9 @@ HsvTables hsv_tables_full() {
 // are the specification here, not the textbook ones.
 namespace {
 
-const int kLabShift = 12;      // == xyz_shift (color.simd_helpers.hpp:18), color_lab.cpp:931
-const int kGammaShift = 3;     // color_lab.cpp:932
-const int kLabShift2 = 15;     // lab_shift + gamma_shift (color_lab.cpp:933)
+const int kLabShift = 12;      // == xyz_shift (color.simd_helpers.hpp), color_lab.cpp
+const int kGammaShift = 3;     // color_lab.cpp
+const int kLabShift2 = 15;     // lab_shift + gamma_shift (color_lab.cpp)
 const int kInvGammaShift = 12;
 const int kInvGammaTabSize = 1 << kInvGammaShift;
 const int kLabCbrtTabSizeB = 256 * 3 / 2 * (1 << kGammaShift);   // 3072
@@ -550,7 +551,7 @@ const int kMinAB = -8145;
 using cv::softdouble;
 using cv::softfloat;
 
-// color_lab.cpp:985-1009 (applyGamma / applyInvGamma inside a softdouble evaluation).
+// color_lab.cpp (applyGamma / applyInvGamma inside a softdouble evaluation).
 softfloat applyGamma(softfloat x) {
     static const softdouble threshold = softdouble(809) / softdouble(20000);
     static const softdouble lowScale = softdouble(323) / softdouble(25);
@@ -570,7 +571,7 @@ softfloat applyInvGamma(softfloat x) {
                            : pow(xd, softdouble::one() / power) * (softdouble::one() + xshift) - xshift;
 }
 
-// D65 and the sRGB matrices as raw bit patterns (color_lab.cpp:116-145, :915-917). Raw and not
+// D65 and the sRGB matrices as raw bit patterns (color_lab.cpp). Raw and not
 // decimal literals on purpose: the decimal comments in the source are rounded renderings and
 // parsing them back gives different doubles.
 const softdouble D65[3] = {softdouble::fromRaw(0x3fee6a22b3892ee8), softdouble::one(),
@@ -589,11 +590,11 @@ const softdouble kXYZ2sRGB_D65[9] = {
     softdouble::fromRaw(0x3ff0eabef06b3786)};
 
 // XYZ's integer matrices are these literals directly: the 8-bit path never scales the floats
-// (color_lab.cpp:146-158).
+// (color_lab.cpp).
 const int kSRGB2XYZ_i[9] = {1689, 1465, 739, 871, 2929, 296, 79, 488, 3892};
 const int kXYZ2sRGB_i[9] = {13273, -6296, -2042, -3970, 7684, 170, 228, -836, 4331};
 
-// The white-point chroma initLUTforLUV receives (color_lab.cpp:1288-1292). Note `dd` is a
+// The white-point chroma initLUTforLUV receives (color_lab.cpp). Note `dd` is a
 // softfloat, not a softdouble, because `dd` was declared softfloat and std::max therefore
 // returns softfloat -- so the double-valued reciprocal is ROUNDED TO FLOAT before it is used.
 // That is why the value is 2.571912... and not the textbook 1/(0.9505+15+3*1.0888) = 0.0526.
@@ -624,7 +625,7 @@ void coeffs_for(int code, int out[9]) {
     const bool xyzInv = (code == 34 || code == 35);
     const bool luv = (code == 50 || code == 51 || code == 58 || code == 59 || code == 80 || code == 81);
     // blueIdx = swapBlue(code) ? 2 : 0. swapBlue is false for the BGR/XYZ codes and true for
-    // their RGB twins (color.hpp:54-89), which is what makes the two directions of the SAME code
+    // their RGB twins (color.hpp), which is what makes the two directions of the SAME code
     // family differ.
     const bool rgbCode = (code == 33 || code == 35 || code == 45 || code == 75 || code == 51 ||
                           code == 57 || code == 59 || code == 79 || code == 81);
@@ -632,7 +633,7 @@ void coeffs_for(int code, int out[9]) {
     static const softdouble lshift(1 << kLabShift);
 
     if (xyz) {
-        // RGB2XYZ_i<uchar> (color_lab.cpp:291-330): the int table with swapBlueCoeffsCols for
+        // RGB2XYZ_i<uchar> (color_lab.cpp): the int table with swapBlueCoeffsCols for
         // blueIdx == 0. Column 0 of the CPU's array is then the coefficient of `b` = src[0], so
         // the CPU's order already IS our slot order and no extra work is needed beyond the swap.
         for (int r = 0; r < 3; ++r) {
@@ -644,7 +645,7 @@ void coeffs_for(int code, int out[9]) {
         return;
     }
     if (xyzInv) {
-        // XYZ2RGB_i<uchar> (color_lab.cpp:671-700) applies swapBlueCoeffsRows when blueIdx == 0 --
+        // XYZ2RGB_i<uchar> (color_lab.cpp) applies swapBlueCoeffsRows when blueIdx == 0 --
         // ROWS, not columns, and blueIdx 0 is the BGR-output code. The CPU writes dst[0] from
         // flat row 0, so a row swap moves which destination channel each matrix row feeds.
         for (int r = 0; r < 3; ++r) {
@@ -655,7 +656,7 @@ void coeffs_for(int code, int out[9]) {
     }
 
     if (forward) {
-        // RGB2Lab_b's constructor (color_lab.cpp:1563-1585). c[] is indexed by the LOGICAL
+        // RGB2Lab_b's constructor (color_lab.cpp). c[] is indexed by the LOGICAL
         // channel R, G, B and the constructor writes slot (blueIdx^2) for c[0], 1 for c[1],
         // blueIdx for c[2]. Our slot k reads src[k], which is the CPU's `b` for k = 0 whatever
         // blueIdx is (the CPU reads src[0] as b, src[1] as g, src[2] as r, and only the
@@ -672,7 +673,7 @@ void coeffs_for(int code, int out[9]) {
         return;
     }
 
-    // Lab2RGBinteger / Luv2RGBinteger (color_lab.cpp:2391-2411, :3534-3552).
+    // Lab2RGBinteger / Luv2RGBinteger (color_lab.cpp).
     //
     // THE INDEX ORDER IS TRANSPOSED HERE: `c[j] = XYZ2sRGB_D65[i + j*3]`, against the forward
     // direction's `c[j] = M[i*3 + j]`. The reverse transform requires this transpose.
@@ -737,7 +738,7 @@ LabLuvTables buildLabLuvTables() {
     t.abxz.resize(kLabBase * 9 / 4);
     for (int i = kMinAB; i < kLabBase * 9 / 4 + kMinAB; ++i) {
         int v;
-        // The two branches are f^-1 and t^3, meeting at 6/29 * BASE = 3389.73 (:1070-1078).
+        // The two branches are f^-1 and t^3, meeting at 6/29 * BASE = 3389.73.
         if (i <= 3390) v = i * 108 / 841 - kLutBase * 16 / 116 * 108 / 841;
         else v = i * i / kLutBase * i / kLutBase;
         t.abxz[i - kMinAB] = v;
@@ -750,7 +751,7 @@ LabLuvTables buildLabLuvTables() {
     softfloat un, vn;
     whiteChroma(un, vn);
 
-    // initLUTforLUV (color_lab.cpp:1017-1058). LvToVpl_b uses `long long`
+    // initLUTforLUV (color_lab.cpp). LvToVpl_b uses `long long`
     // because intermediate values exceed the signed 32-bit range.
     t.lu.resize(256 * 256);
     t.lv.resize(256 * 256);
@@ -783,7 +784,7 @@ LabLuvTables buildLabLuvTables() {
         }
     }
 
-    // RGB2LuvLUT_s16 (color_lab.cpp:1100-1210): the 33^3 grid, in softfloat, then the corner
+    // RGB2LuvLUT_s16 (color_lab.cpp): the 33^3 grid, in softfloat, then the corner
     // duplication fill_one applies so that the last node has a valid "up" neighbour.
     {
         const int n3 = kLabLutDim * kLabLutDim * kLabLutDim;
@@ -803,7 +804,7 @@ LabLuvTables buildLabLuvTables() {
 
         // The Luv grid's coefficients are NOT white-point scaled: building the LUT divides by
         // the white point only for Lab (scaleWhite), and the Luv block uses `coeffs`, which is
-        // sRGB2XYZ_D65 with R and B swapped (color_lab.cpp:1113-1125).
+        // sRGB2XYZ_D65 with R and B swapped (color_lab.cpp).
         softfloat c[9];
         for (int i = 0; i < 3; ++i) {
             softfloat s0 = kSRGB2XYZ_D65[i * 3 + 0];
@@ -835,7 +836,7 @@ LabLuvTables buildLabLuvTables() {
                     prev[idx + 1] = (short)cvRound(lbase * (u - uLow) / uRange);
                     prev[idx + 2] = (short)cvRound(lbase * (v - vLow) / vRange);
                 }
-        // fill_one (:1084-1098): corner (_p,_q,_r) of node (p,q,r) takes the value of node
+        // fill_one: corner (_p,_q,_r) of node (p,q,r) takes the value of node
         // (min(p+_p, 32), min(q+_q, 32), min(r+_r, 32)) -- the duplication that gives the last
         // node an "up" neighbour -- and lands at 4*_p + 2*_q + _r inside the node's 24 int16,
         // with the channels at +0, +8, +16.

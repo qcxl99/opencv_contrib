@@ -1,9 +1,9 @@
 Triton warpAffine {#tutorial_triton_warpaffine}
 =================
 
-@see @ref triton "Triton API reference".
-@see @ref triton_runtime_toolchain "Runtime compilation and cache".
-@see @ref triton_architecture "Streams and resource ownership".
+[API reference][triton-api].
+[Runtime compilation and cache][runtime-toolchain].
+[Streams and resource ownership][runtime-architecture].
 
 Supported inputs
 ----------------
@@ -72,8 +72,15 @@ wholly outside neighborhood leaves the pixel unchanged. Weights are not
 renormalized. AREA uses LINEAR sampling here, rather than resize-style area
 integration.
 
+<a id="cpu-reference-and-accuracy"></a>
+<a id="warp-numerics"></a>
 CPU reference and accuracy
 --------------------------
+
+A CPU arithmetic **profile** describes how this build rounds coordinate and
+interpolation expressions, including fused multiply-add and vector/tail grouping.
+It is detected from small fixed inputs, not from the GPU model. This selects the
+CPU behavior the GPU emulates; caller images remain on the GPU.
 
 NEAREST/LINEAR/AREA follow the linked OpenCV CPU implementation's vector-path
 arithmetic. In that implementation the SIMD body evaluates a coordinate as
@@ -132,3 +139,19 @@ Performance tests warm the kernels and include public submission plus stream
 completion. The AREA/TRANSPARENT cases initialize and reuse destination storage;
 reading previous destination values is part of their workload. They do not
 assume that native CUDA transparent-border behavior is equivalent.
+
+<!-- Link targets: GitHub source paths; Doxygen page labels in the hidden block. -->
+<!--
+@cond
+-->
+[triton-api]: ../include/opencv2/triton.hpp
+[runtime-toolchain]: maintenance.markdown#runtime-toolchain
+[runtime-architecture]: maintenance.markdown#architecture
+<!--
+@endcond
+[triton-api]: @ref triton
+[runtime-toolchain]: @ref triton_runtime_toolchain
+[runtime-architecture]: @ref triton_architecture
+@cond
+-->
+<!-- @endcond -->

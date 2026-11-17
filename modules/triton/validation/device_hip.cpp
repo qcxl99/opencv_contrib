@@ -1,6 +1,9 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
+// Test/perf adapter for the public HIP DeviceImage entries, not a production allocator.
+// ROI fixtures share the parent allocation; stream fixtures own streams they create.
+// Blocking upload/download delimit host comparisons. Callers retain fixtures in flight.
 #include "device.hpp"
 #include "opencv2/triton/device.hpp"
 #include "../src/entry.hpp"

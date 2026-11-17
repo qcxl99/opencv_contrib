@@ -2,7 +2,10 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# HIP resize kernels for complete 2x2 area windows.
+# HIP GPU resize fast paths for complete 2x2 area windows in uint8 images.
+# Host predicates admit only supported channel counts, alignment and full windows.
+# Row/batch strides count uint8 elements (bytes); packed loads convert to word offsets.
+# C1 packs four grayscale pixels per word; C4 packs four channels of one pixel.
 
 import triton
 import triton.language as tl

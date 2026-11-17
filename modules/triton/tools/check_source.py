@@ -3,7 +3,12 @@
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 
-"""Explicit CPU-only source checks; never builds OpenCV or probes/uses a GPU."""
+"""Check module sources and generated-file consistency without importing kernels.
+
+Reads this module, checks Python syntax/notices and both generators, and compiles
+CPU controls in a temporary directory with --cxx. Prints check results; exits 0
+on success, nonzero on a failed control. Does not build OpenCV or use a GPU.
+"""
 import argparse
 import ast
 import os

@@ -1,10 +1,13 @@
 # Generated HIP warpaffine kernels; regenerate with tools/make_kernels_cpu_hip.py.
-# source_sha256: dbc7724a8bbeaf4069ff517eda8bb5b19f244b3ddb9fe236f24ed1948b314399
+# source_sha256: d65191438d1dd43dd1f85c6d3e81d11918e1371ba2a10ef7f0995f45f58377df
 # This file is part of OpenCV project.
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
 #
-# Affine warp kernels for runtime compilation.
+# GPU affine sampling with the selected OpenCV CPU coordinate and rounding rules.
+# The cpu prefix describes the arithmetic, not where execution takes place.
+# M maps destination pixels to source coordinates after host-side inversion if needed.
+# Row strides count typed elements; border indices are source pixel indices.
 
 import triton
 import triton.language as tl

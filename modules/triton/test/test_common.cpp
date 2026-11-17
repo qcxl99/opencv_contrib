@@ -1,7 +1,9 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
-// Shared accuracy through real public APIs, without CUDA/HIP SDK headers.
+// Shared accuracy through the public backend entries, without SDK-specific headers.
+// Device fixtures exercise pitched/ROI images; references check sampling and rounding.
+// Guard tests detect writes outside the destination view, including 16U byte damage.
 #include "../validation/device.hpp"
 #include "../validation/guards.hpp"
 #include <limits>

@@ -1,13 +1,17 @@
 Maintaining the Triton module {#tutorial_triton_maintenance}
 =============================
 
-@tableofcontents
+Read by task: [source and call flow](#source-layout), [terms](#terms),
+[errors](#error-messages), [resource lifetime](#cleanup),
+[compiler/cache](#runtime-toolchain), [generated sources](#generated-hip-sources).
 
+<a id="source-layout"></a>
 Source layout
 -------------
 
 All sources and generation tools needed to build the module are in this
-module directory. `kernels/` contains Triton implementations. `src/` contains
+module directory. `kernels/` contains GPU implementations; `cpu` in a kernel
+filename means it reproduces CPU arithmetic, not that it executes on the CPU. `src/` contains
 entry validation, adapters and runtime code. Runtime resize planning is separate
 from the CPU output evaluator under `test/`; tests also compare against the
 linked OpenCV CPU implementations where documented. Keep algorithmic source
@@ -17,6 +21,7 @@ Describe current behavior in guides and explain invariants in code comments.
 Keep development logs, run reports and build artifacts outside the source tree.
 Generated-source notices and integrity hashes remain with their generated files.
 
+<a id="architecture"></a>
 Architecture and ownership {#triton_architecture}
 --------------------------
 
@@ -35,6 +40,37 @@ For a first source read, follow one call through these layers:
 | Device computation | `kernels/` | The arithmetic and memory accesses executed on the GPU |
 | Validation | `validation/`, `test/`, `perf/` | Shared cases, numerical references, lifecycle checks and timing |
 
+The call flow is the same for the three operations:
+
+```text
+cv::triton::<operation>
+  → adapter checks shapes, device views and caller stream
+  → C++ plan selects sampling rules, tables and launch arguments
+  → runtime reuses a compiled binary, or invokes the compile helper on a miss
+  → GPU work is submitted to the caller stream
+  → caller waits before reading/releasing images; runtime retains its own resources
+```
+
+### Names used in the source
+
+These namespaces describe existing layers, not additional public APIs:
+
+| Name | Meaning / entry |
+|---|---|
+| `cv::triton` | Installed public operations and backend queries |
+| `cv::triton::detail` | Private adapter/output validation in `src/entry.hpp` and `src/core.hpp` |
+| `cv_triton_runtime` | Private device views, status, keys and backend services in `src/runtime/provider.hpp` |
+| `cv_triton_resize` | Resize planning and CPU-compatible sampling tables in `resize_plan.hpp` |
+| `cv_triton_color`, `cv_triton_warp` | Colour specifications and affine sampling plans |
+| `triton_validation` | Test/perf device adapters, selected by CMake; not installed |
+| `triton_graph` | Private HIP graph request parser in `perf/hip/graph_request.hpp` |
+
+Short local aliases do not introduce a new layer: `ref` usually names the
+resize reference/planner and `wa` the warp planner. `tr` in the HIP tests names
+`cv::triton`, `td` in the test helpers and `D` in the HIP graph tool name
+`cv::triton::detail`, and `J` in that tool names `cv_triton_runtime`.
+Check the adjacent `namespace ... = ...` declaration for a file's exact alias.
+
 `validation/` contains private shared accuracy/performance support. CMake
 selects `device_cuda.cpp` or `device_hip.cpp`; each calls its backend's public
 module entry points. These test helpers are not installed. Backend lifecycle
@@ -48,6 +84,7 @@ can be captured on a stream where compilation, module loads and table uploads
 are already complete. After all graphs using these resources are destroyed or
 cannot be replayed, call cv::triton::releaseGraphResources().
 
+<a id="cleanup"></a>
 Asynchronous cleanup and context ownership
 -----------------------------------------
 
@@ -95,6 +132,7 @@ Primary-context ownership follows these rules:
 - Static teardown does not release the owner after the driver may be gone.
   Arbitrary primary-context resets and private contexts are unsupported by this fallback.
 
+<a id="runtime-toolchain"></a>
 Runtime compiler, ABI and cache {#triton_runtime_toolchain}
 -------------------------------
 
@@ -103,12 +141,13 @@ enabled. Nothing is compiled by Triton during the OpenCV build. On first use,
 `tools/compile_helper.py` runs in a separate Python process using the configured
 Triton 3.6.0 compiler. The C++ execution path does not embed an interpreter.
 Build commands and toolkit examples are maintained in
-@ref tutorial_triton_cuda_first_use and @ref tutorial_triton_hip_first_use.
+[CUDA first use][cuda-first-use] and
+[HIP first use][hip-first-use].
 
 The compile key includes source identity, kernel signature, compile-time
 parameters, launch options, target and compiler version. The runtime checks
 manifest and binary hashes before loading disk artifacts. An unsupported
-compiler launch ABI is rejected. See @ref triton_architecture for table uploads,
+compiler launch ABI is rejected. See [architecture and ownership](#architecture) for table uploads,
 stream dependencies and in-flight ownership.
 
 The writable cache defaults to `~/.cache/opencv/triton`. The following runtime
@@ -146,6 +185,7 @@ and HIP hsaco metadata. Runtime argument types, ordered parameters, warp/block
 geometry and zero scratch requirements are checked before launch. A matching
 version string alone does not validate an incompatible backend or entry ABI.
 
+<a id="generated-hip-sources"></a>
 Generated HIP sources
 ---------------------
 
@@ -195,6 +235,84 @@ tests check numerical behavior. Native CUDA comparison modules are optional
 and do not alter production dependencies. Preserve comparable inputs, devices
 and timing boundaries when reporting performance.
 
-For deployment/cache checks, use @ref triton_runtime_toolchain and the backend
+For deployment/cache checks, use [runtime compilation and cache](#runtime-toolchain) and the backend
 tutorials. Backend launch defaults and specialized layout guards are shared where
 implemented; benchmark each actual device rather than infer per-architecture tuning.
+
+<a id="terms"></a>
+Terms used in this module
+------------------------
+
+| Term | Meaning here |
+|---|---|
+| CPU-compatible GPU kernel | GPU code reproducing the selected CPU algorithm/rounding. The `*_cpu.py` files still execute on the GPU. See the operator numerical guides. |
+| Profile | A pattern of arithmetic observed in the linked CPU build, such as fused versus separate multiply/add or row grouping. It is not a GPU model or a performance profile. [Colour][colour-numerics] and [warp][warp-numerics] select it differently. |
+| Route | A chosen algorithm branch, such as resize copy, nearest, separable interpolation, integer-area or fractional-area sampling. |
+| Plan | C++ output metadata, coordinate/coefficient tables and launch choices prepared for a request. It is separate from GPU execution; see `src/runtime/provider.hpp`. |
+| Owner | The object keeping a resource alive. Caller image/stream owners and runtime module/table owners have separate [lifetimes](#cleanup). |
+| Step / pitch | Bytes from one image row to the next in public views. Kernel `rs` arguments count typed elements, after division by the element size. |
+| DTK / ROCm | HIP toolchains and runtimes from Hygon / AMD respectively. A common HIP API does not imply identical optional queries or targets. |
+| `sm_90` / `gfx936` / `gfx1100` | Compiler architecture targets; `gfx*` does not identify the host machine or establish test coverage. |
+| cubin / hsaco | CUDA device binary / HIP code object loaded by the backend. A filename or matching compiler version is not sufficient to validate its launch ABI. |
+| JIT cache | Persisted binary plus manifest keyed by source, target, types and compile options. This is distinct from a loaded-context module cache and the compiler's own cache. |
+| `constexpr` | A Triton compile-time argument. Its value selects a binary specialization; ordinary runtime arguments keep their values at launch time. |
+| `do_not_specialize` | Suppresses Triton's implicit value/alignment specialization for the listed runtime arguments. The explicit compile key still identifies types, constexprs and options. |
+| Guard band | Test-only bytes outside a destination ROI, checked for unintended writes. It is not padding the operation is allowed to overwrite. |
+| FMA / SIMD | Fused multiply-add rounds once; separate multiply/add round twice. SIMD processes lanes together; scalar tails can follow different expression grouping. |
+
+<a id="error-messages"></a>
+Reading an error
+----------------
+
+Most private runtime statuses reach the public entry as:
+`cv::triton::<operation>: <message> (<reason>)`. In Python this is a `cv.error`;
+in C++ it is a `cv::Exception`. The message contains the failing condition;
+the final lowercase token is the private `Reason` name, not the exception code.
+
+`requireStatus` in `src/entry.cpp` maps an **Unsupported** status to
+`StsUnsupportedFormat` for type/mode/route mismatches and `StsBadArg` for other
+request errors. An **Error** status becomes `StsError`. Some adapter checks
+raise directly, for example HIP GpuMat calls with `StsNotImplemented`, so not
+every exception has a reason suffix. The following names come from
+`reason_name` in `src/runtime/provider.cpp`:
+
+| Private Reason → suffix | Likely cause | Action |
+|---|---|---|
+| `DepthOrChannels` → `depth_or_channels` | Unsupported depth or channel count for the operation/code | Use the supported type/code combination in the operator guide. |
+| `Interpolation` → `interpolation` | Unsupported interpolation, colour code, flags or border option | Check the operation's supported options; this name also covers colour-code rejection. |
+| `EmptyOrSize` → `empty_or_size` | Empty view, invalid output size/scale or packed-video geometry | Check positive dimensions, `dsize`/scale rules and conversion-specific shape. |
+| `TypeMismatch` → `type_mismatch` | Source and destination types disagree | Allocate the code-specific output type/channel count. |
+| `StepLayout` → `step_layout` | Misaligned pointer/step, too short a row or view outside allocation | Supply byte pitch for the full row and a valid ROI inside its parent allocation. |
+| `IndexRange` → `index_range` | Dimensions/strides, coordinates or offsets exceed supported finite/index ranges | Reduce the view or transform; do not truncate large values. |
+| `InPlaceOrOverlap` → `in_place_or_overlap` | Source and destination pixel storage overlaps | Use disjoint image views. |
+| `ContextMismatch` → `context_mismatch` | Buffer/stream/context identity is incompatible or cannot be established | Use allocations and streams from the selected device/context; inspect the detailed message. |
+| `RouteNotEnabled` → `route_not_enabled` | This build does not serve the selected route | Check the installed module's supported routes/resources. |
+| `ToolchainUnavailable` → `toolchain_unavailable` | Cache miss without a usable interpreter/compiler, or compiler mismatch | Select a Python with Triton 3.6.0 via `OPENCV_TRITON_PYTHON` and, if needed, `OPENCV_TRITON_PYTHONPATH`. |
+| `CompileFailed` → `compile_failed` | Helper/compiler rejected the request | Read the compiler diagnostic and check selected package/target compatibility. |
+| `CompileTimeout` → `compile_timeout` | Helper exceeded its deadline | Check compiler progress, process/resource availability and the detailed timeout. |
+| `ManifestInvalid` → `manifest_invalid` | Artifact identity/hash/metadata is inconsistent | Check cache permissions and integrity; allow recompilation with a valid toolchain. |
+| `LoadFailed` → `load_failed` | Driver cannot load the device binary | Check actual driver, architecture and compiler ABI compatibility. |
+| `DeviceAlloc` → `device_alloc` | Device allocation or table setup failed | Check available memory and the underlying driver diagnostic. |
+| `LaunchFailed` → `launch_failed` | Submission, event or cleanup operation failed | Check the driver message and [resource-lifetime rules](#cleanup); the suffix alone does not prove a kernel execution fault. |
+
+`None` (`none`) is the no-error reason. If the exception says work had already
+been submitted, the output is undefined: preserve the storage until safe
+completion/teardown, and do not silently rerun the request elsewhere.
+
+<!-- Link targets: GitHub source paths; Doxygen page labels in the hidden block. -->
+<!--
+@cond
+-->
+[cuda-first-use]: ../tutorials/cuda-first-use.markdown
+[hip-first-use]: ../tutorials/hip-first-use.markdown
+[colour-numerics]: cvtcolor.markdown#numerical-behavior
+[warp-numerics]: warpaffine.markdown#cpu-reference-and-accuracy
+<!--
+@endcond
+[cuda-first-use]: @ref tutorial_triton_cuda_first_use
+[hip-first-use]: @ref tutorial_triton_hip_first_use
+[colour-numerics]: @ref colour-numerics
+[warp-numerics]: @ref warp-numerics
+@cond
+-->
+<!-- @endcond -->

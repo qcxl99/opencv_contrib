@@ -1,7 +1,8 @@
 Building and checking a Triton contribution {#tutorial_triton_validation}
 =========================================
 
-@tableofcontents
+Choose a check: [source controls](#cpu-only-source-checks), [module off](#module-off),
+[device builds](#enabled-cuda-and-hip), [installed applications](#installed-application-checks).
 
 These are explicit checks, not automatic first-use actions. Use the same paired
 OpenCV/contrib source snapshot throughout and save commands, environment, source
@@ -26,6 +27,7 @@ be updated through their included generators and checked for consistency rather
 than reformatted separately. Documentation generation is a separate check; state
 whether it covers the module pages or the complete OpenCV website.
 
+<a id="cpu-only-source-checks"></a>
 CPU-only source checks
 ----------------------
 
@@ -60,6 +62,7 @@ The bytewise helper is shared by CUDA ROI checks and common CUDA/HIP
 fixtures. An expected guard image is constructed at the actual destination type;
 16U data is never interpreted as float.
 
+<a id="module-off"></a>
 Module off
 ----------
 
@@ -82,13 +85,14 @@ from this module introducing a dependency. To verify absence of a module probe,
 set `TRITON_PYTHON_EXECUTABLE` to a logging stub in this off-only build and verify
 it was never invoked. Do not use that stub in enabled builds.
 
+<a id="enabled-cuda-and-hip"></a>
 Enabled CUDA and HIP
 --------------------
 
 Use separate build/install directories, standard `BUILD_TESTS`,
 `BUILD_PERF_TESTS`, `BUILD_EXAMPLES`, and the corresponding backend toolkit.
-Use @ref tutorial_triton_cuda_first_use for CUDA build/install commands and
-@ref tutorial_triton_hip_first_use for HIP, including DTK/ROCm differences.
+Use [CUDA first use][cuda-first-use] for CUDA build/install commands and
+[HIP first use][hip-first-use] for HIP, including DTK/ROCm differences.
 Results from one machine or architecture do not validate another. Include
 `python3,python_bindings_generator,ts` in BUILD_LIST when validating wrappers
 and tests; select compatible Python development headers/library and NumPy.
@@ -117,8 +121,9 @@ exercise backend queries and the explicitly unsupported GpuMat operations;
 no HIP Python device-buffer wrapper is advertised. Separate positive, refusal,
 platform skip, missing data and zero-test results.
 
-Install and hardware evidence
------------------------------
+<a id="installed-application-checks"></a>
+Installed application checks
+----------------------------
 
 Verify `cv2.__file__`, actual loaded OpenCV libraries and runtime resources are
 from the selected installation. Use installed headers and `find_package(OpenCV)`
@@ -127,13 +132,25 @@ cache, disk cache without a compiler interpreter, and a different empty cache
 without the compiler. Existing runtime tests cover integrity and resource lifetime; select
 changed boundaries, including graph capture or cross-stream dependencies when
 applicable. Backend tutorials own build/install commands;
-@ref triton_runtime_toolchain owns compiler, cache and relocation rules.
+[runtime compiler/cache guide][runtime-toolchain] owns compiler, cache and relocation rules.
 
-A hosted CPU source check, an enabled compile job and an actual run on each target device
-establish different things. The repository's general PR workflow does not by
-itself establish that this default-off module was enabled. Hardware runners and
-integration into OpenCV's shared CI are to be agreed with maintainers; they are
-not installed by this module. Pending/no checks on a pushed branch do not prove
-failure or success. Until corresponding jobs exist, attach reproducible logs
-with exact source/environment/binary identities and list each unrun backend.
-Do not describe this document or a runner definition as an executed CI result.
+Report the actual device, toolchain and source/installed-binary identity with
+results. List failures and skips separately. CPU controls, build success and
+hardware execution cover different boundaries; compare each result with the
+operation and backend it exercised.
+
+<!-- Link targets: GitHub source paths; Doxygen page labels in the hidden block. -->
+<!--
+@cond
+-->
+[cuda-first-use]: ../tutorials/cuda-first-use.markdown
+[hip-first-use]: ../tutorials/hip-first-use.markdown
+[runtime-toolchain]: maintenance.markdown#runtime-toolchain
+<!--
+@endcond
+[cuda-first-use]: @ref tutorial_triton_cuda_first_use
+[hip-first-use]: @ref tutorial_triton_hip_first_use
+[runtime-toolchain]: @ref triton_runtime_toolchain
+@cond
+-->
+<!-- @endcond -->

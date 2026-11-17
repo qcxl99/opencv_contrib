@@ -2,7 +2,13 @@
 # This file is part of OpenCV project.
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
-"""Compile the actual backend context code with injected CPU driver calls, never a GPU fault."""
+"""Compile selected backend lifetime/context functions against injected CPU driver calls.
+
+Reads the module sources and uses a temporary C++ harness to check completion,
+cleanup failures and primary-context ownership. No SDK or GPU fault is needed.
+Prints control results and exits nonzero on a failed compile/assertion; this does
+not establish real-driver or hardware qualification.
+"""
 import argparse
 from pathlib import Path
 import shlex
