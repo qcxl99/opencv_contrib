@@ -11,7 +11,7 @@ ABI, cache and resource-location rules.
 A configuration example is Linux x86_64, NVIDIA H20 (`sm_90`), CUDA Toolkit 12.8
 and Triton 3.6.0. These values describe a build configuration, not a test result
 for every machine or source revision. Follow the
-[OpenCV Linux installation guide](https://docs.opencv.org/4.x/d7/d9f/tutorial_linux_install.html)
+[OpenCV Linux installation guide](https://docs.opencv.org/5.x/d7/d9f/tutorial_linux_install.html)
 for general prerequisites. Record the actual driver and loaded libraries when
 validating a build.
 

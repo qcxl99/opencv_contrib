@@ -90,4 +90,4 @@ warmed public calls with stream completion. Native CUDA comparisons are off by
 default. To include them, set `TRITON_PERF_WITH_NATIVE_BASELINE=ON` and build
 `cudawarping` and `cudaimgproc`; these are perf-only dependencies. See the
 [performance test commands](doc/validation.markdown#performance-tests).
-The [HIP graph helper](perf/hip/GRAPH.md) measures replay separately.
+The [HIP graph helper](doc/hip_graph.markdown) measures replay separately.

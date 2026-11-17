@@ -35,7 +35,7 @@ all implementations as interchangeable.
 The reference is the generic OpenCV 5.0.0 CPU resize algorithm with 128-bit SIMD,
 without FMA, IPP or HAL substitutions. `CV_8U` output is bit-exact against this
 reference. `CV_32F` accuracy checks use the fixed absolute bounds in
-[validation/numerics.hpp](https://github.com/qcxl99/opencv_contrib/blob/361d52c05c7cc35a92fefa4e5b3bdf23374c79ab/modules/triton/validation/numerics.hpp).
+[numerical validation criteria][resize-numerics] (`validation/numerics.hpp`).
 Those bounds were calibrated on a finite set with `abs(input) <= 2`; they are not
 a universal error proof for other amplitudes or arithmetic environments. This is
 a test-evidence boundary, not a new production API input-amplitude restriction.
@@ -83,6 +83,7 @@ cv::triton::releaseGraphResources().
 <!--
 @cond
 -->
+[resize-numerics]: ../validation/numerics.hpp
 [triton-api]: ../include/opencv2/triton.hpp
 [cuda-setup]: ../tutorials/cuda_setup.markdown
 [hip-setup]: ../tutorials/hip_setup.markdown
@@ -90,6 +91,7 @@ cv::triton::releaseGraphResources().
 [runtime-architecture]: maintenance.markdown#architecture
 <!--
 @endcond
+[resize-numerics]: @ref tutorial_triton_validation
 [triton-api]: @ref triton
 [cuda-setup]: @ref tutorial_triton_cuda_first_use
 [hip-setup]: @ref tutorial_triton_hip_first_use
