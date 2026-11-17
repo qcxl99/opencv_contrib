@@ -63,6 +63,16 @@ if(IOS OR WINRT OR WIN32 OR APPLE OR _triton_backend STREQUAL "none")
 endif()
 message(STATUS "triton: backend ${_triton_backend}")
 
+option(TRITON_PERF_WITH_NATIVE_BASELINE "Build native CUDA comparisons into opencv_perf_triton" OFF)
+if(TRITON_PERF_WITH_NATIVE_BASELINE)
+  if(NOT BUILD_PERF_TESTS)
+    message(FATAL_ERROR "triton: TRITON_PERF_WITH_NATIVE_BASELINE requires BUILD_PERF_TESTS=ON")
+  endif()
+  if(NOT _triton_backend STREQUAL "cuda")
+    message(FATAL_ERROR "triton: TRITON_PERF_WITH_NATIVE_BASELINE currently requires the CUDA backend")
+  endif()
+endif()
+
 # The interpreter the compile helper runs under, and the PYTHONPATH that makes `import triton`
 # work for it. Distinct from PYTHON3_EXECUTABLE (the Python bindings' interpreter), though it
 # defaults to it. Both can be overridden at run time (OPENCV_TRITON_PYTHON[PATH]).
@@ -232,27 +242,24 @@ if(_triton_backend STREQUAL "cuda")
                                        "${CMAKE_CURRENT_LIST_DIR}/perf/*.hpp")
   ocv_add_perf_tests(FILES "Src" ${_triton_common_perf_sources})
   ocv_add_samples()
-  # Native CUDA comparisons are optional performance-test dependencies.
-  # Check each module independently during OpenCV discovery, before targets exist.
-  if(TARGET opencv_perf_triton)
-    ocv_check_dependencies(opencv_cudawarping)
-    if(OCV_DEPENDENCIES_FOUND)
-      ocv_target_include_modules(opencv_perf_triton opencv_cudawarping)
-      ocv_target_link_libraries(opencv_perf_triton LINK_PRIVATE opencv_cudawarping)
-      target_compile_definitions(opencv_perf_triton PRIVATE OPENCV_TRITON_PERF_HAVE_CUDAWARPING=1)
-    else()
-      message(STATUS "triton: opencv_cudawarping not built -- the native CUDA resize baseline "
-                     "in perf/ is omitted; the module itself is unaffected")
+  # Native comparisons are an explicit perf-only dependency, never auto-discovered.
+  if(TRITON_PERF_WITH_NATIVE_BASELINE)
+    if(NOT TARGET opencv_perf_triton)
+      message(FATAL_ERROR "triton: native baselines requested, but opencv_perf_triton is not selected; "
+                          "check BUILD_PERF_TESTS and OPENCV_BUILD_PERF_TEST_MODULES_LIST")
     endif()
-    ocv_check_dependencies(opencv_cudaimgproc)
-    if(OCV_DEPENDENCIES_FOUND)
-      ocv_target_include_modules(opencv_perf_triton opencv_cudaimgproc)
-      ocv_target_link_libraries(opencv_perf_triton LINK_PRIVATE opencv_cudaimgproc)
-      target_compile_definitions(opencv_perf_triton PRIVATE OPENCV_TRITON_PERF_HAVE_CUDAIMGPROC=1)
-    else()
-      message(STATUS "triton: opencv_cudaimgproc not built -- the native CUDA cvtColor baseline "
-                     "in perf/ is omitted; the module itself is unaffected")
+    ocv_check_dependencies(opencv_cudawarping opencv_cudaimgproc)
+    if(NOT OCV_DEPENDENCIES_FOUND)
+      message(FATAL_ERROR "triton: native baselines require opencv_cudawarping and opencv_cudaimgproc; "
+                          "include cudawarping,cudaimgproc in BUILD_LIST")
     endif()
+    target_sources(opencv_perf_triton PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/perf/baseline/native_cuda_resize.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/perf/baseline/native_cuda_cvtcolor.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/perf/baseline/native_cuda_warpaffine.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/perf/baseline/native_cuda_precomp.hpp")
+    ocv_target_include_modules(opencv_perf_triton opencv_cudawarping opencv_cudaimgproc)
+    ocv_target_link_libraries(opencv_perf_triton LINK_PRIVATE opencv_cudawarping opencv_cudaimgproc)
   endif()
   foreach(_t opencv_test_triton opencv_perf_triton)
     if(TARGET ${_t})

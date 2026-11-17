@@ -34,8 +34,12 @@ all implementations as interchangeable.
 
 The reference is the generic OpenCV 5.0.0 CPU resize algorithm with 128-bit SIMD,
 without FMA, IPP or HAL substitutions. `CV_8U` output is bit-exact against this
-reference. `CV_32F` comparisons allow float32 rounding error according to the
-operation-specific bounds in the accuracy tests. Tests use a portable CPU
+reference. `CV_32F` accuracy checks use the fixed absolute bounds in
+[validation/numerics.hpp](https://github.com/qcxl99/opencv_contrib/blob/361d52c05c7cc35a92fefa4e5b3bdf23374c79ab/modules/triton/validation/numerics.hpp).
+Those bounds were calibrated on a finite set with `abs(input) <= 2`; they are not
+a universal error proof for other amplitudes or arithmetic environments. This is
+a test-evidence boundary, not a new production API input-amplitude restriction.
+Tests use a portable CPU
 implementation in the test sources so that host-library dispatch choices do
 not change their expected output.
 

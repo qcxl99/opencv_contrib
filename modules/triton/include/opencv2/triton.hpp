@@ -42,9 +42,17 @@ CV_EXPORTS_W bool haveBackend();
 /** @brief Name of the active backend, or an empty string if none. */
 CV_EXPORTS_W String backendName();
 
-/** @brief Release kernel and table resources retained by captured graphs.
- * Call only after all graphs using this module are destroyed or cannot be replayed.
- * This function is thread-safe.
+/** @brief Release all capture holds maintained by this loaded module's backend runtime.
+ *
+ * Caller preconditions: stop related captures, replays and concurrent submissions;
+ * confirm all submitted replays complete through their streams/events; then destroy
+ * or permanently disable every related graph executable before calling this function.
+ * Destroying a graph template does not disable its executables; destroying an executable
+ * does not establish completion of its in-flight work.
+ *
+ * Holds are process-local to this loaded runtime and shared across its threads/contexts,
+ * not selected by graph or current context. Internal locking does not coordinate callers
+ * or provide a GPU completion fence. See @ref triton_graph_release for the full contract.
  */
 CV_EXPORTS_W void releaseGraphResources();
 

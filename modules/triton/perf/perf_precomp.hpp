@@ -7,18 +7,5 @@
 #include "opencv2/ts.hpp"
 #include "opencv2/ts/ts_perf.hpp"
 #include "../validation/device.hpp"
-#if defined(OPENCV_TRITON_PERF_HAVE_CUDAWARPING) || defined(OPENCV_TRITON_PERF_HAVE_CUDAIMGPROC)
-#include "opencv2/ts/cuda_perf.hpp"
-#endif
 #include "opencv2/imgproc.hpp"
-
-// Native CUDA resize and warpAffine comparisons require the optional cudawarping module.
-#ifdef OPENCV_TRITON_PERF_HAVE_CUDAWARPING
-#include "opencv2/cudawarping.hpp"
-#endif
-// cv::cuda::cvtColor lives in cudaimgproc, a separate optional dependency of perf/ with its
-// own guard: a build may have either, both or neither.
-#ifdef OPENCV_TRITON_PERF_HAVE_CUDAIMGPROC
-#include "opencv2/cudaimgproc.hpp"
-#endif
 #endif

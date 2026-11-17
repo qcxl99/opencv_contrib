@@ -86,6 +86,8 @@ Buildable examples are [resize](samples/resize.cpp), [cvtColor](samples/cvtcolor
 [warpAffine](samples/warpaffine.cpp) and the [HIP device-buffer sample](samples/hip/device.cpp).
 Enable `BUILD_EXAMPLES`, `BUILD_TESTS` and `BUILD_PERF_TESTS` as needed.
 `opencv_test_triton` runs accuracy/runtime checks; `opencv_perf_triton` measures
-warmed public calls with stream completion. Optional native CUDA comparisons
-require `cudawarping` and `cudaimgproc`, not production dependencies.
+warmed public calls with stream completion. Native CUDA comparisons are off by
+default. To include them, set `TRITON_PERF_WITH_NATIVE_BASELINE=ON` and build
+`cudawarping` and `cudaimgproc`; these are perf-only dependencies. See the
+[performance test commands](doc/validation.markdown#performance-tests).
 The [HIP graph helper](perf/hip/GRAPH.md) measures replay separately.

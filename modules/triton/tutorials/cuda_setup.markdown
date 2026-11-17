@@ -29,7 +29,7 @@ python3 -m venv <venv>
 cmake -S <opencv> -B <build> -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=<install> \
   -DOPENCV_EXTRA_MODULES_PATH=<opencv_contrib>/modules \
-  -DBUILD_LIST=core,imgproc,imgcodecs,triton,python3,python_bindings_generator,ts \
+  -DBUILD_LIST=core,imgproc,imgcodecs,cudev,triton,python3,python_bindings_generator,ts \
   -DBUILD_opencv_triton=ON -DTRITON_BACKEND=cuda -DWITH_CUDA=ON \
   -DCUDA_TOOLKIT_ROOT_DIR=<cuda-toolkit> \
   -DCUDA_ARCH_BIN=<compute-capability> -DCUDA_ARCH_PTX= \
@@ -47,18 +47,59 @@ Python headers/library and module list. `TRITON_PYTHONPATH` is optional if the
 compiler interpreter already imports the intended Triton package. Kernels are
 compiled on first use, rather than during the OpenCV build.
 
-`cudawarping` and `cudaimgproc` are optional native CUDA performance comparisons.
-Include them in `BUILD_LIST` to enable their available benchmark paths. They are
-not production dependencies of the Triton module.
+Native CUDA performance comparisons are disabled by default. To include them,
+set `TRITON_PERF_WITH_NATIVE_BASELINE=ON` with `BUILD_PERF_TESTS=ON`, and include
+both `cudawarping` and `cudaimgproc` in `BUILD_LIST`. They are perf-only, not
+production dependencies. With baselines enabled, an unfiltered
+`opencv_perf_triton` run executes both sets. The performance-test section in
+`doc/validation.markdown` lists the gtest filters for selecting one set.
+
+`cudev` is required by OpenCV's CUDA build. It provides CUDA template support
+and is unrelated to cuBLAS or cuFFT. `BUILD_LIST` is an allowlist: setting
+`BUILD_opencv_cudawarping=ON` or `BUILD_opencv_cudaimgproc=ON` alone does not
+select a module excluded from that list. Confirm the final `To be built` list
+and the registered native perf tests before claiming a comparison.
+
+For a minimal toolkit without cuBLAS/cuFFT development headers, these three
+operations and their CUDA timing comparisons can be built with
+`-DWITH_CUBLAS=OFF -DWITH_CUFFT=OFF`. Keep `cudev` enabled. These switches disable
+BLAS/FFT functionality elsewhere; they do not disable NPP or Triton.
+
+If the Python summary has `Libraries: NO`, no NumPy path, or `python3` is absent
+from `To be built`, stop before building. Install matching Python development
+files, or pass the selected interpreter's paths explicitly:
+
+```sh
+<venv>/bin/python -c 'import sysconfig, numpy; print(sysconfig.get_path("include")); print(sysconfig.get_config_var("LIBDIR") + "/" + sysconfig.get_config_var("LDLIBRARY")); print(numpy.get_include())'
+```
+
+Reconfigure with `-DPYTHON3_INCLUDE_DIR=<include>`,
+`-DPYTHON3_LIBRARY=<library>` and `-DPYTHON3_NUMPY_INCLUDE_DIRS=<numpy-include>`.
+If Python detection was cached before its dependencies were installed, clear
+only those cached results using `cmake -U 'PYTHON3*' -S OPENCV_SOURCE -B BUILD_DIR`
+**together with all the Python selection arguments above**, then inspect the
+summary again. Do not substitute another installation's `cv2` for missing bindings.
 
 Use the installed module
 ------------------------
 
 Select the installed OpenCV library and Python paths for the local installation
-layout. Check `cv2.__file__`, the loaded native extension path and
+layout. For the layout shown by CMake above, for example:
+
+```sh
+export CUDA_VISIBLE_DEVICES=<available-physical-device>
+export LD_LIBRARY_PATH=<install>/lib:${LD_LIBRARY_PATH:-}
+export PYTHONPATH=<install>/lib/python3.12/site-packages:${PYTHONPATH:-}
+export OPENCV_TRITON_CACHE_DIR=<writable-cache>
+```
+
+Use your interpreter's actual `python3.X` directory, not another Python version.
+Repeat these exports in a new terminal. For an installation check, leave
+`OPENCV_TRITON_RESOURCES` unset and use the installed `cv2`. Check
+`cv2.__file__`, the loaded native extension path and
 `cv2.getBuildInformation()` to avoid importing another OpenCV installation.
-Select an available device before running applications, for example with
-`CUDA_VISIBLE_DEVICES`.
+When using OpenCV's package loader, `cv2._native.__file__` identifies the native
+extension as well as `cv2.__file__` identifying the loader.
 
 The examples use public GpuMat calls and explicit streams:
 
@@ -103,21 +144,83 @@ Tests and performance
 ```
 
 The Python tests use OpenCV's test helpers; add
-`<opencv>/modules/python/test` to `PYTHONPATH` as needed. Standard OpenCV
-list/filter/XML options select test cases. Review actual failures and skips,
-including tests requiring a second device. Performance workloads can be chosen
-with `--gtest_filter`; warmed public-call timing includes submission and stream
+`<opencv>/modules/python/test` to `PYTHONPATH` as needed. Some CPU numerical
+checks intentionally skip when the linked OpenCV CPU build is not their fixed
+reference configuration. Review the skip reason and keep the same installed
+`cv2`. Standard OpenCV list/filter/XML options select test cases. Review actual failures and skips,
+including tests requiring a second device. To check perf wiring without running
+the entire performance matrix, run one representative case from each operation:
+
+```sh
+<build>/bin/opencv_perf_triton \
+  --gtest_filter='*TritonResize.TritonResize/0:*TritonCvtColor.TritonCvtColor/0:*TritonWarpAffine.TritonWarpAffine/0' \
+  --perf_min_samples=10 --perf_force_samples=10 --gtest_output=xml:perf-smoke.xml
+```
+
+This checks test wiring only. Select performance workloads with
+`--gtest_filter`; warmed public-call timing includes submission and stream
 completion. It is distinct from isolated kernel or graph replay timing.
 
 Installation and cache checks
 -----------------------------
 
-Use the installed headers with `find_package(OpenCV REQUIRED COMPONENTS core imgproc triton)`
-in an independent C++ consumer. Check the selected Python extension and loaded
-OpenCV libraries, including after moving an installation to a different prefix.
+Use the installed headers in an independent C++ consumer. Check the selected
+Python extension and loaded libraries after moving an installation prefix.
 
 Follow @ref triton_runtime_toolchain for separate empty-cache, persisted-cache
 without compiler, and empty-cache without compiler checks. See
 @ref tutorial_triton_validation for accuracy/performance scope and evidence
 requirements. Save results with the actual machine, device, driver, toolkit,
 compiler and source/artifact identities; this tutorial does not certify them.
+
+For example, save the following as `consumer/main.cpp`:
+
+```cpp
+#include <opencv2/triton.hpp>
+#include <opencv2/core.hpp>
+#include <iostream>
+
+int main()
+{
+    if (!cv::triton::haveBackend()) return 1;
+    cv::Mat host(96, 128, CV_8UC3, cv::Scalar(64, 128, 192));
+    cv::cuda::GpuMat src(host), dst;
+    cv::cuda::Stream stream;
+    cv::triton::resize(src, dst, cv::Size(64, 48), 0, 0,
+                       cv::INTER_LINEAR, stream);
+    stream.waitForCompletion();
+    cv::Mat result;
+    dst.download(result);
+    std::cout << result.size() << "\n";
+    return result.size() == cv::Size(64, 48) ? 0 : 2;
+}
+```
+
+Save this as `consumer/CMakeLists.txt`:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(triton_consumer LANGUAGES CXX)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc triton)
+add_executable(triton_consumer main.cpp)
+target_include_directories(triton_consumer PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(triton_consumer PRIVATE ${OpenCV_LIBS})
+```
+
+Build against the installed package, with the environment exports above:
+
+```sh
+cmake -S consumer -B consumer-build -G Ninja \
+  -DOpenCV_DIR=<install>/lib/cmake/opencv5
+cmake --build consumer-build --parallel
+OPENCV_TRITON_CACHE_DIR=<new-empty-cache> consumer-build/triton_consumer
+OPENCV_TRITON_CACHE_DIR=<new-empty-cache> \
+  OPENCV_TRITON_PYTHON=/nonexistent/triton-python consumer-build/triton_consumer
+```
+
+The second command uses the same persisted cache in a new process and must
+succeed without the compiler interpreter. Repeat with a **different** empty
+cache and the nonexistent interpreter to verify a visible `toolchain_unavailable`
+exception. That last command is expected to exit with an error, not succeed or
+silently fall back. These checks exercise the module artifact cache; they do not
+measure a fully cold compiler cache.

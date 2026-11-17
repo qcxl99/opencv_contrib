@@ -98,13 +98,14 @@ CV_EXPORTS void resetRuntimeStats();
 CV_EXPORTS void setCacheLimits(int modules, int tables);
 /** Observe completed launches now (normally done at every call). */
 CV_EXPORTS void reapCompleted();
-/** Release the resources pinned for captured graphs.
- *
- * A graph recorded from a capturing stream is launched later, possibly after its module and
- * tables would have been evicted, so the runtime pins them at capture time. CUDA does not
- * notify when the caller destroys a graph, so the pin is released here instead: call this once
- * the graphs you captured are destroyed or no longer used. Returning them early and then
- * launching a graph that reads them is use-after-free, which no API can detect for you. */
+/** Release all capture holds across this loaded runtime's contexts and host threads.
+ * Caller coordination and completion are required: stop new related capture/replay/
+ * submissions, wait for all submitted replays on their streams/events, then destroy or
+ * permanently disable related graph executables. Neither template nor executable
+ * destruction is a completion fence. This is not a per-graph/current-context release.
+ * See cv::triton::releaseGraphResources() and doc/maintenance.markdown, Graph resources.
+ * Internal locking protects bookkeeping only; this function does not establish GPU completion.
+ */
 CV_EXPORTS void releaseCapturePins();
 /** Fill newly allocated table buffers with 0xFF before the upload, so a launch that read a
  *  table before its upload completed produces garbage instead of plausible numbers. */

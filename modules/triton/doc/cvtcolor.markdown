@@ -94,9 +94,9 @@ catchable `StsNotImplemented` on HIP, including default/`None` streams.
 Callers retain images and order producers and consumers; the runtime retains
 its modules and lookup tables. See [resource lifetime][resource-cleanup].
 
-Warm operations support graph capture. After all graphs using these resources
-are destroyed or will never be replayed again, call
-cv::triton::releaseGraphResources() as documented in the API reference.
+Warm operations support graph capture. Follow the shared [Graph resources][graph-release]
+contract before releasing capture holds; this includes completion and coordination
+across all participating threads and contexts.
 
 Accuracy tests cover every admitted code/depth pair, boundary colours, short
 axes and SIMD/block-boundary widths, pitched ROIs, output guards, refusals and
@@ -238,9 +238,11 @@ also accepted; aliases do not add conversions. Depth support is specific to each
 @cond
 -->
 [resource-cleanup]: maintenance.markdown#cleanup
+[graph-release]: maintenance.markdown#graph-release
 <!--
 @endcond
 [resource-cleanup]: @ref cleanup
+[graph-release]: @ref triton_graph_release
 @cond
 -->
 <!-- @endcond -->

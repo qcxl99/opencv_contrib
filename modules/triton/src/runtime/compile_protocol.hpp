@@ -76,12 +76,15 @@ struct CompileOutcome {
     std::string kind;                          // compiled | cached | timeout | helper_crashed | bad_response | <helper error kind>
     std::string response;                      // raw response text (may be empty)
     std::string artifact_dir;
-    int exit_code = 0;                         // child exit status, or -signal
+    int exit_code = 0;                         // child exit status, -signal, or INT_MIN if unavailable
 };
 
-// Runs the helper in its own process group with the request on stdin. Past the deadline the
-// whole group is killed (SIGKILL); a killed or crashed helper leaves at most a temporary
-// directory, which no reader treats as an artifact. The response is verified (protocol,
+// Runs the helper in its own process group with --request <file>; stdin is /dev/null.
+// One monotonic deadline covers stdout and child exit independently. Timeout kills the
+// whole group (SIGKILL), then allows at most one second to confirm reap; an unconfirmed
+// reap reports helper_cleanup_failed, never a successful timeout recovery. A killed or
+// crashed helper can leave a temporary directory that no reader accepts. The response
+// is verified (protocol,
 // request_sha256, key_digest, manifest_sha256) and so is the artifact before success.
 CompileOutcome compile_key(const HelperCommand& cmd, const KernelKey& key, const std::string& source_path,
                            const std::string& cache_dir);

@@ -121,6 +121,45 @@ exercise backend queries and the explicitly unsupported GpuMat operations;
 no HIP Python device-buffer wrapper is advertised. Separate positive, refusal,
 platform skip, missing data and zero-test results.
 
+<a id="performance-tests"></a>
+Performance tests
+-----------------
+
+By default, `opencv_perf_triton` registers only Triton tests on either backend.
+Native CUDA comparisons require an explicit opt-in during configuration:
+
+```sh
+cmake -S "$OPENCV_SRC" -B "$BUILD_ENABLED" \
+  -DBUILD_PERF_TESTS=ON -DTRITON_PERF_WITH_NATIVE_BASELINE=ON
+```
+
+Keep the backend/tutorial configuration arguments and include `cudawarping` and
+`cudaimgproc` in `BUILD_LIST` when using that allowlist. This option requires the
+CUDA backend, both native modules and a selected `opencv_perf_triton` target;
+incompatible or incomplete requests fail configuration. It adds no production
+module dependency. HIP graph replay remains a separate, default-off tool.
+
+After rebuilding, the same executable provides two independently selectable sets:
+
+```sh
+"$BUILD_ENABLED/bin/opencv_perf_triton" --gtest_filter='*Triton*'
+"$BUILD_ENABLED/bin/opencv_perf_triton" --gtest_filter='*NativeCuda*'
+```
+
+With baselines compiled in, an unfiltered run executes **both** sets. List tests
+first when selecting a subset; a filter matching zero tests is not validation.
+To return to Triton-only builds, configure
+`-DTRITON_PERF_WITH_NATIVE_BASELINE=OFF` and rebuild.
+
+The comparable rows share geometry/type/mode definitions, preallocated output,
+20 warmup calls and explicit non-default streams. Each timed iteration includes
+the public call and stream completion. Native cvtColor rows cover their named
+four-code subset; extended Triton rows and AREA/TRANSPARENT affine cases have
+no corresponding native rows here. Sampling and rounding may differ between
+implementations. These are public-call timings, not isolated kernel or graph
+measurements, and they do not establish numerical equivalence. Record workload,
+source/toolchain/device identity and raw timings alongside comparisons.
+
 <a id="installed-application-checks"></a>
 Installed application checks
 ----------------------------

@@ -81,8 +81,8 @@ Size-dependent tables are built in C++, uploaded on the caller's stream and
 cached. Cross-stream consumers wait on upload events. In-flight calls retain
 modules, tables and upload staging bytes even after cache eviction. Warm calls
 can be captured on a stream where compilation, module loads and table uploads
-are already complete. After all graphs using these resources are destroyed or
-cannot be replayed, call cv::triton::releaseGraphResources().
+are already complete. Release captured resources only under the
+[Graph resources](#graph-release) coordination and completion rules below.
 
 <a id="cleanup"></a>
 Asynchronous cleanup and context ownership
@@ -131,6 +131,40 @@ Primary-context ownership follows these rules:
   adds identity metadata, not another retain.
 - Static teardown does not release the owner after the driver may be gone.
   Arbitrary primary-context resets and private contexts are unsupported by this fallback.
+
+<a id="graph-release"></a>
+Graph resources {#triton_graph_release}
+--------------------------------------
+
+`releaseGraphResources()` drops **all capture holds maintained by this loaded
+module's selected backend runtime**, across its host threads and recorded
+contexts. It has no graph argument and is not scoped to the calling thread,
+current context or one graph. Other independently loaded runtimes and caller
+image storage have separate ownership.
+
+The application coordinates this sequence across every participating thread:
+
+1. Stop new related capture, replay and concurrent operator submissions.
+2. Confirm every submitted related replay has completed on its actual stream,
+   or through an event ordered after it. Waiting on an unrelated stream is insufficient.
+3. Destroy or permanently disable all related graph executables, preventing future replay.
+4. Call `cv::triton::releaseGraphResources()` while that coordination remains in effect.
+
+Destroying the graph template used for instantiation does not disable its
+executables. Destroying an executable is also not evidence that its submitted
+GPU work has completed. The runtime does not track those executable handles.
+Its mutex protects capture-hold bookkeeping; it does not stop another thread
+from capturing or submitting again, and the release call is not a completion
+fence. Driver resource destruction may itself block, but that is not a substitute
+for the explicit completion check above. Normal submission adds no new global
+synchronization for this contract.
+
+Backend API references: CUDA Driver API 12.8.1,
+[`cuGraphDestroy` and `cuGraphExecDestroy`](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-driver-api/group__CUDA__GRAPH.html);
+HIP 7.2.0,
+[`hipGraphDestroy` and `hipGraphExecDestroy`](https://rocm.docs.amd.com/projects/HIP/en/docs-7.2.0/reference/hip_runtime_api/modules/graph_management.html).
+The application must satisfy the module's completion/ownership preconditions
+rather than infer them from a destroy call returning.
 
 <a id="runtime-toolchain"></a>
 Runtime compiler, ABI and cache {#triton_runtime_toolchain}
@@ -231,11 +265,15 @@ definitions. Check ordinary and world shared/static linking after changing this
 boundary. The plan's no-contraction option is source-local, so a world build
 does not change imgproc's floating-point compilation.
 
-`opencv_perf_triton` measures warmed public calls with stream completion.
-Generated performance sanity data checks repeatability; independent accuracy
-tests check numerical behavior. Native CUDA comparison modules are optional
-and do not alter production dependencies. Preserve comparable inputs, devices
-and timing boundaries when reporting performance.
+`opencv_perf_triton` measures warmed public calls with stream completion on an
+explicit non-default stream. Generated sanity data checks repeatability;
+independent accuracy tests check numerical behavior. Triton cases live in
+`perf/perf_*.cpp`; optional native CUDA cases and their SDK headers live in
+`perf/baseline/`. Both use the workload definitions in `perf/perf_cases.hpp`.
+The baseline sources and CUDA comparison dependencies are excluded unless
+`TRITON_PERF_WITH_NATIVE_BASELINE=ON`. The same executable then contains both
+sets; use the filters in the validation guide to select one. Preserve comparable
+inputs, devices and timing boundaries when reporting performance.
 
 For deployment/cache checks, use [runtime compilation and cache](#runtime-toolchain) and the backend
 tutorials. Backend launch defaults and specialized layout guards are shared where

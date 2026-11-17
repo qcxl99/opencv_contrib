@@ -9,42 +9,13 @@
 // Public submission and stream completion are included. Host overhead can
 // dominate short operations; these rows are not isolated kernel timings.
 
-#include "perf_precomp.hpp"
+#include "perf_cases.hpp"
 
 namespace opencv_test { namespace {
 
-typedef ::perf::TestBaseWithParam<testing::tuple<cv::Size, int, int, int>> Sz_Interp_Dtype;
-
-// Three representative geometries: identity, half-pixel translation and rotation/scale.
-// They vary coordinate weights and source access patterns without claiming a measured
-// bandwidth/instruction bottleneck or exhaustive transform coverage.
-struct WaGeometry
-{
-    const char* name;
-    double M[6];
-};
-
-static const WaGeometry kGeoms[] = {
-    {"identity",  {1.0, 0.0, 0.0, 0.0, 1.0, 0.0}},
-    {"subpixel",  {1.0, 0.0, 0.5, 0.0, 1.0, 0.5}},
-    {"rot_scale", {0.9, -0.43589, 40.0, 0.43589, 0.9, -20.0}},
-};
-
-static cv::Mat toMat(const double m[6])
-{
-    cv::Mat M(2, 3, CV_64F);
-    for (int i = 0; i < 6; ++i)
-        M.at<double>(i / 3, i % 3) = m[i];
-    return M;
-}
-
 // Typed so a 16-bit row is visible in the output name; the depth is one value per run rather
 // than a range, because a perf row should answer one question.
-PERF_TEST_P(Sz_Interp_Dtype, TritonWarpAffine, testing::Combine(
-    testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
-    testing::Values(0, 1, 2),          // index into kGeoms; this numeric index appears in output
-    testing::Values(CV_8U, CV_16U, CV_32F),
-    testing::Values((int)cv::INTER_NEAREST, (int)cv::INTER_LINEAR, (int)cv::INTER_CUBIC)))
+PERF_TEST_P(Sz_Interp_Dtype, TritonWarpAffine, warpPerfCases())
 {
     const cv::Size size = GET_PARAM(0);
     const int geom      = GET_PARAM(1);
@@ -56,10 +27,10 @@ PERF_TEST_P(Sz_Interp_Dtype, TritonWarpAffine, testing::Combine(
     const int type = CV_MAKETYPE(depth, 3);
     cv::Mat host(size, type);
     declare.in(host, WARMUP_RNG);
-    const cv::Mat M = toMat(kGeoms[geom].M);
+    const cv::Mat M = warpPerfMatrix(geom);
 
     triton_validation::Image src; src.upload(host);
-    triton_validation::Stream stream(true);
+    triton_validation::Stream stream; // explicit non-default stream
     triton_validation::Image dst(size, type);   // preallocated: reused, excluded from the cycle
 
     for (int i = 0; i < 20; ++i)
@@ -94,9 +65,9 @@ PERF_TEST_P(Sz_Interp_Border_Type, TritonWarpAffineAreaTransparent, testing::Com
 
     cv::Mat host(size, type);
     declare.in(host, WARMUP_RNG);
-    const cv::Mat M = toMat(kGeoms[2].M);
+    const cv::Mat M = warpPerfMatrix(2);
     triton_validation::Image src; src.upload(host);
-    triton_validation::Stream stream(true);
+    triton_validation::Stream stream; // explicit non-default stream
     triton_validation::Image dst; dst.upload(host);
     for (int i = 0; i < 20; ++i)
         triton_validation::warpAffine(src, dst, M, size, interp, border, cv::Scalar(), stream);
@@ -111,41 +82,5 @@ PERF_TEST_P(Sz_Interp_Border_Type, TritonWarpAffineAreaTransparent, testing::Com
     SANITY_CHECK(result, 1e-10);
 }
 
-#ifdef OPENCV_TRITON_PERF_HAVE_CUDAWARPING
-// The native implementation on the same card and harness. cudawarping is an OPTIONAL dependency
-// of perf/ only -- the module never uses it -- so a build without it omits this baseline.
-//
-// Call the native cv::cuda entry directly with the harness-owned GpuMat.
-PERF_TEST_P(Sz_Interp_Dtype, NativeCudaWarpAffine_Reference, testing::Combine(
-    testing::Values(cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160)),
-    testing::Values(0, 1, 2),
-    testing::Values(CV_8U, CV_16U, CV_32F),
-    testing::Values((int)cv::INTER_NEAREST, (int)cv::INTER_LINEAR, (int)cv::INTER_CUBIC)))
-{
-    const cv::Size size = GET_PARAM(0);
-    const int geom      = GET_PARAM(1);
-    const int depth     = GET_PARAM(2);
-
-    const int type = CV_MAKETYPE(depth, 3);
-    cv::Mat host(size, type);
-    declare.in(host, WARMUP_RNG);
-    const cv::Mat M = toMat(kGeoms[geom].M);
-
-    const cv::cuda::GpuMat src(host);
-    cv::cuda::GpuMat dst(size, type);
-
-    for (int i = 0; i < 20; ++i)
-        cv::cuda::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE);
-    cv::cuda::Stream::Null().waitForCompletion();
-
-    TEST_CYCLE()
-    {
-        cv::cuda::warpAffine(src, dst, M, size, GET_PARAM(3), cv::BORDER_REPLICATE);
-        cv::cuda::Stream::Null().waitForCompletion();
-    }
-
-    CUDA_SANITY_CHECK(dst, 1e-10);
-}
-#endif  // OPENCV_TRITON_PERF_HAVE_CUDAWARPING
 
 }} // namespace

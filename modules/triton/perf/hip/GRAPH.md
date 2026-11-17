@@ -1,4 +1,4 @@
-# Internal HIP graph metric
+# Internal HIP graph metric {#triton_hip_graph_metric}
 
 This optional helper measures warmed production `DeviceImage` calls captured
 repeatedly on one fixed nondefault stream. It uses production dispatch and

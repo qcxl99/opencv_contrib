@@ -16,17 +16,15 @@
 // Host submission overhead can dominate short operations. These public-call
 // timings do not isolate device execution time.
 
-#include "perf_precomp.hpp"
+#include "perf_cases.hpp"
 #include "../validation/cvtcolor_cases.hpp"
 #include "../validation/reference.hpp"
 
 namespace opencv_test { namespace {
 
-typedef ::perf::TestBaseWithParam<testing::tuple<cv::Size, int>> Sz_Code;
-
 // Seven selected codes with distinct cost structures; this is not coverage of every
 // supported code/depth. All candidate paths use the same private validation adapter on
-// each backend; the optional native reference below is specifically CUDA.
+// each backend; the optional native comparison in baseline/ is specifically CUDA.
 const int kCodes[] = {
     cv::COLOR_BGR2GRAY,
     cv::COLOR_BGRA2GRAY,
@@ -38,7 +36,7 @@ const int kCodes[] = {
 };
 
 PERF_TEST_P(Sz_Code, TritonCvtColor, testing::Combine(
-    testing::Values(cv::Size(640, 480), cv::Size(1920, 1080), cv::Size(3840, 2160)),
+    colorPerfSizes(),
     testing::ValuesIn(kCodes)))
 {
     const cv::Size size = GET_PARAM(0);
@@ -53,7 +51,7 @@ PERF_TEST_P(Sz_Code, TritonCvtColor, testing::Combine(
     declare.in(host, WARMUP_RNG);
 
     triton_validation::Image src; src.upload(host);
-    triton_validation::Stream stream(true);
+    triton_validation::Stream stream; // explicit non-default stream
     triton_validation::Image dst(size, CV_8UC(row->dcn));   // preallocated: reusable, excluded
 
     for (int i = 0; i < 20; ++i)
@@ -112,7 +110,7 @@ PERF_TEST_P(Sz_ExtendedCvt, TritonCvtColorExtended, testing::Combine(
     declare.in(host, WARMUP_RNG);
     triton_validation::Image src; src.upload(host);
     triton_validation::Image dst(size, CV_MAKETYPE(row->depth, row->dcn));
-    triton_validation::Stream stream(true);
+    triton_validation::Stream stream; // explicit non-default stream
     for (int i = 0; i < 20; ++i)
         triton_validation::cvtColor(src, dst, row->code, stream);
     stream.wait();
@@ -128,37 +126,5 @@ PERF_TEST_P(Sz_ExtendedCvt, TritonCvtColorExtended, testing::Combine(
     SANITY_CHECK(result, 1e-10);
 }
 
-#ifdef OPENCV_TRITON_PERF_HAVE_CUDAIMGPROC
-// The native implementation on the same card and harness. cudaimgproc is an OPTIONAL
-// dependency of perf/ only -- the module itself never uses it -- so a build without it simply
-// omits this baseline. The four selected codes form a comparison subset, not a complete
-// inventory of cv::cuda::cvtColor support. Codes absent here are not classified as unsupported.
-PERF_TEST_P(Sz_Code, NativeCudaCvtColor_Reference, testing::Combine(
-    testing::Values(cv::Size(640, 480), cv::Size(1920, 1080), cv::Size(3840, 2160)),
-    testing::Values((int)cv::COLOR_BGR2GRAY, (int)cv::COLOR_BGR2YUV,
-                    (int)cv::COLOR_BGR2YCrCb, (int)cv::COLOR_BGR2HSV)))
-{
-    const cv::Size size = GET_PARAM(0);
-    const int code      = GET_PARAM(1);
-
-    cv::Mat host(size, CV_8UC(3));
-    declare.in(host, WARMUP_RNG);
-
-    const cv::cuda::GpuMat src(host);
-    cv::cuda::GpuMat dst(size, CV_8UC(code == cv::COLOR_BGR2GRAY ? 1 : 3));
-
-    for (int i = 0; i < 20; ++i)
-        cv::cuda::cvtColor(src, dst, code);
-    cv::cuda::Stream::Null().waitForCompletion();
-
-    TEST_CYCLE()
-    {
-        cv::cuda::cvtColor(src, dst, code);
-        cv::cuda::Stream::Null().waitForCompletion();
-    }
-
-    CUDA_SANITY_CHECK(dst, 1e-10);
-}
-#endif  // OPENCV_TRITON_PERF_HAVE_CUDAIMGPROC
 
 }} // namespace

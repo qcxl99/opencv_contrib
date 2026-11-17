@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -538,32 +539,75 @@ CompileOutcome run_request(const HelperCommand& cmd, const std::string& request)
     ::setpgid(pid, pid);
     ::close(out[1]);
     std::string text;
-    bool timed_out = false;
+    bool timed_out = false, stdout_closed = false, reaped = false;
+    int st = 0, wait_error = 0, io_error = 0;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(cmd.timeout_s);
     char buf[4096];
-    while (true) {
-        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+    // Pipe EOF and child exit are independent. One monotonic deadline covers both,
+    // including descendants that inherit stdout after the direct helper exits.
+    while (!stdout_closed || !reaped) {
+        if (!reaped) {
+            const pid_t done = ::waitpid(pid, &st, WNOHANG);
+            if (done == pid) reaped = true;
+            else if (done < 0 && errno != EINTR) { wait_error = errno; break; }
+        }
+        if (stdout_closed && reaped) break;
+        const auto left = std::chrono::duration<double, std::milli>(deadline - std::chrono::steady_clock::now()).count();
         if (left <= 0) { timed_out = true; break; }
+        // After EOF there is no descriptor to wait on: sleep briefly between
+        // nonblocking exit checks rather than spinning or doing a blocking waitpid.
+        const int pause = static_cast<int>(std::min(left, stdout_closed ? 10.0 : 1000.0)) + 1;
         pollfd pf{out[0], POLLIN, 0};
-        const int r = ::poll(&pf, 1, static_cast<int>(std::min<long long>(left, 1000)));
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) continue;
+        const int result = ::poll(stdout_closed ? nullptr : &pf, stdout_closed ? 0 : 1, pause);
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            io_error = errno;
+            break;
+        }
+        if (result == 0 || stdout_closed) continue;
+        if (pf.revents & POLLNVAL) { io_error = EBADF; break; }
         const ssize_t n = ::read(out[0], buf, sizeof buf);
-        if (n <= 0) break;  // EOF: the helper closed stdout (exited)
-        text.append(buf, static_cast<std::size_t>(n));
+        if (n == 0) stdout_closed = true; // writer closed the pipe; it may still be running
+        else if (n > 0) text.append(buf, static_cast<std::size_t>(n));
+        else if (errno != EINTR) { io_error = errno; break; }
     }
-    if (timed_out) ::kill(-pid, SIGKILL);  // the whole group: the helper and anything it spawned (ptxas)
     ::close(out[0]);
-    int st = 0;
-    while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (timed_out || wait_error || io_error) {
+        // The group includes compiler descendants. Also kill the direct child if
+        // process-group creation failed. Do not signal a pid already reaped/reused.
+        if (wait_error != ECHILD) {
+            const int group_result = ::kill(-pid, SIGKILL);
+            if (group_result < 0 && !reaped) (void)::kill(pid, SIGKILL);
+        }
+        // SIGKILL normally permits immediate reap. Bound cleanup separately so an
+        // abnormal kernel/child-wait condition cannot turn a timeout into a hang.
+        const auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!reaped && wait_error != ECHILD && std::chrono::steady_clock::now() < cleanup_deadline) {
+            const pid_t done = ::waitpid(pid, &st, WNOHANG);
+            if (done == pid) { reaped = true; break; }
+            if (done < 0 && errno != EINTR) { wait_error = errno; break; }
+            (void)::poll(nullptr, 0, 10);
+        }
+    }
     ::unlink(req_path.c_str());
 
+    if (!reaped) {
+        CompileOutcome f = failed(Reason::CompileFailed, "helper_cleanup_failed",
+                                  "cannot confirm helper reap for pid " + std::to_string(pid) +
+                                  " within bounded cleanup (wait errno " + std::to_string(wait_error) + ")");
+        f.exit_code = INT_MIN; // no exit status was collected; do not report a successful exit
+        f.response = text;
+        return f;
+    }
     CompileOutcome o;
     o.exit_code = WIFEXITED(st) ? WEXITSTATUS(st) : -(WIFSIGNALED(st) ? WTERMSIG(st) : 0);
-    if (timed_out) {
-        o = failed(Reason::CompileTimeout, "timeout", "no response within " + std::to_string(cmd.timeout_s) + " s");
-        o.exit_code = -SIGKILL;
-        return o;
+    if (timed_out || wait_error || io_error) {
+        CompileOutcome f = timed_out
+            ? failed(Reason::CompileTimeout, "timeout", "helper output/exit deadline exceeded after " + std::to_string(cmd.timeout_s) + " s")
+            : failed(Reason::CompileFailed, "helper_wait_failed", "helper pipe/wait failed (errno " + std::to_string(wait_error ? wait_error : io_error) + ")");
+        f.exit_code = o.exit_code;
+        f.response = text;
+        return f;
     }
     if (o.exit_code == 127) return failed(Reason::ToolchainUnavailable, "toolchain_unavailable", "cannot execute " + cmd.python);
     // Compiler diagnostics may precede the response. The helper writes its JSON

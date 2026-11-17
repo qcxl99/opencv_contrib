@@ -11,6 +11,15 @@ Select the runtime and target
 
 Both configurations below use HIP-capable Triton 3.6.0. The compiler must support
 the actual target; its version string alone does not identify the backend.
+This tutorial assumes a compatible HIP compiler package is already prepared for
+the selected DTK/ROCm environment. It does not prescribe one generic pip package
+for every platform; record the installed distribution/source revision, installation
+source and import path in that machine's verification record.
+
+The current compile-key architecture field is an integer gfx suffix, such as
+936 or 1100. Targets containing letters, such as `gfx90a`, are rejected even if
+the installed compiler supports them. This module limitation is separate from
+the compiler's target support.
 
 | Configuration example | GPU target | Toolkit root | Context/stream admission |
 |---|---|---|---|
@@ -107,7 +116,7 @@ driver, loaded HIP library, compiler package, architecture and wave size. A BW10
 run does not validate W7900D or another ROCm installation. Record unavailable tools
 and unrun combinations explicitly; host guards are not GPU sanitizer coverage.
 
-The optional [HIP graph benchmark](../perf/hip/GRAPH.md) measures warmed replay
+The optional @ref triton_hip_graph_metric "HIP graph benchmark" measures warmed replay
 separately from ordinary calls. Any performance comparison needs an identified
 baseline on the same device and a declared timing boundary. A framework baseline
 with different numerical semantics is not the OpenCV correctness reference.
