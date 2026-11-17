@@ -164,10 +164,12 @@ Installation places resources under `share/opencv5/triton`, resolved relative
 to the module library. A disk-cache hit runs without the compiler interpreter;
 a cache miss with no usable compiler raises a toolchain error.
 
-The module and compiler have separate caches. Clearing
-`OPENCV_TRITON_CACHE_DIR` forces a module-cache miss, but the compiler can still
-reuse its own cached output. To measure compilation from scratch, also select
-an empty compiler cache and record both cache locations.
+The helper stores its private Triton compiler cache under
+`<OPENCV_TRITON_CACHE_DIR>/.triton`, alongside the verified module artifacts.
+Selecting a new empty module cache therefore starts with an empty compiler cache
+as well. Removing only a module artifact subdirectory can reuse `.triton` output.
+The helper overrides the parent process's `TRITON_CACHE_DIR`; record the module
+cache and its private compiler-cache path when measuring compilation.
 
 Static installations use the configured resource install prefix when the
 library-relative path is unavailable. Set `OPENCV_TRITON_RESOURCES` when relocating

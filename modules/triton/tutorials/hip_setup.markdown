@@ -52,7 +52,7 @@ cmake -S <opencv> -B <build> -G Ninja \
   -DPYTHON3_EXECUTABLE=<bindings-python> \
   -DBUILD_TESTS=ON -DBUILD_PERF_TESTS=ON -DBUILD_EXAMPLES=ON \
   -DINSTALL_C_EXAMPLES=ON
-cmake --build <build> --parallel 2
+cmake --build <build> --parallel
 cmake --install <build>
 ```
 
