@@ -1,5 +1,5 @@
 # Generated HIP warpaffine kernels; regenerate with tools/make_kernels_cpu_hip.py.
-# source_sha256: c20d55a8d91a4170705780573662cb11c0d00a06c8279a7a4153f6d0b769711c
+# source_sha256: e9258e1f642a711b42b04f312b40ddd77b66e462e002ea9b34189cbbec1d37f5
 # This file is part of OpenCV project.
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
@@ -429,3 +429,107 @@ def _warp_cubic(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst
             out = acc
         cstore = m & ~all_out if TRANSPARENT else m
         tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, out, mask=cstore)
+
+
+@triton.jit
+def _warp_nearest_packed4(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                          src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                          cn: tl.constexpr, BORDER: tl.constexpr, BORDER_X: tl.constexpr,
+                          BORDER_Y: tl.constexpr, FUSED: tl.constexpr, TRANSPARENT: tl.constexpr,
+                          BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    # The host admits only aligned uint8 C4 views. Reuse the exact nearest
+    # coordinate, border and transparent rules while copying one RGBA word.
+    tl.static_assert(cn == 4)
+    border = (bv0.to(tl.uint32) | (bv1.to(tl.uint32) << 8) |
+              (bv2.to(tl.uint32) << 16) | (bv3.to(tl.uint32) << 24))
+    _warp_nearest(src.to(tl.pointer_type(tl.uint32)), dst.to(tl.pointer_type(tl.uint32)),
+                  M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                  src_rs // 4, dst_rs // 4, border, bv1, bv2, bv3,
+                  cn=1, BORDER=BORDER, BORDER_X=BORDER_X, BORDER_Y=BORDER_Y,
+                  FUSED=FUSED, TRANSPARENT=TRANSPARENT, BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W)
+
+
+@triton.jit
+def _warp_linear_packed4(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                 src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                 cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
+                 BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                 BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr, FUSED: tl.constexpr,
+                 BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    ys = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)[:, None]
+    xs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)[None, :]
+    m = (ys < dst_h) & (xs < dst_w)
+
+    # static_cast<float>(y*M1 + M2): OpenCV's M[] is FLOAT, so the row term is
+    # float arithmetic rounded twice (multiply, add). Computing it in double and
+    # narrowing once moves the result by an ulp on ties, which a 0.5 tie turns
+    # into a whole output level.
+    yf = ys.to(tl.float32)
+    # mul_rn/add_rn rather than `a*b + c`: the compiler would contract that into
+    # one fma, and a single rounding here moves the row term by an ulp, which a
+    # 0.5 tie in the interpolation turns into a whole output level.
+    row_x = _triton_add_rn(_triton_mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
+    row_y = _triton_add_rn(_triton_mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
+    xf = xs.to(tl.float32)
+    sx, sy = _mapped_coord(xf, M00, M10, row_x, row_y, FUSED)
+
+    fx = tl.floor(sx)
+    fy = tl.floor(sy)
+    ax = sx - fx
+    ay = sy - fy
+    ix = fx.to(tl.int32)
+    iy = fy.to(tl.int32)
+    ix1 = ix + 1
+    iy1 = iy + 1
+
+    if BORDER == 0 or TRANSPARENT:
+        # whole neighbourhood outside -> border value; otherwise each tap that is
+        # outside alone takes the border value (CV_WARP_SCALAR_FETCH_PIXEL). TRANSPARENT uses the
+        # same in-range flags, but substitutes the OLD DESTINATION PIXEL for an out-of-range tap
+        # and leaves the weights unchanged (see the lstore comment below).
+        outside = (ix >= src_w) | (ix1 < 0) | (iy >= src_h) | (iy1 < 0)
+        in0 = (ix >= 0) & (ix < src_w)
+        in1 = (ix1 >= 0) & (ix1 < src_w)
+        jy0 = (iy >= 0) & (iy < src_h)
+        jy1 = (iy1 >= 0) & (iy1 < src_h)
+    else:
+        outside = m & False
+        in0 = m
+        in1 = m
+        jy0 = m
+        jy1 = m
+
+    # This first packed interpolation route admits replicate borders only;
+    # every other border retains the general implementation.
+    tl.static_assert(cn == 4 and U8 and BORDER == 1 and not TRANSPARENT)
+    src32 = src.to(tl.pointer_type(tl.uint32))
+    dst32 = dst.to(tl.pointer_type(tl.uint32))
+    cx0 = _bm(ix, src_w, BORDER_X)
+    cx1 = _bm(ix1, src_w, BORDER_X)
+    cy0 = _bm(iy, src_h, BORDER_Y)
+    cy1 = _bm(iy1, src_h, BORDER_Y)
+    row0 = cy0.to(tl.int64) * (src_rs // 4)
+    row1 = cy1.to(tl.int64) * (src_rs // 4)
+    word00 = tl.load(src32 + row0 + cx0, mask=m, other=0)
+    word01 = tl.load(src32 + row0 + cx1, mask=m, other=0)
+    word10 = tl.load(src32 + row1 + cx0, mask=m, other=0)
+    word11 = tl.load(src32 + row1 + cx1, mask=m, other=0)
+    packed = tl.zeros((BLOCK_H, BLOCK_W), tl.uint32)
+    for channel in tl.static_range(4):
+        shift = channel * 8
+        p00 = ((word00 >> shift) & 255).to(tl.float32)
+        p01 = ((word01 >> shift) & 255).to(tl.float32)
+        p10 = ((word10 >> shift) & 255).to(tl.float32)
+        p11 = ((word11 >> shift) & 255).to(tl.float32)
+        # Preserve the selected CPU's interpolation order and rounding.
+        v0 = _fma(ax, p01 - p00, p00, FUSED)
+        v1 = _fma(ax, p11 - p10, p10, FUSED)
+        value = _fma(ay, v1 - v0, v0, FUSED)
+        # Replicate interpolation combines bytes with weights in [0, 1].
+        # Even the float32 rounding error is far below half a byte level,
+        # so round-to-even already produces [0, 255]; integer clipping is redundant.
+        value = libdevice.float2int_rn(value).to(tl.uint32)
+        packed = packed | (value << shift)
+    tl.store(dst32 + ys.to(tl.int64) * (dst_rs // 4) + xs, packed, mask=m)

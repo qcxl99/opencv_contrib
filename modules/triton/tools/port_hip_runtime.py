@@ -159,6 +159,11 @@ sub('''    CUstreamCaptureStatus st = CU_STREAM_CAPTURE_STATUS_NONE;
 '''    hipStreamCaptureStatus st = hipStreamCaptureStatusNone;
     return hipStreamIsCapturing(stream, &st) == hipSuccess && st != hipStreamCaptureStatusNone;''', 1)
 
+# Keep HIP's checked DevInfo query and existing cache; CUDA's checked helper
+# has no HIP role. Restore the three query blocks before their normal translation.
+out = re.sub(r"// Validated CUDA target facts\..*?// End validated CUDA target facts\.\n\n", "", out, flags=re.S)
+out = out.replace('    int major = 0, minor = 0, warp = 32;\n    st = deviceAttributes(ex.ctx.device, major, minor, warp);\n    if (!st.ok())\n        return st;\n', '    CUdevice dev;\n    cuCtxGetDevice(&dev);\n    int major = 0, minor = 0, warp = 32;\n    cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);\n    cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);\n    cuDeviceGetAttribute(&warp, CU_DEVICE_ATTRIBUTE_WARP_SIZE, dev);\n')
+
 # ---- 5. target identity: three identical query blocks -> one cached device query --------
 tgt = re.compile(r'''    CUdevice dev;
     cuCtxGetDevice\(&dev\);
@@ -338,10 +343,11 @@ code_left = [t for t in left if t != "CUDA_VISIBLE_DEVICES" and
 if code_left:
     sys.exit(f"CUDA tokens left in code: {code_left}")
 
+# CUDA preparation remains gated by cuda-jit; HIP retains its own dispatch below.
 # HIP colour vectorization keeps the CUDA runtime's generic route unchanged.
-sub('''    std::sort(key.constexprs.begin(), key.constexprs.end());
-
-    std::shared_ptr<ModuleRes> mod = moduleFor(key, ctx, gen, st, c.cvt_kernels);''',
+sub('''
+    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);''',
 '''    const bool packed = dev.arch == 936 && !n.u16 && !n.f32 && n.cols >= 1024 && n.cols % 4 == 0 &&
         req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 &&
         req.src.step % 4 == 0 && req.dst.step % 4 == 0 &&
@@ -356,7 +362,8 @@ sub('''    std::sort(key.constexprs.begin(), key.constexprs.end());
     }
     std::sort(key.constexprs.begin(), key.constexprs.end());
 
-    std::shared_ptr<ModuleRes> mod = moduleFor(key, ctx, gen, st, c.cvt_kernels);''', 1)
+    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);''', 1)
 sub('''    cv_triton_color::grid(n, key.cfg.block_w, grid);''',
 '''    cv_triton_color::grid(n, key.cfg.block_w, grid);
     if (packed)

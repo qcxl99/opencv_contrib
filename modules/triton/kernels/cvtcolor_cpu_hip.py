@@ -1,5 +1,5 @@
 # Generated HIP cvtcolor kernels; regenerate with tools/make_kernels_cpu_hip.py.
-# source_sha256: 11459efd435000b9abf40f93c7d300f7fdfc653fe0058a51559af17d95652c02
+# source_sha256: d9d7dab7eb98385e6ee0ba8b6c75ee88e9aa90660166ff483149e35fda1eece5
 # This file is part of OpenCV project.
 # It is subject to the license terms in the LICENSE file found in the top-level directory
 # of this distribution and at http://opencv.org/license.html.
@@ -1031,6 +1031,49 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
         tl.store(dst + dp, h.to(tl.uint8), mask=m)
         tl.store(dst + dp + 1, s.to(tl.uint8), mask=m)
         tl.store(dst + dp + 2, v.to(tl.uint8), mask=m)
+
+
+@triton.jit(do_not_specialize=['src', 'dst', 'cols', 'src_rs', 'dst_rs'])
+def _cvtcolor_packed4(src, dst, cols, src_rs, dst_rs,
+                      BLOCK: tl.constexpr, CODE: tl.constexpr):
+    # Four pixels per lane. Host admission guarantees word-aligned rows and
+    # widths divisible by four, so no word touches padding or a neighboring row.
+    row = tl.program_id(0).to(tl.int64)
+    x = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = x < cols // 4
+    s = (src + row * src_rs).to(tl.pointer_type(tl.uint32))
+    d = (dst + row * dst_rs).to(tl.pointer_type(tl.uint32))
+    if CODE == 1:  # BGRA2BGR: four input words become three packed words.
+        a = tl.load(s + 4 * x, mask, 0)
+        b = tl.load(s + 4 * x + 1, mask, 0)
+        c = tl.load(s + 4 * x + 2, mask, 0)
+        e = tl.load(s + 4 * x + 3, mask, 0)
+        tl.store(d + 3 * x, (a & 0xffffff) | ((b & 255) << 24), mask)
+        tl.store(d + 3 * x + 1, ((b >> 8) & 65535) | ((c & 65535) << 16), mask)
+        tl.store(d + 3 * x + 2, ((c >> 16) & 255) | ((e & 0xffffff) << 8), mask)
+    else:
+        a = tl.load(s + 3 * x, mask, 0)
+        b = tl.load(s + 3 * x + 1, mask, 0)
+        c = tl.load(s + 3 * x + 2, mask, 0)
+        if CODE == 6:  # BGR2GRAY, CPU gray_shift=15 and its integer coefficients.
+            y0 = ((a & 255) * 3735 + ((a >> 8) & 255) * 19235 + ((a >> 16) & 255) * 9798 + 16384) >> 15
+            y1 = ((a >> 24) * 3735 + (b & 255) * 19235 + ((b >> 8) & 255) * 9798 + 16384) >> 15
+            y2 = (((b >> 16) & 255) * 3735 + (b >> 24) * 19235 + (c & 255) * 9798 + 16384) >> 15
+            y3 = (((c >> 8) & 255) * 3735 + ((c >> 16) & 255) * 19235 + (c >> 24) * 9798 + 16384) >> 15
+            tl.store(d + x, y0 | (y1 << 8) | (y2 << 16) | (y3 << 24), mask)
+        elif CODE == 0:  # BGR2BGRA, opaque alpha.
+            tl.store(d + 4 * x, (a & 0xffffff) | 0xff000000, mask)
+            tl.store(d + 4 * x + 1, (a >> 24) | ((b & 65535) << 8) | 0xff000000, mask)
+            tl.store(d + 4 * x + 2, (b >> 16) | ((c & 255) << 16) | 0xff000000, mask)
+            tl.store(d + 4 * x + 3, (c >> 8) | 0xff000000, mask)
+        else:  # BGR2RGB.
+            tl.static_assert(CODE == 4)
+            p0 = ((a >> 16) & 255) | (a & 0xff00) | ((a & 255) << 16) | ((b & 0xff00) << 16)
+            p1 = (b & 255) | ((a >> 24) << 8) | ((c & 255) << 16) | (b & 0xff000000)
+            p2 = ((b >> 16) & 255) | ((c >> 24) << 8) | (c & 0xff0000) | ((c & 0xff00) << 16)
+            tl.store(d + 3 * x, p0, mask)
+            tl.store(d + 3 * x + 1, p1, mask)
+            tl.store(d + 3 * x + 2, p2, mask)
 
 
 # HIP-specific aligned colour kernels.

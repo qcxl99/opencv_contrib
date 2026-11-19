@@ -4,6 +4,7 @@
 // Copyright 2026, The FlagOS Contributors.
 #include "precomp.hpp"
 #include "entry.hpp"
+#include <cstring>
 namespace cv
 {
 namespace triton
@@ -69,12 +70,22 @@ cv_triton_warp::Request warpRequest(const cv_triton_runtime::DeviceView &src, In
         CV_Error(Error::StsUnsupportedFormat, "cv::triton::warpAffine: unsupported flags");
     const Mat m = matrix.getMat();
     CV_Assert(m.rows == 2 && m.cols == 3 && (m.type() == CV_32F || m.type() == CV_64F));
-    Mat m64;
-    m.convertTo(m64, CV_64F);
     cv_triton_warp::Request request;
     request.src = src;
+    // Copy the six values directly, including pitched/non-contiguous matrices.
+    // memcpy also accepts unaligned caller storage without a temporary Mat.
     for (int i = 0; i < 6; ++i)
-        request.M[i] = m64.at<double>(i / 3, i % 3);
+    {
+        const unsigned char *row = m.ptr(i / 3);
+        if (m.type() == CV_64F)
+            std::memcpy(&request.M[i], row + (i % 3) * sizeof(double), sizeof(double));
+        else
+        {
+            float value;
+            std::memcpy(&value, row + (i % 3) * sizeof(float), sizeof(float));
+            request.M[i] = static_cast<double>(value);
+        }
+    }
     for (int i = 0; i < 4; ++i)
         request.border[i] = value[i];
     request.interpolation = flags & INTER_MAX;

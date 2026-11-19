@@ -463,10 +463,9 @@ TEST(Triton_Runtime, ArtifactIntegrity)
 // (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED). Reaping must avoid event queries and
 // completion-event recording while the caller's stream is capturing.
 //
-// The supported pattern is the one used here: warm on the stream you will capture on, so the
-// tables are already resident. Capturing on a stream that never saw the table upload still fails
-// (the capture cannot wait on an event recorded outside it) -- that is a documented limit, not
-// asserted here.
+// Warm on the stream you will capture on so the tables are resident and completed
+// uploads have been observed outside capture. A still-pending upload on another
+// stream cannot be imported from an external event during capture.
 // Capture, then evict everything, then replay: the graph must still read live memory.
 //
 // A graph recorded under capture refers to the module
@@ -482,6 +481,121 @@ TEST(Triton_Runtime, ArtifactIntegrity)
 // Change input and overwrite output between replays so an empty or inactive
 // graph cannot pass by retaining the warmup result. Release through the public
 // API, since applications cannot access private runtime resource functions.
+TEST(Triton_Runtime, CompletedTableUploadAcrossCaptureStreams)
+{
+    if (!ready())
+        throw SkipTestException("no Triton backend");
+    Restore restore;
+    const Size size(137, 103), resized(67, 53);
+    const Mat hostA = randomImage(size, CV_8UC3, 177);
+    const Mat hostB = randomImage(size, CV_8UC3, 178);
+    cuda::GpuMat src(hostA);
+    cuda::Stream upload(cudaStreamNonBlocking), capture(cudaStreamNonBlocking);
+    // Resize tables, color div/dummy tables, and the additional Lab family tables.
+    const int codes[] = {-1, COLOR_BGR2GRAY, COLOR_BGR2HSV, COLOR_BGR2Lab};
+    for (const int code : codes)
+    {
+        const Size outputSize = code < 0 ? resized : size;
+        const int outputType = code == COLOR_BGR2GRAY ? CV_8UC1 : CV_8UC3;
+        cuda::GpuMat dst(outputSize, outputType);
+        auto call = [&](cuda::Stream &stream)
+        {
+            if (code < 0)
+                cv::triton::resize(src, dst, resized, 0, 0, INTER_LINEAR, stream);
+            else
+                cv::triton::cvtColor(src, dst, code, stream);
+        };
+        src.upload(hostA, upload);
+        call(upload);
+        upload.waitForCompletion();
+        // This eager hit must observe completion, without changing capture state.
+        call(capture);
+        capture.waitForCompletion();
+        td::resetRuntimeStats();
+        const CUstream raw = cuda::StreamAccessor::getStream(capture);
+        CUgraph graph = nullptr;
+        ASSERT_EQ(CUDA_SUCCESS, cuStreamBeginCapture(raw, CU_STREAM_CAPTURE_MODE_GLOBAL));
+        ASSERT_NO_THROW(call(capture));
+        ASSERT_EQ(CUDA_SUCCESS, cuStreamEndCapture(raw, &graph));
+        CUgraphExec exec = nullptr;
+        ASSERT_EQ(CUDA_SUCCESS, cuGraphInstantiate(&exec, graph, 0));
+        for (const Mat &host : {hostA, hostB})
+        {
+            src.upload(host, capture);
+            dst.setTo(Scalar::all(0), capture);
+            ASSERT_EQ(CUDA_SUCCESS, cuGraphLaunch(exec, raw));
+            capture.waitForCompletion();
+            Mat got, want;
+            dst.download(got);
+            if (code < 0)
+            {
+                want = oracle(host, resized, 0, 0, INTER_LINEAR);
+                EXPECT_TRUE(meetsContract(got, want, INTER_LINEAR));
+            }
+            else
+            {
+                cv::cvtColor(host, want, code);
+                EXPECT_EQ(0.0, cvtest::norm(got, want, NORM_INF)) << "code=" << code;
+            }
+        }
+        EXPECT_EQ(0, td::runtimeStats().cross_stream_waits);
+        EXPECT_GE(td::runtimeStats().capture_pin_holds, 1);
+        cuGraphExecDestroy(exec);
+        cuGraphDestroy(graph);
+        cv::triton::releaseGraphResources();
+    }
+}
+
+TEST(Triton_Runtime, PackedColorCaptureAfterEviction)
+{
+    if (!ready())
+        throw SkipTestException("no Triton backend");
+    Restore restore;
+    const Size size(1280, 67);
+    const Mat hostA = randomImage(size, CV_8UC3, 771);
+    const Mat hostB = randomImage(size, CV_8UC3, 772);
+    cuda::GpuMat src(hostA);
+    cuda::Stream stream(cudaStreamNonBlocking);
+    for (int code : {COLOR_BGR2GRAY, COLOR_BGR2BGRA})
+    {
+        cv::triton::releaseGraphResources();
+        const int type = code == COLOR_BGR2GRAY ? CV_8UC1 : CV_8UC4;
+        cuda::GpuMat dst(size, type);
+        const auto before = td::runtimeStats();
+        cv::triton::cvtColor(src, dst, code, stream);
+        stream.waitForCompletion();
+        EXPECT_NE(std::string::npos, td::runtimeStats().last_key.find("_cvtcolor_packed4"));
+        EXPECT_EQ(before.table_uploads, td::runtimeStats().table_uploads);
+        const CUstream raw = cuda::StreamAccessor::getStream(stream);
+        CUgraph graph = nullptr;
+        ASSERT_EQ(CUDA_SUCCESS, cuStreamBeginCapture(raw, CU_STREAM_CAPTURE_MODE_GLOBAL));
+        ASSERT_NO_THROW(cv::triton::cvtColor(src, dst, code, stream));
+        ASSERT_EQ(CUDA_SUCCESS, cuStreamEndCapture(raw, &graph));
+        EXPECT_EQ(1, td::runtimeStats().capture_pin_holds);
+        CUgraphExec exec = nullptr;
+        ASSERT_EQ(CUDA_SUCCESS, cuGraphInstantiate(&exec, graph, 0));
+        td::setCacheLimits(1, 1);
+        cuda::GpuMat other(size, CV_8UC3);
+        cv::triton::cvtColor(src, other, COLOR_BGR2YUV, stream);
+        stream.waitForCompletion();
+        for (const Mat &host : {hostA, hostB})
+        {
+            src.upload(host, stream);
+            dst.setTo(Scalar::all(0), stream);
+            ASSERT_EQ(CUDA_SUCCESS, cuGraphLaunch(exec, raw));
+            stream.waitForCompletion();
+            Mat got, expected;
+            dst.download(got);
+            cv::cvtColor(host, expected, code);
+            EXPECT_EQ(0., cvtest::norm(got, expected, NORM_INF));
+        }
+        cuGraphExecDestroy(exec);
+        cuGraphDestroy(graph);
+        cv::triton::releaseGraphResources();
+        EXPECT_EQ(0, td::runtimeStats().capture_pin_holds);
+    }
+}
+
 TEST(Triton_Runtime, PublicGraphResourceRelease)
 {
     if (!ready())

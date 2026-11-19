@@ -13,6 +13,9 @@
 // Coverage includes interpolation/borders, affine geometry, degenerate axes,
 // pitched ROIs, output reuse, guard bands and unsupported requests.
 #include "test_helpers.hpp"
+#include "../src/entry.hpp"
+#include <array>
+#include <cstring>
 #include <cuda.h>
 #include <cmath>
 namespace opencv_test
@@ -397,6 +400,72 @@ TEST(Triton_WarpAffine, CubicMatchesNaturalWidth)
                 }
         }
     EXPECT_EQ(3 * 3 * 4 * 3, checked);
+}
+
+TEST(Triton_WarpAffine, PackedRgbaAlignmentAndFallback)
+{
+    if (!ready())
+        throw SkipTestException("no Triton backend");
+    cuda::Stream stream;
+    const Size sourceSize(257, 97), outputSize(517, 173);
+    const Mat host = randomImage(sourceSize, CV_8UC4, 991);
+    const Mat matrix = M6(.97, .1, -10, -.1, .97, 5);
+    const Scalar border(17, 31, 51, 201);
+    for (int mode : {INTER_NEAREST, INTER_LINEAR})
+        for (int borderMode : {BORDER_CONSTANT, BORDER_REPLICATE, BORDER_REFLECT_101})
+            for (int layout = 0; layout < 3; ++layout)
+            {
+                SCOPED_TRACE(cv::format("mode=%d border=%d layout=%d", mode, borderMode, layout));
+                cuda::GpuMat sourceBytes(sourceSize.height + 2, sourceSize.width * 4 + 32, CV_8UC1);
+                cuda::GpuMat outputBytes(outputSize.height + 2, outputSize.width * 4 + 32, CV_8UC1);
+                const int offset = layout == 1 ? 1 : 4;
+                cuda::GpuMat src(sourceSize.height, sourceSize.width, CV_8UC4, sourceBytes.ptr() + offset,
+                                 sourceBytes.step + (layout == 2 ? 1 : 0));
+                cuda::GpuMat dst(outputSize.height, outputSize.width, CV_8UC4, outputBytes.ptr() + offset,
+                                 outputBytes.step + (layout == 2 ? 1 : 0));
+                src.upload(host, stream);
+                const int flags = mode | WARP_INVERSE_MAP;
+                cv::triton::warpAffine(src, dst, matrix, outputSize, flags, borderMode, border, stream);
+                stream.waitForCompletion();
+                Mat got;
+                dst.download(got);
+                EXPECT_TRUE(meetsWarpContract(got, cpuWarp(host, matrix, outputSize, flags, borderMode, border)));
+                const bool packed = layout == 0 && (mode == INTER_NEAREST || borderMode == BORDER_REPLICATE);
+                EXPECT_EQ(packed, td::runtimeStats().last_key.find("_packed4") != std::string::npos);
+            }
+}
+
+TEST(Triton_WarpAffine, HostMatrixStridesAndAlignment)
+{
+    for (int depth : {CV_32F, CV_64F})
+    {
+        std::array<unsigned char, 160> storage{};
+        const std::size_t scalar = depth == CV_32F ? sizeof(float) : sizeof(double);
+        Mat matrix(2, 3, depth, storage.data() + 1, scalar * 7);
+        double expected[6] = {.97, .1, -10., -.1, .97, -0.};
+        for (int i = 0; i < 6; ++i)
+        {
+            if (depth == CV_32F)
+            {
+                const float value = static_cast<float>(expected[i]);
+                expected[i] = value;
+                std::memcpy(matrix.ptr(i / 3) + (i % 3) * scalar, &value, scalar);
+            }
+            else
+                std::memcpy(matrix.ptr(i / 3) + (i % 3) * scalar, &expected[i], scalar);
+        }
+        cv_triton_runtime::DeviceView source;
+        const auto request = cv::triton::detail::warpRequest(
+            source, matrix, INTER_LINEAR | WARP_INVERSE_MAP, BORDER_REPLICATE, Scalar(1, 2, 3, 4));
+        storage.fill(0); // request owns values, not caller matrix storage
+        for (int i = 0; i < 6; ++i)
+        {
+            EXPECT_EQ(expected[i], request.M[i]);
+            EXPECT_EQ(std::signbit(expected[i]), std::signbit(request.M[i]));
+        }
+        EXPECT_TRUE(request.inverse_map);
+        EXPECT_EQ(4., request.border[3]);
+    }
 }
 
 TEST(Triton_WarpAffine, MatchesCpu)
