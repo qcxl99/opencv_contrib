@@ -2,6 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
+// Copyright 2026, The FlagOS Contributors.
 // cv::triton::cvtColor through its real public entry (GpuMat + C++ planner + binaries from the
 // runtime JIT) against OpenCV's CPU cv::cvtColor.
 //
@@ -62,6 +63,42 @@ const Size kSizes[] = {Size(1, 1),   Size(13, 7),  Size(256, 1),
 // 4:2:0 sources.
 const Size kSizes420[] = {Size(2, 2),    Size(4, 2),   Size(16, 4),
                           Size(130, 10), Size(256, 6), Size(640, 480)};
+
+TEST(Triton_CvtColor, PackedByteThresholdTailsAndAlignment)
+{
+    if (!ready())
+        throw SkipTestException("no Triton backend");
+    cuda::Stream stream;
+    const int codes[] = {COLOR_BGR2GRAY, COLOR_BGR2BGRA, COLOR_BGRA2BGR, COLOR_BGR2RGB};
+    const Size sizes[] = {Size(256, 255), Size(256, 256), Size(260, 257), Size(257, 256)};
+    for (int code : codes)
+        for (const Size &size : sizes)
+            for (int layout = 0; layout < 3; ++layout)
+            {
+                SCOPED_TRACE(cv::format("code=%d size=%dx%d layout=%d", code, size.width, size.height, layout));
+                const int scn = code == COLOR_BGRA2BGR ? 4 : 3;
+                const int dcn = code == COLOR_BGR2GRAY ? 1 : (code == COLOR_BGR2BGRA ? 4 : 3);
+                const Mat host = randomImage(size, CV_MAKETYPE(CV_8U, scn), 190 + code + layout);
+                // Owned byte buffers allow genuinely unaligned pointers or row pitches.
+                // Two extra rows cover the small per-row skew in the pitch fallback.
+                cuda::GpuMat sourceBytes(size.height + 2, size.width * scn + 32, CV_8UC1);
+                cuda::GpuMat outputBytes(size.height + 2, size.width * dcn + 32, CV_8UC1);
+                const int offset = layout == 1 ? 1 : 4;
+                cuda::GpuMat src(size.height, size.width, host.type(), sourceBytes.ptr() + offset,
+                                 sourceBytes.step + (layout == 2 ? 1 : 0));
+                cuda::GpuMat dst(size.height, size.width, CV_MAKETYPE(CV_8U, dcn), outputBytes.ptr() + offset,
+                                 outputBytes.step + (layout == 2 ? 1 : 0));
+                src.upload(host, stream);
+                cv::triton::cvtColor(src, dst, code, stream);
+                stream.waitForCompletion();
+                Mat got, want;
+                dst.download(got);
+                cv::cvtColor(host, want, code);
+                EXPECT_EQ(0.0, cvtest::norm(got, want, NORM_INF));
+                const bool packed = layout == 0 && size.area() >= 65536 && size.width % 4 == 0;
+                EXPECT_EQ(packed, td::runtimeStats().last_key.find("_cvtcolor_packed4") != std::string::npos);
+            }
+}
 
 TEST(Triton_CvtColor, MatchesCpu)
 {

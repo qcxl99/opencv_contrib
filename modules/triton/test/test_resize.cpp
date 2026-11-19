@@ -2,6 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
+// Copyright 2026, The FlagOS Contributors.
 // Public GpuMat resize tests against the portable CPU reference, including
 // copy and all four interpolation modes, CV_8U/CV_32F, C1/C3/C4, pitched ROIs,
 // output reuse and guard bands. The linked cv::resize may select different
@@ -280,6 +281,61 @@ TEST(Triton_Boundary, RejectsForeignBuffersAndStreamsBeforeAllocation)
     }
     foreign.release();
     cuda::setDevice(0);
+}
+
+TEST(Triton_Boundary, RejectsAllocatorContextAndForeignStorage)
+{
+    if (!ready())
+        throw SkipTestException("no Triton backend");
+    if (cuda::getCudaEnabledDeviceCount() < 2)
+        throw SkipTestException("two devices required for allocator context rejection");
+    struct Allocator : cuda::GpuMat::Allocator
+    {
+        bool foreignStorage;
+        int allocations = 0;
+        explicit Allocator(bool foreign) : foreignStorage(foreign) {}
+        bool allocate(cuda::GpuMat *mat, int rows, int cols, size_t es) override
+        {
+            ++allocations;
+            cuda::setDevice(foreignStorage ? 1 : 0);
+            const bool ok = cuda::GpuMat::getStdAllocator()->allocate(mat, rows, cols, es);
+            // Either leave another context current, or restore the current context
+            // while returning storage owned by the other device.
+            cuda::setDevice(foreignStorage ? 0 : 1);
+            return ok;
+        }
+        void free(cuda::GpuMat *mat) override
+        {
+            const int previous = cuda::getDevice();
+            cuda::setDevice(foreignStorage ? 1 : 0);
+            cuda::GpuMat::getStdAllocator()->free(mat);
+            cuda::setDevice(previous);
+        }
+    };
+    cuda::setDevice(0);
+    cuda::GpuMat src(16, 16, CV_8UC3);
+    cuda::Stream stream;
+    const Mat matrix = (Mat_<double>(2, 3) << 1, 0, 0, 0, 1, 0);
+    for (bool foreign : {false, true})
+        for (int op = 0; op < 3; ++op)
+        {
+            SCOPED_TRACE(cv::format("foreign=%d op=%d", foreign, op));
+            Allocator allocator(foreign);
+            cuda::GpuMat dst(&allocator);
+            const auto before = td::runtimeStats();
+            if (op == 0)
+                EXPECT_THROW(cv::triton::resize(src, dst, Size(8, 8), 0, 0, INTER_LINEAR, stream), cv::Exception);
+            else if (op == 1)
+                EXPECT_THROW(cv::triton::cvtColor(src, dst, COLOR_BGR2GRAY, stream), cv::Exception);
+            else
+                EXPECT_THROW(cv::triton::warpAffine(src, dst, matrix, Size(8, 8), INTER_LINEAR,
+                                                    BORDER_CONSTANT, Scalar(), stream), cv::Exception);
+            cuda::setDevice(0);
+            EXPECT_EQ(1, allocator.allocations);
+            EXPECT_EQ(before.launches, td::runtimeStats().launches);
+            EXPECT_EQ(before.copies, td::runtimeStats().copies);
+            dst.release();
+        }
 }
 
 TEST(Triton_Boundary, ExplicitProducerConsumerAndSustainedReuse)

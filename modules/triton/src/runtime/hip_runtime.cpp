@@ -1,6 +1,7 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
+// Copyright 2026, The FlagOS Contributors.
 // Runtime JIT for the HIP driver API (ROCm/DTK). See runtime.hpp for execution and ownership rules.
 //
 // GENERATED from cuda_runtime.cpp by tools/port_hip_runtime.py -- do not edit; edit the CUDA
@@ -29,6 +30,7 @@
 #include "lifetime.hpp"
 #include <algorithm>
 #include <cctype>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -419,6 +421,7 @@ struct TableRes
     std::map<std::string, std::size_t> offset;
     int xmax = 0, kx = 0, ky = 0;
     bool upload_started = false, upload_recorded = false, cleanup_failed = false;
+    bool upload_complete = false; // guarded by State::mu on cached table hits
     bool had_error = false;
     bool failed() const
     {
@@ -501,6 +504,35 @@ struct TableRes
         if (!released)
             return false;
         ++g_table_frees;
+        return true;
+    }
+    bool prepareUploadDependency(hipStream_t stream, bool isCapturing, bool &waited,
+                                 Status &status)
+    {
+        waited = false;
+        // Uploads are immutable. Observe completion outside capture once, then
+        // no later stream needs to import the external upload event into a graph.
+        if (!upload_complete && !isCapturing)
+        {
+            const hipError_t result = hipEventQuery(uploaded);
+            if (result == hipSuccess)
+                upload_complete = true;
+            else if (result != hipErrorNotReady)
+            {
+                status = error(Reason::LaunchFailed, "table upload completion: " + hipErr(result));
+                return false;
+            }
+        }
+        if (!upload_complete && upload_stream != stream)
+        {
+            const hipError_t result = hipStreamWaitEvent(stream, uploaded, 0);
+            if (result != hipSuccess)
+            {
+                status = error(Reason::LaunchFailed, "hipStreamWaitEvent: " + hipErr(result));
+                return false;
+            }
+            waited = true;
+        }
         return true;
     }
     std::uintptr_t at(const char *k) const
@@ -900,11 +932,11 @@ Status currentContext(int device, hipCtx_t &ctx, std::uint64_t &gen)
 
 // ---------------------------------------------------------------- modules
 
-std::shared_ptr<ModuleRes> moduleFor(const KernelKey &key, hipCtx_t ctx, std::uint64_t gen,
+std::shared_ptr<ModuleRes> moduleFor(const KernelKey &key, const std::string &text,
+                                     hipCtx_t ctx, std::uint64_t gen,
                                      Status &st, const std::string &kernels_source)
 {
     State &s = S();
-    const std::string text = key.text();
     const std::string mk = std::to_string(gen) + "|" + text;
     std::shared_ptr<std::mutex> kmu;
     {
@@ -1089,17 +1121,11 @@ std::shared_ptr<TableRes> tablesFor(const Normalized &n, hipCtx_t ctx, std::uint
         if (auto t = s.tables.get(key))
         {
             ++s.st.table_hits;
-            if (t->upload_stream != stream)
-            {
-                const hipError_t r =
-                    hipStreamWaitEvent(stream, t->uploaded, 0); // upload -> this launch
-                if (r != hipSuccess)
-                {
-                    st = error(Reason::LaunchFailed, "hipStreamWaitEvent: " + hipErr(r));
-                    return nullptr;
-                }
+            bool waited = false;
+            if (!t->prepareUploadDependency(stream, recordingCapture, waited, st))
+                return nullptr;
+            if (waited)
                 ++s.st.cross_stream_waits;
-            }
             return t;
         }
         poison = s.poison;
@@ -1146,11 +1172,63 @@ struct Arg
     float f = 0;
 };
 
-Status launch(const ModuleRes &m, const std::map<std::string, Arg> &args, const unsigned grid[3],
+// Keep the current small launch signatures on the stack. Larger future
+// signatures retain dynamic storage rather than acquiring a new ABI limit.
+constexpr std::size_t INLINE_LAUNCH_ARGUMENTS = 32;
+template <class T> class LaunchStorage
+{
+    std::array<T, INLINE_LAUNCH_ARGUMENTS> local_;
+    std::vector<T> extra_;
+    bool dynamic_;
+  public:
+    explicit LaunchStorage(std::size_t count) : dynamic_(count > local_.size())
+    {
+        if (dynamic_)
+            extra_.resize(count);
+    }
+    T *data() { return dynamic_ ? extra_.data() : local_.data(); }
+    T &operator[](std::size_t index) { return data()[index]; }
+};
+
+class LaunchArguments
+{
+    struct Entry { std::string name; Arg value; };
+    std::array<Entry, INLINE_LAUNCH_ARGUMENTS> local_;
+    std::vector<Entry> extra_;
+    std::size_t count_ = 0;
+  public:
+    Arg &operator[](const std::string &name)
+    {
+        Entry *entry;
+        if (count_ < local_.size())
+            entry = &local_[count_];
+        else
+        {
+            extra_.emplace_back();
+            entry = &extra_.back();
+        }
+        ++count_;
+        entry->name = name;
+        return entry->value;
+    }
+    const Arg *find(const std::string &name) const
+    {
+        // Last assignment wins, matching the former named map's semantics.
+        for (std::size_t i = count_; i > 0; --i)
+        {
+            const Entry &entry = i <= local_.size() ? local_[i - 1] : extra_[i - 1 - local_.size()];
+            if (entry.name == name)
+                return &entry.value;
+        }
+        return nullptr;
+    }
+};
+
+Status launch(const ModuleRes &m, const LaunchArguments &args, const unsigned grid[3],
               hipStream_t stream)
 {
-    std::vector<Arg> values(m.man.abi.size());
-    std::vector<void *> params(m.man.abi.size());
+    LaunchStorage<Arg> values(m.man.abi.size());
+    LaunchStorage<void *> params(m.man.abi.size());
     for (std::size_t i = 0; i < m.man.abi.size(); ++i)
     {
         const ManifestParam &p = m.man.abi[i];
@@ -1162,10 +1240,10 @@ Status launch(const ModuleRes &m, const std::map<std::string, Arg> &args, const 
         } // allowed by launch_abi_ok() at load
         else
         {
-            auto it = args.find(p.name);
-            if (it == args.end())
+            const Arg *value = args.find(p.name);
+            if (!value)
                 return error(Reason::ManifestInvalid, "no value for kernel parameter " + p.name);
-            v = it->second;
+            v = *value;
             const char want =
                 p.type[0] == '*' ? 'p' : (p.type == "i32" ? 'i' : (p.type == "fp32" ? 'f' : '?'));
             if (want != v.kind)
@@ -1187,7 +1265,7 @@ Status launch(const ModuleRes &m, const std::map<std::string, Arg> &args, const 
 
 // The div tables RGB2HSV_b reads. Keyed by the code, because the hue range (180 or 256)
 // changes hdiv while sdiv stays the same; two codes with the same range share one upload.
-std::shared_ptr<TableRes> cvtTablesFor(const cv_triton_color::HsvTables &hv, int code,
+std::shared_ptr<TableRes> cvtTablesFor(int code,
                                        hipCtx_t ctx, std::uint64_t gen, hipStream_t stream,
                                        Status &st)
 {
@@ -1199,20 +1277,18 @@ std::shared_ptr<TableRes> cvtTablesFor(const cv_triton_color::HsvTables &hv, int
         if (auto t = s.tables.get(key))
         {
             ++s.st.table_hits;
-            if (t->upload_stream != stream)
-            {
-                const hipError_t r = hipStreamWaitEvent(stream, t->uploaded, 0);
-                if (r != hipSuccess)
-                {
-                    st = error(Reason::LaunchFailed, "hipStreamWaitEvent: " + hipErr(r));
-                    return nullptr;
-                }
+            bool waited = false;
+            if (!t->prepareUploadDependency(stream, recordingCapture, waited, st))
+                return nullptr;
+            if (waited)
                 ++s.st.cross_stream_waits;
-            }
             return t;
         }
         poison = s.poison;
     }
+    const cv_triton_color::HsvTables hv = (code == 66 || code == 67)
+                                             ? cv_triton_color::hsv_tables_full()
+                                             : cv_triton_color::hsv_tables();
     auto t = resource<TableRes>();
     t->ctx = ctx;
     t->gen = gen;
@@ -1290,16 +1366,11 @@ std::shared_ptr<TableRes> labluvTablesFor(int code, hipCtx_t ctx, std::uint64_t 
         if (auto t = s.tables.get(key))
         {
             ++s.st.table_hits;
-            if (t->upload_stream != stream)
-            {
-                const hipError_t r = hipStreamWaitEvent(stream, t->uploaded, 0);
-                if (r != hipSuccess)
-                {
-                    st = error(Reason::LaunchFailed, "hipStreamWaitEvent: " + hipErr(r));
-                    return nullptr;
-                }
+            bool waited = false;
+            if (!t->prepareUploadDependency(stream, recordingCapture, waited, st))
+                return nullptr;
+            if (waited)
                 ++s.st.cross_stream_waits;
-            }
             return t;
         }
         poison = s.poison;
@@ -1468,7 +1539,8 @@ Status resize(const ResizeRequest &req, const ExecContext &ex, std::string *rout
     tc.source_sha256 = c.source_sha256;
     const LaunchShape shape = launch_shape(n, LaunchConfig{}, target, tc, 1, &req.src, &req.dst);
 
-    std::shared_ptr<ModuleRes> mod = moduleFor(shape.key, ctx, gen, st, c.kernels);
+    const std::string keyText = shape.key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(shape.key, keyText, ctx, gen, st, c.kernels);
     if (!mod)
         return st;
     std::shared_ptr<TableRes> tab;
@@ -1480,7 +1552,7 @@ Status resize(const ResizeRequest &req, const ExecContext &ex, std::string *rout
     }
 
     const std::size_t es = elem_size(n.type);
-    std::map<std::string, Arg> a;
+    LaunchArguments a;
     auto ptr = [&](const char *k, std::uintptr_t v)
     {
         Arg x;
@@ -1551,7 +1623,7 @@ Status resize(const ResizeRequest &req, const ExecContext &ex, std::string *rout
     if (!st.ok())
         return st;
     return finishLaunch(s, ctx, gen, stream, mod, tab, ref::route_name(n.route.kind),
-                        shape.key.text(), mod->dir);
+                        keyText, mod->dir);
 }
 
 // ------------------------------------------------------------------- cvtColor
@@ -1610,9 +1682,14 @@ Status cvtColor(const cv_triton_color::Request &req, const ExecContext &ex, std:
     if (!dev.ok) return error(Reason::ToolchainUnavailable, dev.why);
     // The key, built exactly as cvtcolor.cpp describes it. The kernel's constexpr list is
     // spelled out here because KernelKey stores it as name/value pairs.
+    const bool cudaPacked = std::string(name()) == "cuda-jit" && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&
+                        req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 &&
+                        req.src.step % 4 == 0 && req.dst.step % 4 == 0 &&
+                        (spec.code == 0 || spec.code == 1 || spec.code == 4 || spec.code == 6);
     KernelKey key;
-    key.kernel = "_cvtcolor_cpu_kernel";
-    key.signature = cv_triton_color::signature(n);
+    key.kernel = cudaPacked ? "_cvtcolor_packed4" : "_cvtcolor_cpu_kernel";
+    key.signature = cudaPacked ? "src:*u8, dst:*u8, cols:i32, src_rs:i32, dst_rs:i32"
+                           : cv_triton_color::signature(n);
     key.cfg.block_h = 1;
     key.cfg.block_w = cv_triton_color::block_size(n);
     key.cfg.num_warps = cv_triton_color::num_warps(n);
@@ -1623,41 +1700,46 @@ Status cvtColor(const cv_triton_color::Request &req, const ExecContext &ex, std:
     key.target.warp_size = dev.warp;
     key.toolchain.compiler = c.compiler;
     key.toolchain.source_sha256 = c.cvt_source_sha256;
-    key.constexprs = {
-        {"BLOCK", key.cfg.block_w},
-        {"BLUE", spec.blue},
-        {"DCN", spec.dcn},
-        {"GB", spec.gb},
-        {"ORD", spec.ord},
-        // Bayer row phase (Start_with_green); 0 for every other op, which ignores it.
-        {"SWG", spec.swg},
-        // Every conversion key carries the admitted element depth. normalize()
-        // checks each code/depth pair; the helper verifies the kernel's constexpr set.
-        {"U16", n.u16 ? 1 : 0},
-        {"F32", n.f32 ? 1 : 0},
-        {"F32_CPU_SEPARATE4", n.f32_cpu_separate4 ? 1 : 0},
-        {"I0", spec.perm[0]},
-        {"I1", spec.perm[1]},
-        {"I2", spec.perm[2]},
-        {"HR", spec.hrange},
-        {"I3", spec.perm[3]},
-        {"INV", spec.inverse ? 1 : 0},
-        {"OP", static_cast<int>(spec.op)},
-        {"SCN", spec.scn},
-        // The Xyz/Lab/Luv coefficient matrix and the sRGB flag. Passed for EVERY
-        // code, zeros included, so the compile key always names the same constexpr
-        // set -- which is exactly what the helper enforces. They come from the
-        // CODE (coeffs_for), so they are constexprs and not launch arguments.
-        {"SRGB", spec.srgb ? 1 : 0},
-        {"E0", spec.k[0]},
-        {"E1", spec.k[1]},
-        {"E2", spec.k[2]},
-        {"E3", spec.k[3]},
-        {"E4", spec.k[4]},
-        {"E5", spec.k[5]},
-        {"E6", spec.k[6]},
-        {"E7", spec.k[7]},
-        {"E8", spec.k[8]}};
+    if (!cudaPacked)
+    {
+        // The fixed schema is already in canonical lexical order. Keep all depth,
+        // Bayer, permutation and Lab/Luv constants, including unused zero values.
+        key.constexprs = {
+            {"BLOCK", key.cfg.block_w},
+            {"BLUE", spec.blue},
+            {"DCN", spec.dcn},
+            {"E0", spec.k[0]},
+            {"E1", spec.k[1]},
+            {"E2", spec.k[2]},
+            {"E3", spec.k[3]},
+            {"E4", spec.k[4]},
+            {"E5", spec.k[5]},
+            {"E6", spec.k[6]},
+            {"E7", spec.k[7]},
+            {"E8", spec.k[8]},
+            {"F32", n.f32 ? 1 : 0},
+            {"F32_CPU_SEPARATE4", n.f32_cpu_separate4 ? 1 : 0},
+            {"GB", spec.gb},
+            {"HR", spec.hrange},
+            {"I0", spec.perm[0]},
+            {"I1", spec.perm[1]},
+            {"I2", spec.perm[2]},
+            {"I3", spec.perm[3]},
+            {"INV", spec.inverse ? 1 : 0},
+            {"OP", static_cast<int>(spec.op)},
+            {"ORD", spec.ord},
+            {"SCN", spec.scn},
+            {"SRGB", spec.srgb ? 1 : 0},
+            {"SWG", spec.swg},
+            {"U16", n.u16 ? 1 : 0}};
+    }
+    if (cudaPacked)
+    {
+        key.cfg.block_w = spec.code == 6 ? 512 : 128;
+        key.cfg.num_warps = 4;
+        key.constexprs = {{"BLOCK", key.cfg.block_w}, {"CODE", spec.code}};
+    }
+
     const bool packed = dev.arch == 936 && !n.u16 && !n.f32 && n.cols >= 1024 && n.cols % 4 == 0 &&
         req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 &&
         req.src.step % 4 == 0 && req.dst.step % 4 == 0 &&
@@ -1672,28 +1754,30 @@ Status cvtColor(const cv_triton_color::Request &req, const ExecContext &ex, std:
     }
     std::sort(key.constexprs.begin(), key.constexprs.end());
 
-    std::shared_ptr<ModuleRes> mod = moduleFor(key, ctx, gen, st, c.cvt_kernels);
+    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);
     if (!mod)
         return st;
 
     // The two int[256] tables RGB2HSV_b divides by. They are uploaded through the same
     // stream-ordered table cache the resize plans use, so a launch can never read one before
     // its upload completed.
-    cv_triton_color::HsvTables hv = (spec.code == 66 || spec.code == 67)
-                                        ? cv_triton_color::hsv_tables_full()
-                                        : cv_triton_color::hsv_tables();
-    std::shared_ptr<TableRes> tab = cvtTablesFor(hv, spec.code, ctx, gen, stream, st);
-    if (!tab)
-        return st;
+    std::shared_ptr<TableRes> tab, ltab;
+    if (!cudaPacked)
+    {
+        tab = cvtTablesFor(spec.code, ctx, gen, stream, st);
+        if (!tab)
+            return st;
 
-    // The Xyz/Lab/Luv table set, for the codes that read one. XYZ has none (its coefficients are
-    // constexprs); the others get the family's tables, and the pointers that family does not use
-    // still resolve to something valid inside the same allocation.
-    std::shared_ptr<TableRes> ltab = labluvTablesFor(spec.code, ctx, gen, stream, st);
-    if (st.code == cv_triton_runtime::Code::Error)
-        return st;
+        // The Xyz/Lab/Luv table set, for the codes that read one. XYZ has none (its coefficients are
+        // constexprs); the others get the family's tables, and the pointers that family does not use
+        // still resolve to something valid inside the same allocation.
+        ltab = labluvTablesFor(spec.code, ctx, gen, stream, st);
+        if (st.code == cv_triton_runtime::Code::Error)
+            return st;
+    }
 
-    std::map<std::string, Arg> a;
+    LaunchArguments a;
     auto ptr = [&](const char *k, std::uintptr_t v)
     {
         Arg x;
@@ -1710,22 +1794,26 @@ Status cvtColor(const cv_triton_color::Request &req, const ExecContext &ex, std:
     };
     ptr("src", req.src.ptr);
     ptr("dst", req.dst.ptr);
-    ptr("sdiv", tab->at("sdiv"));
-    ptr("hdiv", tab->at("hdiv"));
-    // The three typed table pointers. For a family that reads none of them (every op but
-    // Xyz/Lab/Luv, plus Xyz which has no table at all) these resolve to the four-byte dummy the
-    // small table set carries; the per-code constexprs mean the dead branches never load from it.
-    const std::uintptr_t t32 = ltab ? ltab->at("t32") : tab->at("t32");
-    const std::uintptr_t t16 = ltab ? ltab->at("t16") : tab->at("t16");
-    const std::uintptr_t t64 = ltab ? ltab->at("t64") : tab->at("t64");
-    ptr("t32", t32);
-    ptr("t16", t16);
-    ptr("t64", t64);
+    if (!cudaPacked)
+    {
+        ptr("sdiv", tab->at("sdiv"));
+        ptr("hdiv", tab->at("hdiv"));
+        // The three typed table pointers. For a family that reads none of them (every op but
+        // Xyz/Lab/Luv, plus Xyz which has no table at all) these resolve to the four-byte dummy the
+        // small table set carries; the per-code constexprs mean the dead branches never load from it.
+        const std::uintptr_t t32 = ltab ? ltab->at("t32") : tab->at("t32");
+        const std::uintptr_t t16 = ltab ? ltab->at("t16") : tab->at("t16");
+        const std::uintptr_t t64 = ltab ? ltab->at("t64") : tab->at("t64");
+        ptr("t32", t32);
+        ptr("t16", t16);
+        ptr("t64", t64);
+    }
     // DeviceView::step is the row pitch in BYTES. The kernel indexes a TYPED pointer, so the
     // strides it receives are in ELEMENTS. normalize() checks that the byte step
     // is divisible by the element size.
     i32("cols", n.cols);
-    i32("rows", n.rows);
+    if (!cudaPacked)
+        i32("rows", n.rows);
     i32("src_rs",
         static_cast<long long>(req.src.step / cv_triton_runtime::elem_size(req.src.type)));
     i32("dst_rs",
@@ -1734,9 +1822,12 @@ Status cvtColor(const cv_triton_color::Request &req, const ExecContext &ex, std:
     // code with no chroma plane the value is unused. It uses the DESTINATION height, which for a
     // 4:2:0 decode is the source height * 2/3 -- using src.rows would read 1.5x too far into the
     // buffer, and that is a silent wrong image rather than a crash.
-    i32("uv_rs",
-        static_cast<long long>(n.rows) *
-            static_cast<long long>(req.src.step / cv_triton_runtime::elem_size(req.src.type)));
+    if (!cudaPacked)
+    {
+        i32("uv_rs",
+            static_cast<long long>(n.rows) *
+                static_cast<long long>(req.src.step / cv_triton_runtime::elem_size(req.src.type)));
+    }
 
     unsigned grid[3];
     cv_triton_color::grid(n, key.cfg.block_w, grid);
@@ -1745,13 +1836,15 @@ Status cvtColor(const cv_triton_color::Request &req, const ExecContext &ex, std:
         // A lane covers four complete pixels; row pitches stay independent.
         grid[1] = static_cast<unsigned>((n.cols / 4 + key.cfg.block_w - 1) / key.cfg.block_w);
     }
+    if (cudaPacked)
+        grid[1] = static_cast<unsigned>((n.cols / 4 + key.cfg.block_w - 1) / key.cfg.block_w);
     st = launch(*mod, a, grid, stream);
     if (!st.ok())
         return st;
 
     // Under capture the module and tables are pinned to the graph's lifetime instead of being
     // left to the caches: see finishLaunch.
-    return finishLaunch(s, ctx, gen, stream, mod, tab, spec.name, key.text(), mod->dir, ltab);
+    return finishLaunch(s, ctx, gen, stream, mod, tab, spec.name, keyText, mod->dir, ltab);
 }
 
 // ----------------------------------------------------------------- warpAffine
@@ -1817,11 +1910,28 @@ Status warpAffine(const cv_triton_warp::Request &req, const ExecContext &ex)
         n.block_w = n.block_h == 2 ? 128 : 256;
         n.num_warps = 4;
     }
+    const bool packed4 = std::string(name()) == "cuda-jit" && n.u8 && n.channels == 4 &&
+                         req.src.ptr % 4 == 0 &&
+                         req.dst.ptr % 4 == 0 && req.src.step % 4 == 0 && req.dst.step % 4 == 0;
+    if (packed4 && n.border_mode_code == 1 &&
+        n.mode == cv_triton_warp::Mode::Linear && n.dst_h >= 64 && n.dst_w >= 256)
+    {
+        n.block_h = 1;
+        n.block_w = 256;
+        n.num_warps = 4;
+    }
     const cv_triton_warp::Mode wmode = n.mode;
     const char *wkernel =
         wmode == cv_triton_warp::Mode::Nearest
             ? "_warp_nearest"
             : (wmode == cv_triton_warp::Mode::Linear ? "_warp_linear" : "_warp_cubic");
+    // A four-channel byte pixel can use one word transaction when both
+    // pointers and every row are aligned. Keep the general route for raw views
+    // that do not meet these predicates and for other interpolation borders.
+    if (packed4 && wmode == cv_triton_warp::Mode::Nearest)
+        wkernel = "_warp_nearest_packed4";
+    else if (packed4 && wmode == cv_triton_warp::Mode::Linear && n.border_mode_code == 1)
+        wkernel = "_warp_linear_packed4";
     const char *wroute = wmode == cv_triton_warp::Mode::Nearest
                              ? "nearest"
                              : (wmode == cv_triton_warp::Mode::Linear ? "linear" : "cubic");
@@ -1858,11 +1968,12 @@ Status warpAffine(const cv_triton_warp::Request &req, const ExecContext &ex)
     }
     std::sort(key.constexprs.begin(), key.constexprs.end());
 
-    std::shared_ptr<ModuleRes> mod = moduleFor(key, ctx, gen, st, c.wa_kernels);
+    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.wa_kernels);
     if (!mod)
         return st;
 
-    std::map<std::string, Arg> a;
+    LaunchArguments a;
     auto ptr = [&](const char *k, std::uintptr_t v)
     {
         Arg x;
@@ -1920,7 +2031,7 @@ Status warpAffine(const cv_triton_warp::Request &req, const ExecContext &ex)
     if (!st.ok())
         return st;
 
-    return finishLaunch(s, ctx, gen, stream, mod, nullptr, wroute, key.text(), mod->dir);
+    return finishLaunch(s, ctx, gen, stream, mod, nullptr, wroute, keyText, mod->dir);
 }
 
 } // namespace runtime

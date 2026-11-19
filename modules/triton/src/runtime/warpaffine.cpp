@@ -2,6 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
+// Copyright 2026, The FlagOS Contributors.
 // Standalone CPU controls and test support do not use library-private headers.
 #ifdef __OPENCV_BUILD
 #include "../precomp.hpp"
@@ -307,12 +308,14 @@ std::string signature(const Normalized &n)
     // The pointer types are concrete per dtype ("*u8" / "*fp32"), not a placeholder: the
     // compile helper maps each token to a Triton type and has no generic form.
     const char *t = n.u8 ? "u8" : (n.u16 ? "u16" : "fp32");
-    std::ostringstream o;
-    o << "src:*" << t << ", dst:*" << t
-      << ", M00:fp32, M01:fp32, M02:fp32, M10:fp32, M11:fp32, M12:fp32, "
-         "src_h:i32, src_w:i32, dst_h:i32, dst_w:i32, src_rs:i32, dst_rs:i32, "
-         "bv0:fp32, bv1:fp32, bv2:fp32, bv3:fp32";
-    return o.str();
+    std::string result;
+    result.reserve(256);
+    result += "src:*";
+    result += t;
+    result += ", dst:*";
+    result += t;
+    result += ", M00:fp32, M01:fp32, M02:fp32, M10:fp32, M11:fp32, M12:fp32, src_h:i32, src_w:i32, dst_h:i32, dst_w:i32, src_rs:i32, dst_rs:i32, bv0:fp32, bv1:fp32, bv2:fp32, bv3:fp32";
+    return result;
 }
 
 std::string constexprs_text(const Normalized &n)

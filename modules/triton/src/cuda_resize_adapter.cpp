@@ -2,6 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
+// Copyright 2026, The FlagOS Contributors.
 // Thin CUDA/GpuMat adapter. Native ownership and output allocation live here;
 // metadata/admission, plans and status translation live in the common private entry/provider.
 // No image copies, replacement streams, numerical rules or kernel selection are added here.
@@ -64,15 +65,16 @@ ImageView toImageView(const cuda::GpuMat &m)
 // Validate actual CUDA ownership, rather than labelling every pointer with the
 // caller's selected device. Query before OutputArray::create so even a resized
 // foreign destination is rejected without touching its allocation.
-void checkCudaBuffer(const cuda::GpuMat &m, const char *name, bool layout)
+void checkCudaBuffer(const cuda::GpuMat &m, const char *name, bool layout,
+                     const cv_triton_runtime::ContextId &context, bool checkOwnership = true)
 {
     if (m.empty())
         CV_Error(Error::StsBadArg, String(name) + " is empty");
-    CUcontext current = nullptr, owner = nullptr;
-    if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || !current ||
-        cuPointerGetAttribute(&owner, CU_POINTER_ATTRIBUTE_CONTEXT,
-                              reinterpret_cast<CUdeviceptr>(m.cudaPtr())) != CUDA_SUCCESS ||
-        owner != current)
+    CUcontext owner = nullptr;
+    if (checkOwnership &&
+        (cuPointerGetAttribute(&owner, CU_POINTER_ATTRIBUTE_CONTEXT,
+                               reinterpret_cast<CUdeviceptr>(m.cudaPtr())) != CUDA_SUCCESS ||
+         reinterpret_cast<std::uintptr_t>(owner) != context.native))
         CV_Error(Error::StsBadArg,
                  String(name) + " must belong to the current CUDA context/device");
     if (!layout)
@@ -82,14 +84,29 @@ void checkCudaBuffer(const cuda::GpuMat &m, const char *name, bool layout)
     if (cuMemGetAddressRange(&base, &bytes, reinterpret_cast<CUdeviceptr>(m.cudaPtr())) !=
         CUDA_SUCCESS)
         CV_Error(Error::StsBadArg, String(name) + " has no verifiable CUDA allocation range");
-    const auto view = detail::toDeviceView(toImageView(m), cuda::getDevice(),
+    const auto view = detail::toDeviceView(toImageView(m), context.device,
                                            static_cast<std::uintptr_t>(base), bytes);
     const auto checked = cv_triton_runtime::validate_view(view, name);
     if (!checked.ok())
         CV_Error(Error::StsBadArg, checked.message);
 }
 
-void checkCudaArguments(const cuda::GpuMat &src, OutputArray dst, cuda::Stream &stream)
+cv_triton_runtime::ContextId currentIdentity(CUcontext context)
+{
+    cv_triton_runtime::ContextId id;
+    CUdevice device = 0;
+    unsigned long long generation = 0;
+    if (!context ||
+        cuCtxGetDevice(&device) != CUDA_SUCCESS || cuCtxGetId(context, &generation) != CUDA_SUCCESS)
+        CV_Error(Error::StsBadArg, "cv::triton: cannot identify the current CUDA context");
+    id.backend = cv_triton_runtime::Backend::CUDA;
+    id.device = static_cast<int>(device);
+    id.native = reinterpret_cast<std::uintptr_t>(context);
+    id.generation = generation;
+    return id;
+}
+
+cv_triton_runtime::ContextId checkCudaArguments(const cuda::GpuMat &src, OutputArray dst, cuda::Stream &stream)
 {
     if (src.empty())
         CV_Error(Error::StsBadArg, "src is empty");
@@ -100,39 +117,29 @@ void checkCudaArguments(const cuda::GpuMat &src, OutputArray dst, cuda::Stream &
     // Initialize its selected runtime context before checking borrowed buffers;
     // never switch an already-current driver context to make a foreign pointer fit.
     if (!current)
+    {
         cuda::setDevice(cuda::getDevice());
-    checkCudaBuffer(src, "src", true);
+        if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || !current)
+            CV_Error(Error::StsBadArg, "cannot initialize the current CUDA context");
+    }
+    const auto context = currentIdentity(current);
+    checkCudaBuffer(src, "src", true, context);
     if (dst.kind() == _InputArray::CUDA_GPU_MAT)
     {
         const cuda::GpuMat pre = dst.getGpuMat();
         if (!pre.empty())
-            checkCudaBuffer(pre, "dst", false);
+            checkCudaBuffer(pre, "dst", false, context);
     }
     const CUstream handle = reinterpret_cast<CUstream>(cuda::StreamAccessor::getStream(stream));
     if (handle)
     {
         CUcontext owner = nullptr;
-        if (cuCtxGetCurrent(&current) != CUDA_SUCCESS ||
-            cuStreamGetCtx(handle, &owner) != CUDA_SUCCESS || owner != current)
+        if (cuStreamGetCtx(handle, &owner) != CUDA_SUCCESS || owner != current)
             CV_Error(Error::StsBadArg, "stream must belong to the current CUDA context/device");
     }
+    return context;
 }
 
-cv_triton_runtime::ContextId currentIdentity()
-{
-    cv_triton_runtime::ContextId id;
-    CUcontext context = nullptr;
-    CUdevice device = 0;
-    unsigned long long generation = 0;
-    if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || !context ||
-        cuCtxGetDevice(&device) != CUDA_SUCCESS || cuCtxGetId(context, &generation) != CUDA_SUCCESS)
-        CV_Error(Error::StsBadArg, "cv::triton: cannot identify the current CUDA context");
-    id.backend = cv_triton_runtime::Backend::CUDA;
-    id.device = static_cast<int>(device);
-    id.native = reinterpret_cast<std::uintptr_t>(context);
-    id.generation = generation;
-    return id;
-}
 
 cv_triton_runtime::DeviceView deviceView(const cuda::GpuMat &image,
                                          const cv_triton_runtime::ContextId &context)
@@ -144,29 +151,55 @@ cv_triton_runtime::DeviceView deviceView(const cuda::GpuMat &image,
     return view;
 }
 
-void rejectOverlap(const cuda::GpuMat &src, OutputArray dst, const char *operation)
+struct DestinationSnapshot
+{
+    const uchar *data = nullptr, *datastart = nullptr, *dataend = nullptr;
+    std::size_t step = 0;
+    Size size;
+    int type = -1;
+};
+
+DestinationSnapshot rejectOverlap(const cuda::GpuMat &src, OutputArray dst, const char *operation,
+                   const cv_triton_runtime::ContextId &context)
 {
     if (dst.kind() == _InputArray::CUDA_GPU_MAT)
     {
         const cuda::GpuMat before = dst.getGpuMat();
         if (!before.empty())
         {
-            checkCudaBuffer(before, "dst", true);
-            const auto context = currentIdentity();
+            checkCudaBuffer(before, "dst", true, context, false); // ownership checked above
             if (cv_triton_runtime::views_overlap(deviceView(src, context),
                                                  deviceView(before, context)))
                 CV_Error(
                     Error::StsBadArg,
                     cv::format("cv::triton::%s: overlapping images are not supported", operation));
+            return {before.data, before.datastart, before.dataend, before.step, before.size(), before.type()};
         }
     }
+    return {};
 }
 
-cuda::GpuMat prepareDestination(OutputArray output, const detail::OutputInfo &info)
+cuda::GpuMat prepareDestination(OutputArray output, const detail::OutputInfo &info,
+                                const cv_triton_runtime::ContextId &context,
+                                const DestinationSnapshot &checked)
 {
+    // GpuMat::create is a no-op for an existing matching allocation. Keep create
+    // itself for OutputArray's fixed-size/type checks, and reuse only this call's
+    // already checked destination. Any changed storage takes the full check below.
+    const bool matching = checked.data && checked.size == info.size &&
+                          checked.type == info.type;
     output.create(info.size, info.type);
     cuda::GpuMat dst = output.getGpuMat();
-    checkCudaBuffer(dst, "dst", true); // create may have changed both address and layout
+    if (matching && dst.data == checked.data && dst.datastart == checked.datastart &&
+        dst.dataend == checked.dataend && dst.step == checked.step &&
+        dst.size() == checked.size && dst.type() == checked.type)
+        return dst;
+    // create may call an allocator: independently recheck current context and storage.
+    CUcontext current = nullptr;
+    if (cuCtxGetCurrent(&current) != CUDA_SUCCESS ||
+        reinterpret_cast<std::uintptr_t>(current) != context.native)
+        CV_Error(Error::StsBadArg, "destination allocation changed the current CUDA context");
+    checkCudaBuffer(dst, "dst", true, context);
     return dst;
 }
 
@@ -177,13 +210,12 @@ void resize(InputArray input, OutputArray output, Size dsize, double fx, double 
 {
     CV_Assert(input.kind() == _InputArray::CUDA_GPU_MAT);
     const cuda::GpuMat src = input.getGpuMat();
-    checkCudaArguments(src, output, stream);
-    const auto context = currentIdentity();
+    const auto context = checkCudaArguments(src, output, stream);
     const auto source = deviceView(src, context);
     const auto info = detail::resizeOutput(source, dsize, fx, fy, interpolation);
     // Check the existing output before create can replace its storage and hide overlap.
-    rejectOverlap(src, output, "resize");
-    const cuda::GpuMat dst = prepareDestination(output, info);
+    const auto checkedDst = rejectOverlap(src, output, "resize", context);
+    const cuda::GpuMat dst = prepareDestination(output, info, context, checkedDst);
     const auto native = reinterpret_cast<std::uintptr_t>(cuda::StreamAccessor::getStream(stream));
     // Preserve original fx/fy when dsize was omitted; do not derive them from rounded sizes.
     detail::resizeDevice(source, deviceView(dst, context), dsize.empty() ? Size() : info.size,
@@ -201,14 +233,13 @@ void cvtColor(InputArray input, OutputArray output, int code, cuda::Stream &stre
 {
     CV_Assert(input.kind() == _InputArray::CUDA_GPU_MAT);
     const cuda::GpuMat src = input.getGpuMat();
-    checkCudaArguments(src, output, stream);
-    const auto context = currentIdentity();
+    const auto context = checkCudaArguments(src, output, stream);
     cv_triton_color::Request request;
     request.src = deviceView(src, context);
     request.code = code;
     const auto info = detail::cvtColorOutput(request.src, code);
-    rejectOverlap(src, output, "cvtColor");
-    const cuda::GpuMat dst = prepareDestination(output, info);
+    const auto checkedDst = rejectOverlap(src, output, "cvtColor", context);
+    const cuda::GpuMat dst = prepareDestination(output, info, context, checkedDst);
     request.dst = deviceView(dst, context);
     detail::cvtColorDevice(
         request, context.device,
@@ -220,13 +251,12 @@ void warpAffine(InputArray input, OutputArray output, InputArray matrix, Size ds
 {
     CV_Assert(input.kind() == _InputArray::CUDA_GPU_MAT);
     const cuda::GpuMat src = input.getGpuMat();
-    checkCudaArguments(src, output, stream);
-    const auto context = currentIdentity();
+    const auto context = checkCudaArguments(src, output, stream);
     auto request =
         detail::warpRequest(deviceView(src, context), matrix, flags, borderMode, borderValue);
     const auto info = detail::warpOutput(request, dsize);
-    rejectOverlap(src, output, "warpAffine");
-    const cuda::GpuMat dst = prepareDestination(output, info);
+    const auto checkedDst = rejectOverlap(src, output, "warpAffine", context);
+    const cuda::GpuMat dst = prepareDestination(output, info, context, checkedDst);
     request.dst = deviceView(dst, context);
     detail::warpAffineDevice(
         request, context.device,

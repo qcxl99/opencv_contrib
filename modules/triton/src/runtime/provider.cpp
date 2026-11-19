@@ -2,6 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
+// Copyright 2026, The FlagOS Contributors.
 // Pure parts of the provider protocol: request normalisation and validation, the explicit
 // compile key, launch geometry. No device access. See provider.hpp.
 // Standalone CPU controls and test support do not use library-private headers.
@@ -10,6 +11,7 @@
 #endif
 #include "provider.hpp"
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -293,14 +295,35 @@ Status normalize(const ResizeRequest &req, Normalized &out)
 
 std::string KernelKey::text() const
 {
-    std::ostringstream o;
-    o << "kernel=" << kernel << ";sig=" << signature << ";cx=";
+    std::string out;
+    out.reserve(kernel.size() + signature.size() + toolchain.compiler.size() +
+                toolchain.source_sha256.size() + target.backend.size() +
+                constexprs.size() * 40 + 96);
+    auto integer = [&](long long value)
+    {
+        char number[32]; // enough for every signed 64-bit decimal value
+        const auto end = std::to_chars(number, number + sizeof(number), value).ptr;
+        out.append(number, end);
+    };
+    out += "kernel="; out += kernel;
+    out += ";sig="; out += signature;
+    out += ";cx=";
     for (std::size_t i = 0; i < constexprs.size(); ++i)
-        o << (i ? "," : "") << constexprs[i].first << "=" << constexprs[i].second;
-    o << ";nw=" << cfg.num_warps << ";ns=" << cfg.num_stages << ";target=" << target.backend << ":"
-      << target.arch << ":" << target.warp_size << ";compiler=" << toolchain.compiler
-      << ";source=" << toolchain.source_sha256;
-    return o.str();
+    {
+        if (i)
+            out += ',';
+        out += constexprs[i].first;
+        out += '=';
+        integer(constexprs[i].second);
+    }
+    out += ";nw="; integer(cfg.num_warps);
+    out += ";ns="; integer(cfg.num_stages);
+    out += ";target="; out += target.backend;
+    out += ':'; integer(target.arch);
+    out += ':'; integer(target.warp_size);
+    out += ";compiler="; out += toolchain.compiler;
+    out += ";source="; out += toolchain.source_sha256;
+    return out;
 }
 
 LaunchConfig default_config(const Normalized &n, const Target *target)
@@ -342,6 +365,14 @@ LaunchConfig default_config(const Normalized &n, const Target *target)
         cfg.block_h = DISPATCH_FALLBACK_BLOCK_H;
         cfg.block_w = DISPATCH_FALLBACK_BLOCK_W;
         cfg.num_warps = DISPATCH_FALLBACK_NUM_WARPS;
+    }
+    // Exact 2x2 byte C4 windows use pixel-major tiles. This CUDA configuration
+    // bounds the live four-channel window without changing the sampling route.
+    if (target && target->backend == "cuda" && two && !f32 && n.channels == 4)
+    {
+        cfg.block_h = 1;
+        cfg.block_w = 128;
+        cfg.num_warps = 4;
     }
     // HIP uses launch defaults by route, channel layout and scale direction;
     // BLOCK_W counts channel elements for nearest/separable kernels, pixels for AREA.

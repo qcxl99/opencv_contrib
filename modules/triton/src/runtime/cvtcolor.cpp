@@ -2,6 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
+// Copyright 2026, The FlagOS Contributors.
 // Pure part of the cvtColor provider: the code table, request validation and the explicit
 // compile key. No device access, so it is testable without a GPU.
 //
@@ -1406,7 +1407,6 @@ const LabLuvTables &labluv_tables()
 
 std::string signature(const Normalized &n)
 {
-    std::ostringstream o;
     // Order matters: this must be the kernel's own parameter order
     // (_cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, ...)), and the compile
     // helper rejects a signature that disagrees with it.
@@ -1424,10 +1424,14 @@ std::string signature(const Normalized &n)
     // uv_rs is the chroma plane base in ELEMENTS from `src`, i.e. H * src_rs (the Y plane's
     // height times the row pitch). It is a runtime argument like the strides, and it is only read
     // by Op::Yuv420; every other op ignores it, so one signature serves all codes.
-    o << "src:*" << t << ", dst:*" << t
-      << ", cols:i32, src_rs:i32, dst_rs:i32, sdiv:*i32, hdiv:*i32"
-      << ", uv_rs:i32, rows:i32, t32:*i32, t16:*i16, t64:*i64";
-    return o.str();
+    std::string result;
+    result.reserve(256);
+    result += "src:*";
+    result += t;
+    result += ", dst:*";
+    result += t;
+    result += ", cols:i32, src_rs:i32, dst_rs:i32, sdiv:*i32, hdiv:*i32, uv_rs:i32, rows:i32, t32:*i32, t16:*i16, t64:*i64";
+    return result;
 }
 
 std::string constexprs_text(const Normalized &n)

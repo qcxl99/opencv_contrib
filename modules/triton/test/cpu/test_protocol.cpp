@@ -2,6 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
+// Copyright 2026, The FlagOS Contributors.
 // Standalone CPU control, deliberately outside the native test target's source list.
 // Build/run with tools/check_source.py; no OpenCV, GPU SDK or Triton dependency.
 #include "compile_protocol.hpp"
@@ -18,6 +19,7 @@
 #include <sys/prctl.h>
 #endif
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 namespace
 {
@@ -51,6 +53,19 @@ try
     key.constexprs = {{"CN", 3}};
     key.cfg = {1, 256, 4, 3, 0};
     key.toolchain.source_sha256 = sha256_hex("source");
+    // Existing canonical format is the reference; cover extrema and ordering.
+    for (long value : {LONG_MIN, -100000L, -1L, 0L, 1L, 100000L, LONG_MAX})
+    {
+        KernelKey k = key;
+        k.constexprs = {{"A", value}, {"B", 4}};
+        k.target = {"cuda", 90, 32};
+        std::ostringstream expected;
+        expected << "kernel=" << k.kernel << ";sig=" << k.signature << ";cx=A=" << value
+                 << ",B=4;nw=" << k.cfg.num_warps << ";ns=" << k.cfg.num_stages
+                 << ";target=cuda:90:32;compiler=" << k.toolchain.compiler
+                 << ";source=" << k.toolchain.source_sha256;
+        require(k.text() == expected.str(), "canonical integer key format unchanged");
+    }
     const std::string text = key.text();
     const std::string request = make_request(key, "/source.py", argv[2]);
     require(json_parse(request, value, why), "request JSON");
