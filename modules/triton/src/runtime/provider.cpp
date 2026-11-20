@@ -440,6 +440,15 @@ LaunchConfig default_config(const Normalized &n, const Target *target)
             }
         }
     }
+    // Reuse horizontal cubic rows for large gfx936 C4 enlargements.
+    if (target && target->backend == "hip" && target->arch == 936 &&
+        look.kind == ref::ROUTE_CUBIC && n.channels == 4 && n.inv_y > 1.0 && n.inv_x >= 1.0 &&
+        n.dst_h >= 64 && n.dst_w >= 256 && static_cast<long long>(n.dst_h) * n.dst_w >= 65536)
+    {
+        cfg.block_h = f32 ? 4 : 8;
+        cfg.block_w = 1024;
+        cfg.num_warps = 4;
+    }
     // Shrink BLOCK_H, then BLOCK_W, until the launch has at least
     // DISPATCH_MIN_PROGRAMS programs (or neither can shrink). It counts programs on
     // dst_w for axis 1 whatever the route; that only errs on the small side for C3/C4

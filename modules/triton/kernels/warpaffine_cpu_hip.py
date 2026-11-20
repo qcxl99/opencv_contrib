@@ -15,7 +15,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 
-# HIP/AMDGCN replacements for missing libdevice primitives: add_rn, mul_rn, sub_rn, rint.
+# HIP/AMDGCN replacements for missing libdevice primitives: add_rn, mul_rn, sub_rn, rint, float2int_rn.
 # Explicit vector arithmetic preserves separate add/multiply/subtract operations.
 # v_rndne_f32 rounds to the nearest even integer.
 
@@ -40,6 +40,14 @@ def _triton_sub_rn(a, b):
 @triton.jit
 def _triton_rint(a):
     return tl.inline_asm_elementwise("v_rndne_f32 $0, $1", "=v,v", [a], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _triton_float2int_rn(a):
+    # The packed byte interpolation range is finite and inside [0, 255].
+    rounded = tl.inline_asm_elementwise("v_rndne_f32 $0, $1", "=v,v", [a],
+                                        dtype=tl.float32, is_pure=True, pack=1)
+    return rounded.to(tl.int32)
 
 
 
@@ -530,6 +538,855 @@ def _warp_linear_packed4(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, d
         # Replicate interpolation combines bytes with weights in [0, 1].
         # Even the float32 rounding error is far below half a byte level,
         # so round-to-even already produces [0, 255]; integer clipping is redundant.
-        value = libdevice.float2int_rn(value).to(tl.uint32)
+        value = _triton_float2int_rn(value).to(tl.uint32)
         packed = packed | (value << shift)
     tl.store(dst32 + ys.to(tl.int64) * (dst_rs // 4) + xs, packed, mask=m)
+
+
+# HIP channel-contiguous linear interpolation.
+@triton.jit
+def _warp_linear_hip_channels(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                 src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                 cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
+                 BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                 BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr, FUSED: tl.constexpr,
+                 BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    ys = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)[:, None, None]
+    xs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)[None, :, None]
+    m = (ys < dst_h) & (xs < dst_w)
+
+    # static_cast<float>(y*M1 + M2): OpenCV's M[] is FLOAT, so the row term is
+    # float arithmetic rounded twice (multiply, add). Computing it in double and
+    # narrowing once moves the result by an ulp on ties, which a 0.5 tie turns
+    # into a whole output level.
+    yf = ys.to(tl.float32)
+    # mul_rn/add_rn rather than `a*b + c`: the compiler would contract that into
+    # one fma, and a single rounding here moves the row term by an ulp, which a
+    # 0.5 tie in the interpolation turns into a whole output level.
+    row_x = _triton_add_rn(_triton_mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
+    row_y = _triton_add_rn(_triton_mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
+    xf = xs.to(tl.float32)
+    sx, sy = _mapped_coord(xf, M00, M10, row_x, row_y, FUSED)
+
+    fx = tl.floor(sx)
+    fy = tl.floor(sy)
+    ax = sx - fx
+    ay = sy - fy
+    ix = fx.to(tl.int32)
+    iy = fy.to(tl.int32)
+    ix1 = ix + 1
+    iy1 = iy + 1
+
+    if BORDER == 0 or TRANSPARENT:
+        # whole neighbourhood outside -> border value; otherwise each tap that is
+        # outside alone takes the border value (CV_WARP_SCALAR_FETCH_PIXEL). TRANSPARENT uses the
+        # same in-range flags, but substitutes the OLD DESTINATION PIXEL for an out-of-range tap
+        # and leaves the weights unchanged (see the lstore comment below).
+        outside = (ix >= src_w) | (ix1 < 0) | (iy >= src_h) | (iy1 < 0)
+        in0 = (ix >= 0) & (ix < src_w)
+        in1 = (ix1 >= 0) & (ix1 < src_w)
+        jy0 = (iy >= 0) & (iy < src_h)
+        jy1 = (iy1 >= 0) & (iy1 < src_h)
+    else:
+        outside = m & False
+        in0 = m
+        in1 = m
+        jy0 = m
+        jy1 = m
+
+    hw = src_rs
+    tl.static_assert((cn == 3 or cn == 4) and BORDER >= 0 and BORDER <= 5)
+    c = tl.arange(0, 4)[None, None, :]
+    m = m & (c < cn)
+    if BORDER == 0 or TRANSPARENT:
+        bv = tl.where(c == 0, bv0, tl.where(c == 1, bv1, tl.where(c == 2, bv2, bv3)))
+        # `other` must have the pointer's element type; the border component is fp32.
+        bvs = bv.to(src.dtype.element_ty)
+        if TRANSPARENT:
+            # Out-of-range taps take the destination pixel's CURRENT value, not a constant.
+            bvs = tl.load(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c,
+                          mask=m, other=0)
+        p00 = tl.load(src + iy.to(tl.int64) * hw + ix.to(tl.int64) * cn + c,
+                      mask=m & in0 & jy0, other=bvs)
+        p01 = tl.load(src + iy.to(tl.int64) * hw + ix1.to(tl.int64) * cn + c,
+                      mask=m & in1 & jy0, other=bvs)
+        p10 = tl.load(src + iy1.to(tl.int64) * hw + ix.to(tl.int64) * cn + c,
+                      mask=m & in0 & jy1, other=bvs)
+        p11 = tl.load(src + iy1.to(tl.int64) * hw + ix1.to(tl.int64) * cn + c,
+                      mask=m & in1 & jy1, other=bvs)
+    else:
+        cx0 = _bm(ix, src_w, BORDER_X)
+        cx1 = _bm(ix1, src_w, BORDER_X)
+        cy0 = _bm(iy, src_h, BORDER_Y)
+        cy1 = _bm(iy1, src_h, BORDER_Y)
+        p00 = tl.load(src + cy0.to(tl.int64) * hw + cx0.to(tl.int64) * cn + c, mask=m, other=0)
+        p01 = tl.load(src + cy0.to(tl.int64) * hw + cx1.to(tl.int64) * cn + c, mask=m, other=0)
+        p10 = tl.load(src + cy1.to(tl.int64) * hw + cx0.to(tl.int64) * cn + c, mask=m, other=0)
+        p11 = tl.load(src + cy1.to(tl.int64) * hw + cx1.to(tl.int64) * cn + c, mask=m, other=0)
+
+    if U8 or U16:
+        f = tl.float32
+        p00 = p00.to(f); p01 = p01.to(f); p10 = p10.to(f); p11 = p11.to(f)
+    # v0 = fma(ax, p01 - p00, p00); v1 = fma(ax, p11 - p10, p10); out = fma(ay, v1 - v0, v0)
+    v0 = _fma(ax, p01 - p00, p00, FUSED)
+    v1 = _fma(ax, p11 - p10, p10, FUSED)
+    v = _fma(ay, v1 - v0, v0, FUSED)
+    if U8:
+        v = tl.minimum(tl.maximum(_triton_rint(v), 0.0), 255.0).to(tl.uint8)
+    elif U16:
+        # v_pack_u(v_round(...)) = saturate_cast<ushort>(float): round, clamp, convert
+        v = tl.minimum(tl.maximum(_triton_rint(v), 0.0), 65535.0).to(tl.uint16)
+    if BORDER == 0:
+        bv = tl.where(c == 0, bv0, tl.where(c == 1, bv1, tl.where(c == 2, bv2, bv3)))
+        v = tl.where(outside & m, bv.to(v.dtype), v)
+    # BORDER_TRANSPARENT (LINEAR): each out-of-range tap is replaced by the OLD DESTINATION
+    # pixel with its weight unchanged -- out = sum(w_k*S_k) + (1 - sum(w_k))*dst_old, so the
+    # blend degenerates smoothly to "keep the old value" as the point leaves the image. No
+    # renormalisation and no border value; the pixel is still written unless the whole 2x2
+    # window is outside (ix < -1 || ix >= W || iy < -1 || iy >= H).
+    # The destination must already hold its intended contents.
+    lstore = m & ~outside if TRANSPARENT else m
+    tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, v, mask=lstore)
+
+
+@triton.jit
+def _warp_cubic_hip_channels(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
+                BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr,
+                FUSED: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    """INTER_CUBIC: genericWarp -> bicubicVec/bicubicRef (OpenCV 5.0.0).
+
+    Different family from _warp_linear/_warp_nearest: the column coordinate is
+    M_x + M_xx*x with NO fma, computed from the absolute x, so every block computes a
+    column the same way and the result does not depend on the destination width.
+    The cubic reference therefore does not need destination-width padding.
+
+    Tap layout: ix0 = floor(sx) - 1, then ix0..ix0+3; sx and sy are clamped in float to
+    [-max(dim,16), 2*max(dim,16)] first, as bicubicCoeffs does, so a wild matrix cannot
+    index unpredictably.
+    """
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    ys = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)[:, None, None]
+    xs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)[None, :, None]
+    m = (ys < dst_h) & (xs < dst_w)
+
+    # M_x = float(y)*M(0,1) + M(0,2): a float multiply then a float add, both rounded.
+    yf = ys.to(tl.float32)
+    row_x = _triton_add_rn(_triton_mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
+    row_y = _triton_add_rn(_triton_mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
+    xf = xs.to(tl.float32)
+    # xbuf[dx] = M_x + M_xx*xf -- NOT fma, and this is what makes CUBIC width-invariant.
+    sx = _triton_add_rn(row_x, _triton_mul_rn(xf, M00.to(tl.float32)))
+    sy = _triton_add_rn(row_y, _triton_mul_rn(xf, M10.to(tl.float32)))
+
+    # bicubicCoeffs' float clamp before the floor: bigwidth = max(size, 16)
+    bigw = tl.maximum(src_w, 16)
+    bigh = tl.maximum(src_h, 16)
+    sx = tl.minimum(tl.maximum(sx, -bigw.to(tl.float32)), (2 * bigw).to(tl.float32))
+    sy = tl.minimum(tl.maximum(sy, -bigh.to(tl.float32)), (2 * bigh).to(tl.float32))
+
+    fx = tl.floor(sx)
+    fy = tl.floor(sy)
+    ax = _triton_sub_rn(sx, fx)
+    ay = _triton_sub_rn(sy, fy)
+    ix0 = fx.to(tl.int32) - 1
+    iy0 = fy.to(tl.int32) - 1
+    wx0, wx1, wx2, wx3 = _bicubic_weights_t(ax, FUSED)
+    wy0, wy1, wy2, wy3 = _bicubic_weights_t(ay, FUSED)
+
+    # all_outliers: the whole 4-tap window is outside, i.e. floor(sx)-1+3 < 0 or >= width, which
+    # with ix0 = floor(sx)-1 is ix0+3 < 0 or ix0 >= width. The upper half is `ix0 + 4 >= width + 4`
+    # (same thing); the lower half must be `ix0 + 3 < 0`, NOT `ix0 + 4 < 0` -- the latter is one
+    # pixel too strict and leaves a column/row of pixels written that the CPU leaves untouched
+    # (warp_kernels.simd.hpp bicubicCoeffs: `(unsigned)(ix0+4) >= (unsigned)(width+4)` compared
+    # against the window origin, and the TRANSPARENT skip is `code == -1`).
+    all_out = ((ix0 + 4 >= src_w + 4) | (ix0 + 3 < 0) |
+               (iy0 + 4 >= src_h + 4) | (iy0 + 3 < 0))
+
+    wx = (wx0, wx1, wx2, wx3)
+    wy = (wy0, wy1, wy2, wy3)
+
+    tl.static_assert((cn == 3 or cn == 4) and BORDER >= 0 and BORDER <= 5)
+    c = tl.arange(0, 4)[None, None, :]
+    m = m & (c < cn)
+    acc = tl.zeros((BLOCK_H, BLOCK_W, 4), dtype=tl.float32)
+    for r in tl.static_range(4):
+        wy_r = wy[r]
+        ry = iy0 + r
+        rowsum = tl.zeros((BLOCK_H, BLOCK_W, 4), dtype=tl.float32)
+        for k in tl.static_range(4):
+            xx = ix0 + k
+            if BORDER == 0 or TRANSPARENT:
+                ok = (xx >= 0) & (xx < src_w) & (ry >= 0) & (ry < src_h)
+                cx = tl.minimum(tl.maximum(xx, 0), src_w - 1)
+                cy = tl.minimum(tl.maximum(ry, 0), src_h - 1)
+            else:
+                cx = _bm(xx, src_w, BORDER_X)
+                cy = _bm(ry, src_h, BORDER_Y)
+                ok = m
+            idx = (cy.to(tl.int64) * src_rs + cx.to(tl.int64) * cn + c)
+            if BORDER == 0 or TRANSPARENT:
+                bv = tl.where(c == 0, bv0, tl.where(c == 1, bv1, tl.where(c == 2, bv2, bv3)))
+                bvs = bv.to(src.dtype.element_ty)
+                if TRANSPARENT:
+                    # BORDER_TRANSPARENT (CUBIC): an out-of-range tap is the OLD DESTINATION
+                    # pixel with unchanged weights, as in the LINEAR blend. The result is
+                    # written unless the whole 4x4 window is outside.
+                    bvs = tl.load(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c,
+                                  mask=m, other=0)
+                v = tl.load(src + idx, mask=m & ok, other=bvs)
+            else:
+                v = tl.load(src + idx, mask=m, other=0)
+            if U8 or U16:
+                v = v.to(tl.float32)
+            # BICUBIC_UPDATE_ACC_VEC: rowsum = fma(v, wx, rowsum)
+            rowsum = _fma(v, wx[k], rowsum, FUSED)
+        acc = _fma(rowsum, wy_r, acc, FUSED)
+    if BORDER == 0:
+        bv = tl.where(c == 0, bv0, tl.where(c == 1, bv1, tl.where(c == 2, bv2, bv3)))
+        acc = tl.where(m & all_out, bv.to(tl.float32), acc)
+    if U8:
+        out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 255.0).to(tl.uint8)
+    elif U16:
+        out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 65535.0).to(tl.uint16)
+    else:
+        out = acc
+    cstore = m & ~all_out if TRANSPARENT else m
+    tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, out, mask=cstore)
+
+
+@triton.jit
+def _warp_cubic_i32_hip_channels(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
+                BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr,
+                FUSED: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    """INTER_CUBIC: genericWarp -> bicubicVec/bicubicRef (OpenCV 5.0.0).
+
+    Different family from _warp_linear/_warp_nearest: the column coordinate is
+    M_x + M_xx*x with NO fma, computed from the absolute x, so every block computes a
+    column the same way and the result does not depend on the destination width.
+    The cubic reference therefore does not need destination-width padding.
+
+    Tap layout: ix0 = floor(sx) - 1, then ix0..ix0+3; sx and sy are clamped in float to
+    [-max(dim,16), 2*max(dim,16)] first, as bicubicCoeffs does, so a wild matrix cannot
+    index unpredictably.
+    """
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    ys = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)[:, None, None]
+    xs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)[None, :, None]
+    m = (ys < dst_h) & (xs < dst_w)
+
+    # M_x = float(y)*M(0,1) + M(0,2): a float multiply then a float add, both rounded.
+    yf = ys.to(tl.float32)
+    row_x = _triton_add_rn(_triton_mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
+    row_y = _triton_add_rn(_triton_mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
+    xf = xs.to(tl.float32)
+    # xbuf[dx] = M_x + M_xx*xf -- NOT fma, and this is what makes CUBIC width-invariant.
+    sx = _triton_add_rn(row_x, _triton_mul_rn(xf, M00.to(tl.float32)))
+    sy = _triton_add_rn(row_y, _triton_mul_rn(xf, M10.to(tl.float32)))
+
+    # bicubicCoeffs' float clamp before the floor: bigwidth = max(size, 16)
+    bigw = tl.maximum(src_w, 16)
+    bigh = tl.maximum(src_h, 16)
+    sx = tl.minimum(tl.maximum(sx, -bigw.to(tl.float32)), (2 * bigw).to(tl.float32))
+    sy = tl.minimum(tl.maximum(sy, -bigh.to(tl.float32)), (2 * bigh).to(tl.float32))
+
+    fx = tl.floor(sx)
+    fy = tl.floor(sy)
+    ax = _triton_sub_rn(sx, fx)
+    ay = _triton_sub_rn(sy, fy)
+    ix0 = fx.to(tl.int32) - 1
+    iy0 = fy.to(tl.int32) - 1
+    wx0, wx1, wx2, wx3 = _bicubic_weights_t(ax, FUSED)
+    wy0, wy1, wy2, wy3 = _bicubic_weights_t(ay, FUSED)
+
+    # all_outliers: the whole 4-tap window is outside, i.e. floor(sx)-1+3 < 0 or >= width, which
+    # with ix0 = floor(sx)-1 is ix0+3 < 0 or ix0 >= width. The upper half is `ix0 + 4 >= width + 4`
+    # (same thing); the lower half must be `ix0 + 3 < 0`, NOT `ix0 + 4 < 0` -- the latter is one
+    # pixel too strict and leaves a column/row of pixels written that the CPU leaves untouched
+    # (warp_kernels.simd.hpp bicubicCoeffs: `(unsigned)(ix0+4) >= (unsigned)(width+4)` compared
+    # against the window origin, and the TRANSPARENT skip is `code == -1`).
+    all_out = ((ix0 + 4 >= src_w + 4) | (ix0 + 3 < 0) |
+               (iy0 + 4 >= src_h + 4) | (iy0 + 3 < 0))
+
+    wx = (wx0, wx1, wx2, wx3)
+    wy = (wy0, wy1, wy2, wy3)
+
+    tl.static_assert((cn == 3 or cn == 4) and BORDER >= 0 and BORDER <= 5)
+    c = tl.arange(0, 4)[None, None, :]
+    m = m & (c < cn)
+    acc = tl.zeros((BLOCK_H, BLOCK_W, 4), dtype=tl.float32)
+    for r in tl.static_range(4):
+        wy_r = wy[r]
+        ry = iy0 + r
+        rowsum = tl.zeros((BLOCK_H, BLOCK_W, 4), dtype=tl.float32)
+        for k in tl.static_range(4):
+            xx = ix0 + k
+            if BORDER == 0 or TRANSPARENT:
+                ok = (xx >= 0) & (xx < src_w) & (ry >= 0) & (ry < src_h)
+                cx = tl.minimum(tl.maximum(xx, 0), src_w - 1)
+                cy = tl.minimum(tl.maximum(ry, 0), src_h - 1)
+            else:
+                cx = _bm(xx, src_w, BORDER_X)
+                cy = _bm(ry, src_h, BORDER_Y)
+                ok = m
+            idx = (cy * src_rs + cx * cn + c).to(tl.int64)
+            if BORDER == 0 or TRANSPARENT:
+                bv = tl.where(c == 0, bv0, tl.where(c == 1, bv1, tl.where(c == 2, bv2, bv3)))
+                bvs = bv.to(src.dtype.element_ty)
+                if TRANSPARENT:
+                    # BORDER_TRANSPARENT (CUBIC): an out-of-range tap is the OLD DESTINATION
+                    # pixel with unchanged weights, as in the LINEAR blend. The result is
+                    # written unless the whole 4x4 window is outside.
+                    bvs = tl.load(dst + (ys * dst_rs + xs * cn + c).to(tl.int64),
+                                  mask=m, other=0)
+                v = tl.load(src + idx, mask=m & ok, other=bvs)
+            else:
+                v = tl.load(src + idx, mask=m, other=0)
+            if U8 or U16:
+                v = v.to(tl.float32)
+            # BICUBIC_UPDATE_ACC_VEC: rowsum = fma(v, wx, rowsum)
+            rowsum = _fma(v, wx[k], rowsum, FUSED)
+        acc = _fma(rowsum, wy_r, acc, FUSED)
+    if BORDER == 0:
+        bv = tl.where(c == 0, bv0, tl.where(c == 1, bv1, tl.where(c == 2, bv2, bv3)))
+        acc = tl.where(m & all_out, bv.to(tl.float32), acc)
+    if U8:
+        out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 255.0).to(tl.uint8)
+    elif U16:
+        out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 65535.0).to(tl.uint16)
+    else:
+        out = acc
+    cstore = m & ~all_out if TRANSPARENT else m
+    tl.store(dst + (ys * dst_rs + xs * cn + c).to(tl.int64), out, mask=cstore)
+
+
+@triton.jit
+def _warp_cubic_packed4_u8(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
+                BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr,
+                FUSED: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    """Aligned U8 C4 word access; canonical cubic arithmetic.
+
+    INTER_CUBIC: genericWarp -> bicubicVec/bicubicRef (OpenCV 5.0.0).
+
+    Different family from _warp_linear/_warp_nearest: the column coordinate is
+    M_x + M_xx*x with NO fma, computed from the absolute x, so every block computes a
+    column the same way and the result does not depend on the destination width.
+    The cubic reference therefore does not need destination-width padding.
+
+    Tap layout: ix0 = floor(sx) - 1, then ix0..ix0+3; sx and sy are clamped in float to
+    [-max(dim,16), 2*max(dim,16)] first, as bicubicCoeffs does, so a wild matrix cannot
+    index unpredictably.
+    """
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    ys = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)[:, None]
+    xs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)[None, :]
+    m = (ys < dst_h) & (xs < dst_w)
+
+    # M_x = float(y)*M(0,1) + M(0,2): a float multiply then a float add, both rounded.
+    yf = ys.to(tl.float32)
+    row_x = _triton_add_rn(_triton_mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
+    row_y = _triton_add_rn(_triton_mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
+    xf = xs.to(tl.float32)
+    # xbuf[dx] = M_x + M_xx*xf -- NOT fma, and this is what makes CUBIC width-invariant.
+    sx = _triton_add_rn(row_x, _triton_mul_rn(xf, M00.to(tl.float32)))
+    sy = _triton_add_rn(row_y, _triton_mul_rn(xf, M10.to(tl.float32)))
+
+    # bicubicCoeffs' float clamp before the floor: bigwidth = max(size, 16)
+    bigw = tl.maximum(src_w, 16)
+    bigh = tl.maximum(src_h, 16)
+    sx = tl.minimum(tl.maximum(sx, -bigw.to(tl.float32)), (2 * bigw).to(tl.float32))
+    sy = tl.minimum(tl.maximum(sy, -bigh.to(tl.float32)), (2 * bigh).to(tl.float32))
+
+    fx = tl.floor(sx)
+    fy = tl.floor(sy)
+    ax = _triton_sub_rn(sx, fx)
+    ay = _triton_sub_rn(sy, fy)
+    ix0 = fx.to(tl.int32) - 1
+    iy0 = fy.to(tl.int32) - 1
+    wx0, wx1, wx2, wx3 = _bicubic_weights_t(ax, FUSED)
+    wy0, wy1, wy2, wy3 = _bicubic_weights_t(ay, FUSED)
+
+    # all_outliers: the whole 4-tap window is outside, i.e. floor(sx)-1+3 < 0 or >= width, which
+    # with ix0 = floor(sx)-1 is ix0+3 < 0 or ix0 >= width. The upper half is `ix0 + 4 >= width + 4`
+    # (same thing); the lower half must be `ix0 + 3 < 0`, NOT `ix0 + 4 < 0` -- the latter is one
+    # pixel too strict and leaves a column/row of pixels written that the CPU leaves untouched
+    # (warp_kernels.simd.hpp bicubicCoeffs: `(unsigned)(ix0+4) >= (unsigned)(width+4)` compared
+    # against the window origin, and the TRANSPARENT skip is `code == -1`).
+    all_out = ((ix0 + 4 >= src_w + 4) | (ix0 + 3 < 0) |
+               (iy0 + 4 >= src_h + 4) | (iy0 + 3 < 0))
+
+    wx = (wx0, wx1, wx2, wx3)
+    wy = (wy0, wy1, wy2, wy3)
+
+    tl.static_assert(U8 and not U16 and cn == 4 and BORDER == 1 and not TRANSPARENT)
+    packed = tl.zeros((BLOCK_H, BLOCK_W), tl.uint32)
+    for c in tl.static_range(cn):
+        acc = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+        for r in tl.static_range(4):
+            wy_r = wy[r]
+            ry = iy0 + r
+            rowsum = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+            for k in tl.static_range(4):
+                xx = ix0 + k
+                if BORDER == 0 or TRANSPARENT:
+                    ok = (xx >= 0) & (xx < src_w) & (ry >= 0) & (ry < src_h)
+                    cx = tl.minimum(tl.maximum(xx, 0), src_w - 1)
+                    cy = tl.minimum(tl.maximum(ry, 0), src_h - 1)
+                else:
+                    cx = _bm(xx, src_w, BORDER_X)
+                    cy = _bm(ry, src_h, BORDER_Y)
+                    ok = m
+                idx = cy.to(tl.int64) * (src_rs // 4) + cx.to(tl.int64)
+                if BORDER == 0 or TRANSPARENT:
+                    if c == 0:
+                        bv = bv0
+                    elif c == 1:
+                        bv = bv1
+                    elif c == 2:
+                        bv = bv2
+                    else:
+                        bv = bv3
+                    bvs = bv.to(src.dtype.element_ty)
+                    if TRANSPARENT:
+                        # BORDER_TRANSPARENT (CUBIC): an out-of-range tap is the OLD DESTINATION
+                        # pixel with unchanged weights, as in the LINEAR blend. The result is
+                        # written unless the whole 4x4 window is outside.
+                        bvs = tl.load(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c,
+                                      mask=m, other=0)
+                    v = tl.load(src + idx, mask=m & ok, other=bvs)
+                else:
+                    word = tl.load(src.to(tl.pointer_type(tl.uint32)) + idx, mask=m, other=0)
+                    v = (word >> (8 * c)) & 255
+                if U8 or U16:
+                    v = v.to(tl.float32)
+                # BICUBIC_UPDATE_ACC_VEC: rowsum = fma(v, wx, rowsum)
+                rowsum = _fma(v, wx[k], rowsum, FUSED)
+            acc = _fma(rowsum, wy_r, acc, FUSED)
+        if BORDER == 0:
+            if c == 0:
+                bv = bv0
+            elif c == 1:
+                bv = bv1
+            elif c == 2:
+                bv = bv2
+            else:
+                bv = bv3
+            acc = tl.where(m & all_out, tl.full(acc.shape, bv.to(tl.float32), tl.float32), acc)
+        if U8:
+            out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 255.0).to(tl.uint8)
+        elif U16:
+            out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 65535.0).to(tl.uint16)
+        else:
+            out = acc
+        cstore = m & ~all_out if TRANSPARENT else m
+        packed = packed | (out.to(tl.uint32) << (8 * c))
+    tl.store(dst.to(tl.pointer_type(tl.uint32)) + ys.to(tl.int64) * (dst_rs // 4) + xs.to(tl.int64),
+             packed, mask=m)
+
+
+@triton.jit
+def _warp_cubic_halfpixel(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
+                BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr,
+                FUSED: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    """Host admits unit linear part, matching sizes below 2**23 and exact +/-0.5 shifts.
+    INTER_CUBIC: genericWarp -> bicubicVec/bicubicRef (OpenCV 5.0.0).
+
+    Different family from _warp_linear/_warp_nearest: the column coordinate is
+    M_x + M_xx*x with NO fma, computed from the absolute x, so every block computes a
+    column the same way and the result does not depend on the destination width.
+    The cubic reference therefore does not need destination-width padding.
+
+    Tap layout: ix0 = floor(sx) - 1, then ix0..ix0+3; sx and sy are clamped in float to
+    [-max(dim,16), 2*max(dim,16)] first, as bicubicCoeffs does, so a wild matrix cannot
+    index unpredictably.
+    """
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    ys = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)[:, None]
+    xs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)[None, :]
+    m = (ys < dst_h) & (xs < dst_w)
+
+    # M_x = float(y)*M(0,1) + M(0,2): a float multiply then a float add, both rounded.
+    yf = ys.to(tl.float32)
+    row_x = _triton_add_rn(_triton_mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
+    row_y = _triton_add_rn(_triton_mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
+    xf = xs.to(tl.float32)
+    # xbuf[dx] = M_x + M_xx*xf -- NOT fma, and this is what makes CUBIC width-invariant.
+    sx = _triton_add_rn(row_x, _triton_mul_rn(xf, M00.to(tl.float32)))
+    sy = _triton_add_rn(row_y, _triton_mul_rn(xf, M10.to(tl.float32)))
+
+    # bicubicCoeffs' float clamp before the floor: bigwidth = max(size, 16)
+    bigw = tl.maximum(src_w, 16)
+    bigh = tl.maximum(src_h, 16)
+    sx = tl.minimum(tl.maximum(sx, -bigw.to(tl.float32)), (2 * bigw).to(tl.float32))
+    sy = tl.minimum(tl.maximum(sy, -bigh.to(tl.float32)), (2 * bigh).to(tl.float32))
+
+    fx = tl.floor(sx)
+    fy = tl.floor(sy)
+    ax = _triton_sub_rn(sx, fx)
+    ay = _triton_sub_rn(sy, fy)
+    ix0 = fx.to(tl.int32) - 1
+    iy0 = fy.to(tl.int32) - 1
+    wx0, wx1, wx2, wx3 = -0.09375, 0.59375, 0.59375, -0.09375
+    wy0, wy1, wy2, wy3 = -0.09375, 0.59375, 0.59375, -0.09375
+
+    # all_outliers: the whole 4-tap window is outside, i.e. floor(sx)-1+3 < 0 or >= width, which
+    # with ix0 = floor(sx)-1 is ix0+3 < 0 or ix0 >= width. The upper half is `ix0 + 4 >= width + 4`
+    # (same thing); the lower half must be `ix0 + 3 < 0`, NOT `ix0 + 4 < 0` -- the latter is one
+    # pixel too strict and leaves a column/row of pixels written that the CPU leaves untouched
+    # (warp_kernels.simd.hpp bicubicCoeffs: `(unsigned)(ix0+4) >= (unsigned)(width+4)` compared
+    # against the window origin, and the TRANSPARENT skip is `code == -1`).
+    all_out = ((ix0 + 4 >= src_w + 4) | (ix0 + 3 < 0) |
+               (iy0 + 4 >= src_h + 4) | (iy0 + 3 < 0))
+
+    wx = (wx0, wx1, wx2, wx3)
+    wy = (wy0, wy1, wy2, wy3)
+
+    for c in tl.static_range(cn):
+        acc = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+        for r in tl.static_range(4):
+            wy_r = wy[r]
+            ry = iy0 + r
+            rowsum = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+            for k in tl.static_range(4):
+                xx = ix0 + k
+                if BORDER == 0 or TRANSPARENT:
+                    ok = (xx >= 0) & (xx < src_w) & (ry >= 0) & (ry < src_h)
+                    cx = tl.minimum(tl.maximum(xx, 0), src_w - 1)
+                    cy = tl.minimum(tl.maximum(ry, 0), src_h - 1)
+                else:
+                    cx = _bm(xx, src_w, BORDER_X)
+                    cy = _bm(ry, src_h, BORDER_Y)
+                    ok = m
+                idx = (cy.to(tl.int64) * src_rs + cx.to(tl.int64) * cn + c)
+                if BORDER == 0 or TRANSPARENT:
+                    if c == 0:
+                        bv = bv0
+                    elif c == 1:
+                        bv = bv1
+                    elif c == 2:
+                        bv = bv2
+                    else:
+                        bv = bv3
+                    bvs = bv.to(src.dtype.element_ty)
+                    if TRANSPARENT:
+                        # BORDER_TRANSPARENT (CUBIC): an out-of-range tap is the OLD DESTINATION
+                        # pixel with unchanged weights, as in the LINEAR blend. The result is
+                        # written unless the whole 4x4 window is outside.
+                        bvs = tl.load(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c,
+                                      mask=m, other=0)
+                    v = tl.load(src + idx, mask=m & ok, other=bvs)
+                else:
+                    v = tl.load(src + idx, mask=m, other=0)
+                if U8 or U16:
+                    v = v.to(tl.float32)
+                # BICUBIC_UPDATE_ACC_VEC: rowsum = fma(v, wx, rowsum)
+                rowsum = _fma(v, wx[k], rowsum, FUSED)
+            acc = _fma(rowsum, wy_r, acc, FUSED)
+        if BORDER == 0:
+            if c == 0:
+                bv = bv0
+            elif c == 1:
+                bv = bv1
+            elif c == 2:
+                bv = bv2
+            else:
+                bv = bv3
+            acc = tl.where(m & all_out, tl.full(acc.shape, bv.to(tl.float32), tl.float32), acc)
+        if U8:
+            out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 255.0).to(tl.uint8)
+        elif U16:
+            out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 65535.0).to(tl.uint16)
+        else:
+            out = acc
+        cstore = m & ~all_out if TRANSPARENT else m
+        tl.store(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c, out, mask=cstore)
+
+
+@triton.jit
+def _warp_cubic_i32_hip_channels_halfpixel(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
+                BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr,
+                FUSED: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    """Host admits unit linear part, matching sizes below 2**23 and exact +/-0.5 shifts.
+    INTER_CUBIC: genericWarp -> bicubicVec/bicubicRef (OpenCV 5.0.0).
+
+    Different family from _warp_linear/_warp_nearest: the column coordinate is
+    M_x + M_xx*x with NO fma, computed from the absolute x, so every block computes a
+    column the same way and the result does not depend on the destination width.
+    The cubic reference therefore does not need destination-width padding.
+
+    Tap layout: ix0 = floor(sx) - 1, then ix0..ix0+3; sx and sy are clamped in float to
+    [-max(dim,16), 2*max(dim,16)] first, as bicubicCoeffs does, so a wild matrix cannot
+    index unpredictably.
+    """
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    ys = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)[:, None, None]
+    xs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)[None, :, None]
+    m = (ys < dst_h) & (xs < dst_w)
+
+    # M_x = float(y)*M(0,1) + M(0,2): a float multiply then a float add, both rounded.
+    yf = ys.to(tl.float32)
+    row_x = _triton_add_rn(_triton_mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
+    row_y = _triton_add_rn(_triton_mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
+    xf = xs.to(tl.float32)
+    # xbuf[dx] = M_x + M_xx*xf -- NOT fma, and this is what makes CUBIC width-invariant.
+    sx = _triton_add_rn(row_x, _triton_mul_rn(xf, M00.to(tl.float32)))
+    sy = _triton_add_rn(row_y, _triton_mul_rn(xf, M10.to(tl.float32)))
+
+    # bicubicCoeffs' float clamp before the floor: bigwidth = max(size, 16)
+    bigw = tl.maximum(src_w, 16)
+    bigh = tl.maximum(src_h, 16)
+    sx = tl.minimum(tl.maximum(sx, -bigw.to(tl.float32)), (2 * bigw).to(tl.float32))
+    sy = tl.minimum(tl.maximum(sy, -bigh.to(tl.float32)), (2 * bigh).to(tl.float32))
+
+    fx = tl.floor(sx)
+    fy = tl.floor(sy)
+    ax = _triton_sub_rn(sx, fx)
+    ay = _triton_sub_rn(sy, fy)
+    ix0 = fx.to(tl.int32) - 1
+    iy0 = fy.to(tl.int32) - 1
+    wx0, wx1, wx2, wx3 = -0.09375, 0.59375, 0.59375, -0.09375
+    wy0, wy1, wy2, wy3 = -0.09375, 0.59375, 0.59375, -0.09375
+
+    # all_outliers: the whole 4-tap window is outside, i.e. floor(sx)-1+3 < 0 or >= width, which
+    # with ix0 = floor(sx)-1 is ix0+3 < 0 or ix0 >= width. The upper half is `ix0 + 4 >= width + 4`
+    # (same thing); the lower half must be `ix0 + 3 < 0`, NOT `ix0 + 4 < 0` -- the latter is one
+    # pixel too strict and leaves a column/row of pixels written that the CPU leaves untouched
+    # (warp_kernels.simd.hpp bicubicCoeffs: `(unsigned)(ix0+4) >= (unsigned)(width+4)` compared
+    # against the window origin, and the TRANSPARENT skip is `code == -1`).
+    all_out = ((ix0 + 4 >= src_w + 4) | (ix0 + 3 < 0) |
+               (iy0 + 4 >= src_h + 4) | (iy0 + 3 < 0))
+
+    wx = (wx0, wx1, wx2, wx3)
+    wy = (wy0, wy1, wy2, wy3)
+
+    tl.static_assert((cn == 3 or cn == 4) and BORDER >= 0 and BORDER <= 5)
+    c = tl.arange(0, 4)[None, None, :]
+    m = m & (c < cn)
+    acc = tl.zeros((BLOCK_H, BLOCK_W, 4), dtype=tl.float32)
+    for r in tl.static_range(4):
+        wy_r = wy[r]
+        ry = iy0 + r
+        rowsum = tl.zeros((BLOCK_H, BLOCK_W, 4), dtype=tl.float32)
+        for k in tl.static_range(4):
+            xx = ix0 + k
+            if BORDER == 0 or TRANSPARENT:
+                ok = (xx >= 0) & (xx < src_w) & (ry >= 0) & (ry < src_h)
+                cx = tl.minimum(tl.maximum(xx, 0), src_w - 1)
+                cy = tl.minimum(tl.maximum(ry, 0), src_h - 1)
+            else:
+                cx = _bm(xx, src_w, BORDER_X)
+                cy = _bm(ry, src_h, BORDER_Y)
+                ok = m
+            idx = (cy * src_rs + cx * cn + c).to(tl.int64)
+            if BORDER == 0 or TRANSPARENT:
+                bv = tl.where(c == 0, bv0, tl.where(c == 1, bv1, tl.where(c == 2, bv2, bv3)))
+                bvs = bv.to(src.dtype.element_ty)
+                if TRANSPARENT:
+                    # BORDER_TRANSPARENT (CUBIC): an out-of-range tap is the OLD DESTINATION
+                    # pixel with unchanged weights, as in the LINEAR blend. The result is
+                    # written unless the whole 4x4 window is outside.
+                    bvs = tl.load(dst + (ys * dst_rs + xs * cn + c).to(tl.int64),
+                                  mask=m, other=0)
+                v = tl.load(src + idx, mask=m & ok, other=bvs)
+            else:
+                v = tl.load(src + idx, mask=m, other=0)
+            if U8 or U16:
+                v = v.to(tl.float32)
+            # BICUBIC_UPDATE_ACC_VEC: rowsum = fma(v, wx, rowsum)
+            rowsum = _fma(v, wx[k], rowsum, FUSED)
+        acc = _fma(rowsum, wy_r, acc, FUSED)
+    if BORDER == 0:
+        bv = tl.where(c == 0, bv0, tl.where(c == 1, bv1, tl.where(c == 2, bv2, bv3)))
+        acc = tl.where(m & all_out, bv.to(tl.float32), acc)
+    if U8:
+        out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 255.0).to(tl.uint8)
+    elif U16:
+        out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 65535.0).to(tl.uint16)
+    else:
+        out = acc
+    cstore = m & ~all_out if TRANSPARENT else m
+    tl.store(dst + (ys * dst_rs + xs * cn + c).to(tl.int64), out, mask=cstore)
+
+
+@triton.jit
+def _warp_cubic_packed4_u8_halfpixel(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                cn: tl.constexpr, U8: tl.constexpr, U16: tl.constexpr,
+                BORDER: tl.constexpr, TRANSPARENT: tl.constexpr,
+                BORDER_X: tl.constexpr, BORDER_Y: tl.constexpr,
+                FUSED: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    """Host admits unit linear part, matching sizes below 2**23 and exact +/-0.5 shifts.
+    Aligned U8 C4 word access; canonical cubic arithmetic.
+
+    INTER_CUBIC: genericWarp -> bicubicVec/bicubicRef (OpenCV 5.0.0).
+
+    Different family from _warp_linear/_warp_nearest: the column coordinate is
+    M_x + M_xx*x with NO fma, computed from the absolute x, so every block computes a
+    column the same way and the result does not depend on the destination width.
+    The cubic reference therefore does not need destination-width padding.
+
+    Tap layout: ix0 = floor(sx) - 1, then ix0..ix0+3; sx and sy are clamped in float to
+    [-max(dim,16), 2*max(dim,16)] first, as bicubicCoeffs does, so a wild matrix cannot
+    index unpredictably.
+    """
+    pid_h = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    ys = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)[:, None]
+    xs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)[None, :]
+    m = (ys < dst_h) & (xs < dst_w)
+
+    # M_x = float(y)*M(0,1) + M(0,2): a float multiply then a float add, both rounded.
+    yf = ys.to(tl.float32)
+    row_x = _triton_add_rn(_triton_mul_rn(yf, M01.to(tl.float32)), M02.to(tl.float32))
+    row_y = _triton_add_rn(_triton_mul_rn(yf, M11.to(tl.float32)), M12.to(tl.float32))
+    xf = xs.to(tl.float32)
+    # xbuf[dx] = M_x + M_xx*xf -- NOT fma, and this is what makes CUBIC width-invariant.
+    sx = _triton_add_rn(row_x, _triton_mul_rn(xf, M00.to(tl.float32)))
+    sy = _triton_add_rn(row_y, _triton_mul_rn(xf, M10.to(tl.float32)))
+
+    # bicubicCoeffs' float clamp before the floor: bigwidth = max(size, 16)
+    bigw = tl.maximum(src_w, 16)
+    bigh = tl.maximum(src_h, 16)
+    sx = tl.minimum(tl.maximum(sx, -bigw.to(tl.float32)), (2 * bigw).to(tl.float32))
+    sy = tl.minimum(tl.maximum(sy, -bigh.to(tl.float32)), (2 * bigh).to(tl.float32))
+
+    fx = tl.floor(sx)
+    fy = tl.floor(sy)
+    ax = _triton_sub_rn(sx, fx)
+    ay = _triton_sub_rn(sy, fy)
+    ix0 = fx.to(tl.int32) - 1
+    iy0 = fy.to(tl.int32) - 1
+    wx0, wx1, wx2, wx3 = -0.09375, 0.59375, 0.59375, -0.09375
+    wy0, wy1, wy2, wy3 = -0.09375, 0.59375, 0.59375, -0.09375
+
+    # all_outliers: the whole 4-tap window is outside, i.e. floor(sx)-1+3 < 0 or >= width, which
+    # with ix0 = floor(sx)-1 is ix0+3 < 0 or ix0 >= width. The upper half is `ix0 + 4 >= width + 4`
+    # (same thing); the lower half must be `ix0 + 3 < 0`, NOT `ix0 + 4 < 0` -- the latter is one
+    # pixel too strict and leaves a column/row of pixels written that the CPU leaves untouched
+    # (warp_kernels.simd.hpp bicubicCoeffs: `(unsigned)(ix0+4) >= (unsigned)(width+4)` compared
+    # against the window origin, and the TRANSPARENT skip is `code == -1`).
+    all_out = ((ix0 + 4 >= src_w + 4) | (ix0 + 3 < 0) |
+               (iy0 + 4 >= src_h + 4) | (iy0 + 3 < 0))
+
+    wx = (wx0, wx1, wx2, wx3)
+    wy = (wy0, wy1, wy2, wy3)
+
+    tl.static_assert(U8 and not U16 and cn == 4 and BORDER == 1 and not TRANSPARENT)
+    packed = tl.zeros((BLOCK_H, BLOCK_W), tl.uint32)
+    for c in tl.static_range(cn):
+        acc = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+        for r in tl.static_range(4):
+            wy_r = wy[r]
+            ry = iy0 + r
+            rowsum = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+            for k in tl.static_range(4):
+                xx = ix0 + k
+                if BORDER == 0 or TRANSPARENT:
+                    ok = (xx >= 0) & (xx < src_w) & (ry >= 0) & (ry < src_h)
+                    cx = tl.minimum(tl.maximum(xx, 0), src_w - 1)
+                    cy = tl.minimum(tl.maximum(ry, 0), src_h - 1)
+                else:
+                    cx = _bm(xx, src_w, BORDER_X)
+                    cy = _bm(ry, src_h, BORDER_Y)
+                    ok = m
+                idx = cy.to(tl.int64) * (src_rs // 4) + cx.to(tl.int64)
+                if BORDER == 0 or TRANSPARENT:
+                    if c == 0:
+                        bv = bv0
+                    elif c == 1:
+                        bv = bv1
+                    elif c == 2:
+                        bv = bv2
+                    else:
+                        bv = bv3
+                    bvs = bv.to(src.dtype.element_ty)
+                    if TRANSPARENT:
+                        # BORDER_TRANSPARENT (CUBIC): an out-of-range tap is the OLD DESTINATION
+                        # pixel with unchanged weights, as in the LINEAR blend. The result is
+                        # written unless the whole 4x4 window is outside.
+                        bvs = tl.load(dst + ys.to(tl.int64) * dst_rs + xs.to(tl.int64) * cn + c,
+                                      mask=m, other=0)
+                    v = tl.load(src + idx, mask=m & ok, other=bvs)
+                else:
+                    word = tl.load(src.to(tl.pointer_type(tl.uint32)) + idx, mask=m, other=0)
+                    v = (word >> (8 * c)) & 255
+                if U8 or U16:
+                    v = v.to(tl.float32)
+                # BICUBIC_UPDATE_ACC_VEC: rowsum = fma(v, wx, rowsum)
+                rowsum = _fma(v, wx[k], rowsum, FUSED)
+            acc = _fma(rowsum, wy_r, acc, FUSED)
+        if BORDER == 0:
+            if c == 0:
+                bv = bv0
+            elif c == 1:
+                bv = bv1
+            elif c == 2:
+                bv = bv2
+            else:
+                bv = bv3
+            acc = tl.where(m & all_out, tl.full(acc.shape, bv.to(tl.float32), tl.float32), acc)
+        if U8:
+            out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 255.0).to(tl.uint8)
+        elif U16:
+            out = tl.minimum(tl.maximum(_triton_rint(acc), 0.0), 65535.0).to(tl.uint16)
+        else:
+            out = acc
+        cstore = m & ~all_out if TRANSPARENT else m
+        packed = packed | (out.to(tl.uint32) << (8 * c))
+    tl.store(dst.to(tl.pointer_type(tl.uint32)) + ys.to(tl.int64) * (dst_rs // 4) + xs.to(tl.int64),
+             packed, mask=m)
+
+
+@triton.jit
+def _warp_nearest_packed4_u16(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                          src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                          cn: tl.constexpr, BORDER: tl.constexpr, BORDER_X: tl.constexpr,
+                          BORDER_Y: tl.constexpr, FUSED: tl.constexpr, TRANSPARENT: tl.constexpr,
+                          BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    # The host admits only aligned uint16 C4 views. Reuse the exact nearest
+    # coordinate, border and transparent rules while copying one RGBA word.
+    tl.static_assert(cn == 4)
+    tl.static_assert(BORDER == 1 and not TRANSPARENT)
+    border = 0
+    _warp_nearest(src.to(tl.pointer_type(tl.uint64)), dst.to(tl.pointer_type(tl.uint64)),
+                  M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                  src_rs // 4, dst_rs // 4, border, bv1, bv2, bv3,
+                  cn=1, BORDER=BORDER, BORDER_X=BORDER_X, BORDER_Y=BORDER_Y,
+                  FUSED=FUSED, TRANSPARENT=TRANSPARENT, BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W)
+
+
+@triton.jit
+def _warp_nearest_packed2_f32(src, dst, M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                          src_rs, dst_rs, bv0, bv1, bv2, bv3,
+                          cn: tl.constexpr, BORDER: tl.constexpr, BORDER_X: tl.constexpr,
+                          BORDER_Y: tl.constexpr, FUSED: tl.constexpr, TRANSPARENT: tl.constexpr,
+                          BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    # Replicate-only, aligned float C4: two raw words preserve every pixel bit.
+    tl.static_assert(cn == 4 and BORDER == 1 and not TRANSPARENT)
+    border = 0
+    _warp_nearest(src.to(tl.pointer_type(tl.uint64)), dst.to(tl.pointer_type(tl.uint64)),
+                  M00, M01, M02, M10, M11, M12, src_h, src_w, dst_h, dst_w,
+                  src_rs // 2, dst_rs // 2, border, bv1, bv2, bv3,
+                  cn=2, BORDER=BORDER, BORDER_X=BORDER_X, BORDER_Y=BORDER_Y,
+                  FUSED=FUSED, TRANSPARENT=TRANSPARENT, BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W)

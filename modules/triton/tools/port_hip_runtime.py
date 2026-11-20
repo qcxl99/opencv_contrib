@@ -343,7 +343,14 @@ code_left = [t for t in left if t != "CUDA_VISIBLE_DEVICES" and
 if code_left:
     sys.exit(f"CUDA tokens left in code: {code_left}")
 
-# CUDA preparation remains gated by cuda-jit; HIP retains its own dispatch below.
+# Candidate packed paths keep the same alignment and type admission as CUDA.
+sub('std::string(name()) == "cuda-jit" && !n.u16',
+    'dev.arch == 936 && (spec.code == 0 || spec.code == 4) && !n.u16', 1)
+sub('std::string(name()) == "cuda-jit" && n.u8',
+    'dev.arch == 936 && n.dst_h >= 64 && n.dst_w >= 256 && '
+    'static_cast<long long>(n.dst_h) * n.dst_w >= 65536 && n.u8', 1)
+# Keep HIP interpolation and nearest tiles independent of CUDA defaults.
+
 # HIP colour vectorization keeps the CUDA runtime's generic route unchanged.
 sub('''
     const std::string keyText = key.text();
@@ -371,6 +378,281 @@ sub('''    cv_triton_color::grid(n, key.cfg.block_w, grid);''',
         // A lane covers four complete pixels; row pitches stay independent.
         grid[1] = static_cast<unsigned>((n.cols / 4 + key.cfg.block_w - 1) / key.cfg.block_w);
     }''', 1)
+
+# gfx936 launch defaults preserve explicit schemas and other HIP architectures.
+sub("""    const LaunchShape shape = launch_shape(n, LaunchConfig{}, target, tc, 1, &req.src, &req.dst);""",
+"""    LaunchConfig requested;
+    if (dev.arch == 936 && n.route.kind == ref::ROUTE_CUBIC && n.inv_y > 0.25 &&
+        n.dst_h <= n.src_h && n.dst_w <= n.src_w &&
+        static_cast<long long>(n.dst_h) * n.dst_w >= 65536)
+    {
+        // Reuse coefficients and overlapping rows without starving independent programs.
+        int rows = 16;
+        const auto programs = [&](int height)
+        {
+            return static_cast<long long>((n.dst_h + height - 1) / height) *
+                   ((n.dst_w + 127) / 128);
+        };
+        while (rows > 4 && programs(rows) < DISPATCH_MIN_PROGRAMS)
+            rows /= 2;
+        if (programs(rows) >= DISPATCH_MIN_PROGRAMS)
+        {
+            requested.block_h = rows;
+            requested.block_w = 128;
+            requested.num_warps = 2;
+        }
+    }
+    LaunchShape shape = launch_shape(n, requested, target, tc, 1, &req.src, &req.dst);
+    if (target.arch == 936 && n.route.kind == ref::ROUTE_CUBIC && shape.key.cfg.block_h > 1 &&
+        n.inv_y > 0.25 && n.inv_y < 1.0)
+        shape.key.kernel = "_resize_cpu_sep_reuse_kernel";
+    if (target.arch == 936 && n.route.kind == ref::ROUTE_CUBIC && n.type == ElemType::F32 &&
+        n.inv_y >= 1.0 && (static_cast<long long>(n.dst_w) * n.channels) % 4 == 0)
+        shape.key.kernel = "_resize_cpu_sep_f32_aligned_kernel";""", 1)
+
+sub("""#include "resize_plan.hpp"
+""",
+"""#include "resize_plan.hpp"
+#include "dispatch_table.hpp"
+""", 1)
+
+# All colour constexpr initializers are already in canonical lexical order.
+# Values cannot affect order because names are unique; retain identical key bytes.
+sub("""    std::sort(key.constexprs.begin(), key.constexprs.end());
+
+    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);""",
+"""    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);""", 1)
+
+sub("""    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);""",
+"""    if (dev.arch == 936 && !n.u16 && !n.f32 && n.n >= 65536 && n.cols >= 512 && (spec.code == 10 || spec.code == 82) && !cudaPacked && !packed)
+    {
+        key.cfg.block_w = 512;
+        key.cfg.num_warps = 4;
+        for (auto &constant : key.constexprs)
+            if (constant.first == "BLOCK") constant.second = 512;
+    }
+    if (dev.arch == 936 && spec.code == 10 && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&
+        req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 && req.src.step % 4 == 0 && req.dst.step % 4 == 0)
+    {
+        key.kernel = "_cvtcolor_hip_bgra_gray";
+        key.signature = "src:*u8, dst:*u8, cols:i32, src_rs:i32, dst_rs:i32";
+        key.cfg.block_w = 256;
+        key.cfg.num_warps = 4;
+        key.constexprs = {{"BLOCK", key.cfg.block_w}};
+    }
+    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);""", 1)
+
+sub("""    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);""",
+"""    if (dev.arch == 936 && spec.code == 0 && n.f32 && n.n >= 65536 && n.cols >= 256)
+    {
+        key.kernel = "_cvtcolor_hip_alpha_f32";
+        key.signature = "src:*fp32, dst:*fp32, cols:i32, src_rs:i32, dst_rs:i32";
+        key.cfg.block_w = 256;
+        key.cfg.num_warps = 4;
+        key.constexprs = {{"BLOCK", key.cfg.block_w}};
+    }
+    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);""", 1)
+
+sub("""    if (packed)
+    {
+        // A lane covers four complete pixels; row pitches stay independent.""",
+"""    if (packed || key.kernel == "_cvtcolor_hip_bgra_gray")
+    {
+        // A lane covers four complete pixels; row pitches stay independent.""", 1)
+
+sub("""    const bool packed4 = dev.arch == 936""",
+"""    if (dev.arch == 936 && n.channels == 1 && n.mode == cv_triton_warp::Mode::Cubic &&
+        std::abs(n.A[3]) >= 0.125 && n.border_mode_code == 1 && n.dst_h >= 64 && n.dst_w >= 256 &&
+        static_cast<long long>(n.dst_h) * n.dst_w >= 65536)
+    {
+        n.block_h = 4;
+        n.block_w = 32;
+        n.num_warps = 2;
+    }
+    const bool packed4 = dev.arch == 936""", 1)
+
+sub("""    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""",
+"""    // Modulo borders use channel tiles only where their arithmetic cost is offset
+    // by cubic tap reuse or four-channel float loads.
+    const bool channelBorder = n.border_mode_code == 0 || n.border_mode_code == 5 || n.border_mode_code == 1 ||
+        ((n.border_mode_code >= 2 && n.border_mode_code <= 4) &&
+         ((n.mode == cv_triton_warp::Mode::Cubic && (n.channels == 4 || req.src.type != ElemType::U16)) ||
+          (n.mode == cv_triton_warp::Mode::Linear && n.channels == 4 && req.src.type == ElemType::F32)));
+    if (dev.arch == 936 && (n.channels == 3 || (n.channels == 4 && (!packed4 || n.mode == cv_triton_warp::Mode::Cubic || n.border_mode_code != 1))) &&
+        n.mode != cv_triton_warp::Mode::Nearest && ((n.channels == 4 && n.border_mode_code == 1) || std::abs(n.A[3]) >= 0.125) &&
+        channelBorder && n.dst_w >= 256 && n.dst_h >= 64 &&
+        static_cast<long long>(n.dst_w) * n.dst_h >= 65536)
+    {
+        wkernel = n.mode == cv_triton_warp::Mode::Linear ? "_warp_linear_hip_channels" : "_warp_cubic_hip_channels";
+        // Large float C4 frames benefit from keeping two nearby rows in a program.
+        const bool twoRows = n.border_mode_code == 1 && n.channels == 4 && req.src.type == ElemType::F32 && wmode == cv_triton_warp::Mode::Linear &&
+                             std::abs(n.A[3]) >= 0.125 &&
+                             static_cast<long long>(n.src_h) * n.src_w >= (1LL << 22) &&
+                             static_cast<long long>(n.dst_h) * n.dst_w >= (1LL << 22);
+        n.block_h = twoRows ? 2 : 1;
+        n.block_w = twoRows ? 64 : 128;
+        n.num_warps = 4;
+    }
+    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""", 1)
+
+# The conservative byte bound also bounds every valid element offset.
+sub("#include <list>", "#include <list>\n#include <limits>", 1)
+sub("""    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""",
+"""    const std::size_t offsetLimit = static_cast<std::size_t>(std::numeric_limits<int>::max());
+    if (dev.arch == 936 && n.u16 && n.channels == 4 && n.border_mode_code == 1 &&
+        std::strcmp(wkernel, "_warp_cubic_hip_channels") == 0 &&
+        req.src.step <= offsetLimit / static_cast<std::size_t>(n.src_h) &&
+        req.dst.step <= offsetLimit / static_cast<std::size_t>(n.dst_h))
+        wkernel = "_warp_cubic_i32_hip_channels";
+    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""", 1)
+
+sub("""    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""",
+"""    if (dev.arch == 936 && n.u8 && n.channels == 4 && n.border_mode_code == 1 &&
+        wmode == cv_triton_warp::Mode::Cubic && n.dst_w >= 256 && n.dst_h >= 64 &&
+        static_cast<long long>(n.dst_w) * n.dst_h >= 65536 &&
+        req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 &&
+        req.src.step % 4 == 0 && req.dst.step % 4 == 0 &&
+        (n.A[3] == 0.0 || (static_cast<long long>(n.src_w) * n.src_h < (1LL << 22) &&
+                          static_cast<long long>(n.dst_w) * n.dst_h < (1LL << 22))))
+    {
+        wkernel = "_warp_cubic_packed4_u8";
+        n.block_h = 1;
+        n.block_w = 128;
+        n.num_warps = 2;
+    }
+    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""", 1)
+
+sub("""    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""",
+"""    if (dev.arch == 936 && wmode == cv_triton_warp::Mode::Cubic && n.border_mode_code == 1 &&
+        ((req.src.type == ElemType::F32 && n.channels == 1) ||
+         ((n.u8 || n.u16) && n.channels == 4)) &&
+        n.src_w == n.dst_w && n.src_h == n.dst_h && n.src_w < (1 << 23) && n.src_h < (1 << 23) &&
+        n.dst_w >= 256 && n.dst_h >= 64 && static_cast<long long>(n.dst_w) * n.dst_h >= 65536 &&
+        n.A[0] == 1.0 && n.A[4] == 1.0 && n.A[1] == 0.0 && n.A[3] == 0.0 &&
+        std::abs(n.A[2]) == 0.5 && std::abs(n.A[5]) == 0.5)
+    {
+        if (req.src.type == ElemType::F32 && n.channels == 1)
+            wkernel = "_warp_cubic_halfpixel";
+        else if (std::strcmp(wkernel, "_warp_cubic_i32_hip_channels") == 0)
+            wkernel = "_warp_cubic_i32_hip_channels_halfpixel";
+        else if (std::strcmp(wkernel, "_warp_cubic_packed4_u8") == 0)
+            wkernel = "_warp_cubic_packed4_u8_halfpixel";
+    }
+    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""", 1)
+
+# Exact identity nearest and integer interpolation are image copies. Retain validation and
+# context/capture/cleanup checks before the shortcut, as for resize copy.
+sub("""    // CUDA uses per-mode tiles: interpolation benefits from a""",
+"""    const auto copyAligned = [&](std::size_t alignment)
+    {
+        return req.src.ptr % alignment == 0 && req.dst.ptr % alignment == 0 &&
+            req.src.step % alignment == 0 && req.dst.step % alignment == 0 &&
+            req.src.row_bytes() % alignment == 0;
+    };
+    if (dev.arch == 936 &&
+        (n.mode == cv_triton_warp::Mode::Nearest ||
+         ((n.u8 || n.u16) &&
+          (n.mode == cv_triton_warp::Mode::Linear || n.mode == cv_triton_warp::Mode::Cubic))) &&
+        n.src_w == n.dst_w && n.src_h == n.dst_h &&
+        n.src_w < (1 << 23) && n.src_h < (1 << 23) &&
+        n.dst_w >= 256 && n.dst_h >= 64 &&
+        static_cast<long long>(n.dst_w) * n.dst_h >= (1 << 18) &&
+        n.A[0] == 1 && n.A[1] == 0 && n.A[2] == 0 &&
+        n.A[3] == 0 && n.A[4] == 1 && n.A[5] == 0 &&
+        (copyAligned(16) || (n.u8 && n.channels == 3 && copyAligned(4))))
+    {
+        const hipError_t result = hipMemcpy2DAsync(reinterpret_cast<void*>(req.dst.ptr),
+            req.dst.step, reinterpret_cast<const void*>(req.src.ptr), req.src.step,
+            req.src.row_bytes(), static_cast<std::size_t>(req.src.rows),
+            hipMemcpyDeviceToDevice, stream);
+        if (result != hipSuccess)
+            return error(Reason::LaunchFailed, "identity warp copy: " + hipErr(result));
+        std::lock_guard<std::mutex> lock(s.mu);
+        ++s.st.copies;
+        s.st.last_route = "warp_identity_copy";
+        Status ok;
+        ok.code = Code::Submitted;
+        ok.submitted = true;
+        return ok;
+    }
+    // CUDA uses per-mode tiles: interpolation benefits from a""", 1)
+
+sub("""    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""",
+"""    if (dev.arch == 936 && n.u16 && n.channels == 4 && n.border_mode_code == 1 &&
+        wmode == cv_triton_warp::Mode::Nearest &&
+        req.src.ptr % 8 == 0 && req.dst.ptr % 8 == 0 &&
+        req.src.step % 8 == 0 && req.dst.step % 8 == 0 &&
+        n.dst_w >= 256 && n.dst_h >= 64 && static_cast<long long>(n.dst_w) * n.dst_h >= 65536)
+    {
+        wkernel = "_warp_nearest_packed4_u16";
+        n.block_h = 1;
+        n.block_w = 512;
+        n.num_warps = 4;
+    }
+    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""", 1)
+
+sub("""    const std::string keyText = shape.key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(shape.key, keyText, ctx, gen, st, c.kernels);""",
+"""    std::shared_ptr<TableRes> staticAreaTables;
+    if (dev.arch == 936 && n.route.kind == ref::ROUTE_AREA &&
+        n.type == ElemType::F32 && n.channels == 1)
+    {
+        staticAreaTables = tablesFor(n, ctx, gen, stream, st);
+        if (!staticAreaTables)
+            return st;
+        if (staticAreaTables->kx <= 4 && staticAreaTables->ky <= 4)
+        {
+            shape.key.kernel = "_resize_cpu_area_static_kernel";
+            const std::string dynamicTaps = "KX:i32, KY:i32, ";
+            const auto offset = shape.key.signature.find(dynamicTaps);
+            if (offset == std::string::npos)
+                return error(Reason::LaunchFailed, "static AREA signature missing tap counts");
+            shape.key.signature.erase(offset, dynamicTaps.size());
+            shape.key.constexprs.push_back({"KX", staticAreaTables->kx});
+            shape.key.constexprs.push_back({"KY", staticAreaTables->ky});
+            std::sort(shape.key.constexprs.begin(), shape.key.constexprs.end());
+        }
+    }
+    const std::string keyText = shape.key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(shape.key, keyText, ctx, gen, st, c.kernels);""", 1)
+sub("""    std::shared_ptr<TableRes> tab;
+    if (n.route.kind != ref::ROUTE_AREA_FAST)""",
+"""    std::shared_ptr<TableRes> tab = staticAreaTables;
+    if (!tab && n.route.kind != ref::ROUTE_AREA_FAST)""", 1)
+
+sub("""    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);""",
+"""    if (dev.arch == 936 && n.f32 && n.f32_cpu_separate4 &&
+        (spec.code == 10 || spec.code == 11) && n.n >= 65536 && n.cols >= 256)
+    {
+        key.kernel = "_cvtcolor_hip_gray_f32_c4";
+        key.signature = "src:*fp32, dst:*fp32, cols:i32, src_rs:i32, dst_rs:i32";
+        key.cfg.block_w = 256;
+        key.cfg.num_warps = 4;
+        key.constexprs = {{"BLOCK", key.cfg.block_w}, {"BLUE", spec.blue}};
+    }
+    const std::string keyText = key.text();
+    std::shared_ptr<ModuleRes> mod = moduleFor(key, keyText, ctx, gen, st, c.cvt_kernels);""", 1)
+
+sub("""    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""",
+"""    if (dev.arch == 936 && req.src.type == ElemType::F32 && n.channels == 4 &&
+        n.border_mode_code == 1 && wmode == cv_triton_warp::Mode::Nearest &&
+        std::abs(n.A[3]) >= 0.125 && req.src.ptr % 8 == 0 && req.dst.ptr % 8 == 0 &&
+        req.src.step % 8 == 0 && req.dst.step % 8 == 0 &&
+        n.dst_w >= 256 && n.dst_h >= 64 && static_cast<long long>(n.dst_w) * n.dst_h >= 65536)
+    {
+        wkernel = "_warp_nearest_packed2_f32";
+        n.block_h = 1;
+        n.block_w = 256;
+        n.num_warps = 4;
+    }
+    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""", 1)
 
 dst = HERE / "src/runtime/hip_runtime.cpp"
 if "--check" in sys.argv[1:]:

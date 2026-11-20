@@ -185,7 +185,12 @@ void cvtColor(const DeviceImage &src, const DeviceImage &dst, int code, int devi
     requireDevice(device, "cvtColor");
     validateStream(stream);
     cv_triton_color::Request req;
+#ifdef OPENCV_TRITON_HAVE_HIP_ADAPTER
+    // The source view was validated above in this same call; do not query it twice.
+    req.src = source;
+#else
     req.src = view(src, device);
+#endif
     req.dst = view(dst, device);
     req.code = code;
     detail::cvtColorDevice(req, device, stream);

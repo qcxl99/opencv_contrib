@@ -59,7 +59,9 @@ static void cvtRuntimeChecks(hipStream_t stream)
     };
 
     detail::setPoisonNewTables(true);
-    for (int code : {cv::COLOR_BGR2HSV, cv::COLOR_BGR2Lab, cv::COLOR_BGR2Luv})
+    for (int code : {cv::COLOR_BGR2HSV, cv::COLOR_BGR2Lab, cv::COLOR_BGR2Luv,
+                     cv::COLOR_Lab2BGR, cv::COLOR_Luv2BGR, cv::COLOR_Luv2RGB,
+                     cv::COLOR_Luv2LBGR, cv::COLOR_Luv2LRGB})
     {
         // The runtime clamps a zero limit to one; replace that last table
         // with an unrelated resize plan before requesting a fresh color family.
@@ -76,66 +78,78 @@ static void cvtRuntimeChecks(hipStream_t stream)
         HIPOK(hipStreamSynchronize(stream));
         HIPOK(hipStreamSynchronize(other));
         const auto after = detail::runtimeStats();
+        // Evaluate numerical/guard checks even when a statistics assertion fails.
+        const bool matchesA = outputMatches(outputA, hostA, code);
+        const bool matchesB = outputMatches(outputB, hostB, code);
+        std::printf("  cvtColor code=%d uploads=%llu->%llu waits=%llu->%llu exact+guards=%d/%d\n",
+                    code, static_cast<unsigned long long>(before.table_uploads),
+                    static_cast<unsigned long long>(after.table_uploads),
+                    static_cast<unsigned long long>(before.cross_stream_waits),
+                    static_cast<unsigned long long>(after.cross_stream_waits), matchesA, matchesB);
         report(
             after.table_uploads > before.table_uploads &&
                 after.cross_stream_waits > before.cross_stream_waits &&
-                outputMatches(outputA, hostA, code) && outputMatches(outputB, hostB, code),
+                matchesA && matchesB,
             cv::format("cvtColor code=%d poisoned tables: two streams exact and ROI guards intact",
                        code));
     }
 
-    // Warm both complete table closures on the capture stream. In particular,
-    // Luv forward owns the large 33^3 LUT as well as its small family tables.
-    tr::cvtColor(sourceA.view(), outputA.view(), cv::COLOR_BGR2Luv, 0,
-                 reinterpret_cast<std::uintptr_t>(stream));
-    tr::cvtColor(sourceA.view(), outputB.view(), cv::COLOR_BGR2HSV, 0,
-                 reinterpret_cast<std::uintptr_t>(stream));
-    HIPOK(hipStreamSynchronize(stream));
-    const auto beforeCapture = detail::runtimeStats();
-    HIPOK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
-    tr::cvtColor(sourceA.view(), outputA.view(), cv::COLOR_BGR2Luv, 0,
-                 reinterpret_cast<std::uintptr_t>(stream));
-    tr::cvtColor(sourceA.view(), outputB.view(), cv::COLOR_BGR2HSV, 0,
-                 reinterpret_cast<std::uintptr_t>(stream));
-    HIPOK(hipStreamEndCapture(stream, &restore.graph));
-    HIPOK(hipGraphInstantiate(&restore.executable, restore.graph, nullptr, nullptr, 0));
-    const auto captured = detail::runtimeStats();
+    for (int captureCode : {cv::COLOR_BGR2Luv, cv::COLOR_Luv2BGR, cv::COLOR_Luv2RGB,
+                            cv::COLOR_Luv2LBGR, cv::COLOR_Luv2LRGB})
+    {
+        // Warm complete table closures, including the private inverse-Luv layout.
+        detail::setCacheLimits(64, 256);
+        tr::cvtColor(sourceA.view(), outputA.view(), captureCode, 0,
+                     reinterpret_cast<std::uintptr_t>(stream));
+        tr::cvtColor(sourceA.view(), outputB.view(), cv::COLOR_BGR2HSV, 0,
+                     reinterpret_cast<std::uintptr_t>(stream));
+        HIPOK(hipStreamSynchronize(stream));
+        const auto beforeCapture = detail::runtimeStats();
+        HIPOK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
+        tr::cvtColor(sourceA.view(), outputA.view(), captureCode, 0,
+                     reinterpret_cast<std::uintptr_t>(stream));
+        tr::cvtColor(sourceA.view(), outputB.view(), cv::COLOR_BGR2HSV, 0,
+                     reinterpret_cast<std::uintptr_t>(stream));
+        HIPOK(hipStreamEndCapture(stream, &restore.graph));
+        HIPOK(hipGraphInstantiate(&restore.executable, restore.graph, nullptr, nullptr, 0));
+        const auto captured = detail::runtimeStats();
 
-    // A zero cache limit is clamped to one entry by the runtime. Force a
-    // different resize module/table through that last slot too, so BOTH
-    // captured conversions are genuinely evicted rather than merely shrunk.
-    detail::setCacheLimits(1, 1);
-    tr::resize(sourceB.view(), scratch.view(), {31, 23}, cv::INTER_NEAREST, 0,
-               reinterpret_cast<std::uintptr_t>(stream));
-    HIPOK(hipStreamSynchronize(stream));
-    const auto evicted = detail::runtimeStats();
-    report(
-        captured.capture_launches >= beforeCapture.capture_launches + 2 &&
-            captured.capture_pin_holds > beforeCapture.capture_pin_holds &&
-            evicted.module_evictions >= captured.module_evictions + 2 &&
-            evicted.table_evictions >= captured.table_evictions + 3,
-        "cvtColor captured Luv/HSV modules and table closures pinned through actual LRU eviction");
+        // A zero cache limit is clamped to one entry by the runtime. Force a
+        // different resize module/table through that last slot too, so BOTH
+        // captured conversions are genuinely evicted rather than merely shrunk.
+        detail::setCacheLimits(1, 1);
+        tr::resize(sourceB.view(), scratch.view(), {31, 23}, cv::INTER_NEAREST, 0,
+                   reinterpret_cast<std::uintptr_t>(stream));
+        HIPOK(hipStreamSynchronize(stream));
+        const auto evicted = detail::runtimeStats();
+        report(
+            captured.capture_launches >= beforeCapture.capture_launches + 2 &&
+                captured.capture_pin_holds > beforeCapture.capture_pin_holds &&
+                evicted.module_evictions >= captured.module_evictions + 2 &&
+                evicted.table_evictions >= captured.table_evictions + 3,
+            "cvtColor captured Luv/HSV modules and table closures pinned through actual LRU eviction");
 
-    const cv::Mat changed = randomImage(size, CV_8UC3, 70103);
-    upload(sourceA, changed);
-    HIPOK(hipMemset(outputA.base, fill, outputA.bytes));
-    HIPOK(hipMemset(outputB.base, fill, outputB.bytes));
-    HIPOK(hipGraphLaunch(restore.executable, stream));
-    HIPOK(hipStreamSynchronize(stream));
-    report(
-        outputMatches(outputA, changed, cv::COLOR_BGR2Luv),
-        "captured BGR2Luv replays changed input exactly after LUT/module eviction, ROI guards intact");
-    report(
-        outputMatches(outputB, changed, cv::COLOR_BGR2HSV),
-        "captured BGR2HSV replays changed input exactly after table/module eviction, independent dst guards intact");
+        const cv::Mat changed = randomImage(size, CV_8UC3, 70103 + captureCode);
+        upload(sourceA, changed);
+        HIPOK(hipMemset(outputA.base, fill, outputA.bytes));
+        HIPOK(hipMemset(outputB.base, fill, outputB.bytes));
+        HIPOK(hipGraphLaunch(restore.executable, stream));
+        HIPOK(hipStreamSynchronize(stream));
+        report(
+            outputMatches(outputA, changed, captureCode),
+            cv::format("captured code=%d replays changed input after LUT/module eviction, ROI guards intact", captureCode));
+        report(
+            outputMatches(outputB, changed, cv::COLOR_BGR2HSV),
+            "captured BGR2HSV replays changed input exactly after table/module eviction, independent dst guards intact");
 
-    HIPOK(hipGraphExecDestroy(restore.executable));
-    restore.executable = nullptr;
-    HIPOK(hipGraphDestroy(restore.graph));
-    restore.graph = nullptr;
-    cv::triton::releaseGraphResources();
-    detail::reapCompleted();
-    report(detail::runtimeStats().capture_pin_holds == 0,
-           "public releaseGraphResources drops all cvtColor pins after graph destruction");
+        HIPOK(hipGraphExecDestroy(restore.executable));
+        restore.executable = nullptr;
+        HIPOK(hipGraphDestroy(restore.graph));
+        restore.graph = nullptr;
+        cv::triton::releaseGraphResources();
+        detail::reapCompleted();
+        report(detail::runtimeStats().capture_pin_holds == 0,
+               "public releaseGraphResources drops all cvtColor pins after graph destruction");
+    }
 }
 #endif // OPENCV_TRITON_TEST_HIP_CVT_RUNTIME_HPP

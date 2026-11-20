@@ -941,32 +941,32 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             wg1 = fg
             wb0 = 16 - fb
             wb1 = fb
-            # Steps to the corner one node up on each axis, with the last-node duplication
-            # (fill_one's min(p+_p, 32)) applied: at node 32 the "up" corner IS node 32, so
-            # the step is 0 there and the weight lands on the same value twice -- which is what
-            # the CPU does, and why the clamp is applied to the step rather than the node.
-            s_r = (nr - tr) * 24
-            s_g = (ng - tg) * LUV_LUT_STRIDE
-            s_b = (nb - tb) * LUV_LUT_STRIDE2
             # Channel stride inside a node is 8: L at +0, u at +8, v at +16.
+            # labluvTablesFor packs the internal table at 256-byte alignment.
+            # One node contains 24 int16 values: two words per output channel.
+            words = t16.to(tl.pointer_type(tl.uint64))
+            word_base = px // 4
+            l0 = tl.load(words + word_base, mask=m, other=0)
+            l1 = tl.load(words + word_base + 1, mask=m, other=0)
+            u0 = tl.load(words + word_base + 2, mask=m, other=0)
+            u1 = tl.load(words + word_base + 3, mask=m, other=0)
+            v0 = tl.load(words + word_base + 4, mask=m, other=0)
+            v1 = tl.load(words + word_base + 5, mask=m, other=0)
             accL = tl.zeros((BLOCK,), tl.int32)
             accU = tl.zeros((BLOCK,), tl.int32)
             accV = tl.zeros((BLOCK,), tl.int32)
-            zero = tl.zeros((BLOCK,), tl.int32)
             for i in tl.static_range(8):
-                # i is a Python int at trace time (static_range), so these are Python ints 0/1
-                # and the ternaries below are resolved while tracing -- no dynamic select
-                # reaches the device. The explicit `zero` keeps both arms the same SHAPE: a
-                # scalar 0 mixed with a BLOCK-vector in a ternary is a Triton compile error
-                # ("Ternary expression with dynamic condition has inconsistent types").
                 pr = (i >> 2) & 1
                 qg = (i >> 1) & 1
                 rb = i & 1
-                off = px + (s_r if pr else zero) + (s_g if qg else zero) + (s_b if rb else zero)
                 wgt = (wr1 if pr else wr0) * (wg1 if qg else wg0) * (wb1 if rb else wb0)
-                accL += tl.load(t16 + off, mask=m, other=0) * wgt
-                accU += tl.load(t16 + off + 8, mask=m, other=0) * wgt
-                accV += tl.load(t16 + off + 16, mask=m, other=0) * wgt
+                shift = (i % 4) * 16
+                lv = ((l0 if i < 4 else l1) >> shift).to(tl.int16).to(tl.int32)
+                uv = ((u0 if i < 4 else u1) >> shift).to(tl.int16).to(tl.int32)
+                vv = ((v0 if i < 4 else v1) >> shift).to(tl.int16).to(tl.int32)
+                accL += lv * wgt
+                accU += uv * wgt
+                accV += vv * wgt
             # CV_DESCALE(..., trilinear_shift*3 = 12); the weights sum to 16^3 = 4096, so the
             # descaled value is again on the LUT's 2^14 scale. The CPU then TRUNCATES (v/baseDiv
             # with baseDiv = 64, and v >= 0 by construction), which is `>> 6`, not a rounding.
@@ -983,17 +983,23 @@ def _cvtcolor_cpu_kernel(src, dst, cols, src_rs, dst_rs, sdiv, hdiv, uv_rs, rows
             y = tl.load(t32 + T_YF + LL * 2, mask=m, other=0)
             up = tl.load(t32 + T_LU + LL * 256 + uu, mask=m, other=0)
             vp = tl.load(t32 + T_LV + LL * 256 + vv, mask=m, other=0)
-            vpl = tl.load(t64 + LL * 256 + vv, mask=m, other=0)
+            # CPU initLUTforLUV defines LvToVpl from LvToV * L. The
+            # first product fits int32; widen before the larger constant multiply.
+            vpl = (vp * LL).to(tl.int64) * (12 * 13 * 100 * (BASE // 1024))
             y64 = y.to(tl.int64)
             xv = up.to(tl.int64) * vp.to(tl.int64)
             # C++ integer division and Triton's signed // truncate toward zero.
             # A right shift would floor negative values instead.
-            x = (xv // BASE).to(tl.int32)
-            x = ((y64 * x.to(tl.int64)) // BASE).to(tl.int32)
+            # The first quotient fits int32 for every LuToUp/LvToVp pair.
+            # Since Y is nonnegative, a negative X is clipped to zero at the end.
+            positive_x = tl.maximum(xv, 0).to(tl.uint64)
+            x = (positive_x >> 14).to(tl.uint32)
+            x = ((y.to(tl.uint64) * x.to(tl.uint64)) >> 14).to(tl.int32)
             zp = (vpl - xv * 85) // BASE          # 255/3 == 85 in the CPU (integer division)
             zq = zp - 5 * 255 * BASE
             zm = ((y64 * zq) // BASE).to(tl.int32)
-            z = zm // 256 + zm // 65536
+            positive_z = tl.maximum(zm, 0).to(tl.uint32)
+            z = ((positive_z >> 8) + (positive_z >> 16)).to(tl.int32)
             x = tl.minimum(tl.maximum(x, 0), 2 * BASE)
             z = tl.minimum(tl.maximum(z, 0), 2 * BASE)
             # Destination-slot rows, same as OP_LAB's reverse.
@@ -1082,9 +1088,9 @@ def _cvtcolor_packed4(src, dst, cols, src_rs, dst_rs,
 # of this distribution and at http://opencv.org/license.html.
 # Copyright 2026, The FlagOS Contributors.
 #
-# HIP GPU fast path: convert four aligned uint8 BGR pixels to grayscale per lane.
+# HIP color fast paths with explicit type and layout predicates.
 # The generator appends this fragment to cvtcolor_cpu_hip.py, inheriting its imports.
-# Host predicates check width/alignment; row strides count uint8 elements (bytes).
+# Row strides count elements of each kernel's pointer type.
 
 
 @triton.jit(do_not_specialize=['src', 'dst', 'cols', 'src_rs', 'dst_rs'])
@@ -1105,3 +1111,54 @@ def _cvtcolor_hip_packed(src, dst, cols, src_rs, dst_rs,
     y2 = (((b >> 16) & 255) * 3735 + (b >> 24) * 19235 + (c & 255) * 9798 + 16384) >> 15
     y3 = (((c >> 8) & 255) * 3735 + ((c >> 16) & 255) * 19235 + (c >> 24) * 9798 + 16384) >> 15
     tl.store(d + x, y0 | (y1 << 8) | (y2 << 16) | (y3 << 24), mask)
+
+
+# Four complete BGRA pixels use word loads and one packed grayscale word store.
+@triton.jit(do_not_specialize=['src', 'dst', 'cols', 'src_rs', 'dst_rs'])
+def _cvtcolor_hip_bgra_gray(src, dst, cols, src_rs, dst_rs,
+                           BLOCK: tl.constexpr):
+    """Four aligned BGRA byte pixels per lane, preserving CPU integer gray."""
+    row = tl.program_id(0).to(tl.int64)
+    x = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = x < cols // 4
+    source = (src + row * src_rs).to(tl.pointer_type(tl.uint32))
+    target = (dst + row * dst_rs).to(tl.pointer_type(tl.uint32))
+    result = tl.full((BLOCK,), 0, tl.uint32)
+    for pixel in tl.static_range(4):
+        word = tl.load(source + 4 * x + pixel, mask=mask, other=0)
+        gray = ((word & 255) * 3735 + ((word >> 8) & 255) * 19235 +
+                ((word >> 16) & 255) * 9798 + 16384) >> 15
+        result = result | (gray << (8 * pixel))
+    tl.store(target + x, result, mask=mask)
+
+
+@triton.jit(do_not_specialize=['src', 'dst', 'cols', 'src_rs', 'dst_rs'])
+def _cvtcolor_hip_alpha_f32(src, dst, cols, src_rs, dst_rs, BLOCK: tl.constexpr):
+    """Copy three float channels and append alpha, with adjacent channel lanes."""
+    row = tl.program_id(0).to(tl.int64)
+    x = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)[:, None]
+    channel = tl.arange(0, 4)[None, :]
+    active = x < cols
+    value = tl.load(src + row * src_rs + x * 3 + channel,
+                    mask=active & (channel < 3), other=0.)
+    value = tl.where(channel == 3, 1., value)
+    tl.store(dst + row * dst_rs + x * 4 + channel, value, mask=active)
+
+
+@triton.jit(do_not_specialize=['src', 'dst', 'cols', 'src_rs', 'dst_rs'])
+def _cvtcolor_hip_gray_f32_c4(src, dst, cols, src_rs, dst_rs,
+                             BLOCK: tl.constexpr, BLUE: tl.constexpr):
+    """Load adjacent float channels; preserve identified CPU source-order arithmetic."""
+    tl.static_assert(BLUE == 0 or BLUE == 2)
+    row = tl.program_id(0).to(tl.int64)
+    x = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    channel = tl.arange(0, 4)
+    value = tl.load(src + row * src_rs + x[:, None] * 4 + channel[None, :],
+                    mask=x[:, None] < cols, other=0.)
+    first = tl.gather(value, tl.full((BLOCK, 1), 0, tl.int32), axis=1).reshape((BLOCK,))
+    green = tl.gather(value, tl.full((BLOCK, 1), 1, tl.int32), axis=1).reshape((BLOCK,))
+    third = tl.gather(value, tl.full((BLOCK, 1), 2, tl.int32), axis=1).reshape((BLOCK,))
+    p0 = _triton_mul_rn(first, 0.114 if BLUE == 0 else 0.299)
+    p2 = _triton_mul_rn(third, 0.299 if BLUE == 0 else 0.114)
+    gray = _triton_add_rn(_triton_add_rn(p0, _triton_mul_rn(green, 0.587)), p2)
+    tl.store(dst + row * dst_rs + x, gray, mask=x < cols)

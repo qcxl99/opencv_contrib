@@ -230,14 +230,17 @@ def _resize_cpu_sep_kernel(src, dst, xofs, ax, yofs, by, byf,
                 t1 = _triton_add_rn(_triton_mul_rn(h1.to(tl.float32), bf1), t2)
                 t0 = _triton_add_rn(_triton_mul_rn(h0.to(tl.float32), bf0), t1)
                 vf = tl.minimum(tl.maximum(_triton_rint(t0), 0.0), 255.0).to(tl.int32)
-                # ... scalar tail: FixedPtCast<int, uchar, 22>
-                ib0 = tl.load(by + r * 4)
-                ib1 = tl.load(by + r * 4 + 1)
-                ib2 = tl.load(by + r * 4 + 2)
-                ib3 = tl.load(by + r * 4 + 3)
-                s = h0 * ib0 + h1 * ib1 + h2 * ib2 + h3 * ib3
-                vi = tl.minimum(tl.maximum((s + (1 << 21)) >> 22, 0), 255)
-                out = tl.where(e < (W // 8) * 8, vf, vi).to(tl.uint8)
+                if W % 8 == 0:
+                    out = vf.to(tl.uint8)
+                else:
+                    # ... scalar tail: FixedPtCast<int, uchar, 22>
+                    ib0 = tl.load(by + r * 4)
+                    ib1 = tl.load(by + r * 4 + 1)
+                    ib2 = tl.load(by + r * 4 + 2)
+                    ib3 = tl.load(by + r * 4 + 3)
+                    s = h0 * ib0 + h1 * ib1 + h2 * ib2 + h3 * ib3
+                    vi = tl.minimum(tl.maximum((s + (1 << 21)) >> 22, 0), 255)
+                    out = tl.where(e < (W // 8) * 8, vf, vi).to(tl.uint8)
             else:
                 b0 = tl.load(by + r * 4)
                 b1 = tl.load(by + r * 4 + 1)
@@ -593,6 +596,340 @@ def _resize_cpu_area_kernel(src, dst, xs, xa, xc, ys, ya, yc, KX, KY,
             tl.store(dp + 2, acc2, mask=m)
         if cn > 3:
             tl.store(dp + 3, acc3, mask=m)
+
+
+@triton.jit(do_not_specialize=['src', 'dst', 'xs', 'xa', 'xc', 'ys', 'ya', 'yc', 'dst_h', 'W', 'src_rs', 'dst_rs', 'src_bs', 'dst_bs'])
+def _resize_cpu_area_static_kernel(src, dst, xs, xa, xc, ys, ya, yc, KX: tl.constexpr, KY: tl.constexpr,
+                     dst_h, W, cn: tl.constexpr, src_rs, dst_rs, src_bs, dst_bs,
+                     U8: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    """resizeArea_: h = h + S*alpha over x taps in table order, acc = acc + beta*h over y taps.
+
+    computeResizeAreaTab gives every pixel CONSECUTIVE source columns
+    (xs[k] = xs[0] + k) and one weight for every interior tap; only the first and
+    the last can be partial. So the x table is read once per pixel -- start column,
+    first / interior / last weight -- instead of two loads per tap. The tables follow
+    computeResizeAreaTab's contiguous-tap layout. uint8 input is finite,
+    so a padded tap (weight 0) adds an exact +0.0 and needs no predicate on the sums;
+    float32 can hold inf/NaN (inf * 0 = NaN), so there padded taps stay masked out.
+    """
+    rows = tl.program_id(0) * BLOCK_H + tl.arange(0, BLOCK_H)[:, None]
+    px = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)[None, :]
+    rm = rows < dst_h
+    pm = px < W // cn
+    m = rm & pm
+    b = tl.program_id(2).to(tl.int64)
+    ycnt = tl.load(yc + rows, mask=rm, other=0)
+    xcnt = tl.load(xc + px, mask=pm, other=0)
+    xrow = xa + px * KX
+    x0 = tl.load(xs + px * KX, mask=pm, other=0) * cn
+    a_first = tl.load(xrow, mask=pm, other=0.0)
+    a_mid = tl.load(xrow + 1, mask=pm & (xcnt > 2), other=0.0)
+    a_last = tl.load(xrow + tl.maximum(xcnt - 1, 0), mask=pm, other=0.0)
+    last = xcnt - 1
+    base = src + b * src_bs + x0
+    dp = dst + b * dst_bs + rows.to(tl.int64) * dst_rs + px * cn
+    acc0 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
+    acc2 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
+    acc3 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
+    for ky in tl.static_range(0, KY):
+        ylive = ky < ycnt
+        sy = tl.load(ys + rows * KY + ky, mask=rm, other=0).to(tl.int64)
+        beta = tl.load(ya + rows * KY + ky, mask=rm, other=0.0)
+        rp = base + sy * src_rs
+        h0 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
+        h1 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
+        h2 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
+        h3 = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
+        # Unroll pairs of taps to limit instruction growth for short tap lists.
+        for kx in tl.static_range(0, KX):
+            xlive = kx < xcnt
+            a = tl.where(kx == 0, a_first, tl.where(kx == last, a_last, a_mid))
+            q = rp + kx * cn
+            if U8:
+                lm = m & xlive
+                a = tl.where(xlive, a, 0.0)
+                h0 = _triton_add_rn(h0, _triton_mul_rn(tl.load(q, mask=lm, other=0).to(tl.float32), a))
+                if cn > 1:
+                    h1 = _triton_add_rn(h1, _triton_mul_rn(tl.load(q + 1, mask=lm, other=0).to(tl.float32), a))
+                if cn > 2:
+                    h2 = _triton_add_rn(h2, _triton_mul_rn(tl.load(q + 2, mask=lm, other=0).to(tl.float32), a))
+                if cn > 3:
+                    h3 = _triton_add_rn(h3, _triton_mul_rn(tl.load(q + 3, mask=lm, other=0).to(tl.float32), a))
+            else:
+                lm = m & ylive & xlive
+                h0 = tl.where(lm, _triton_add_rn(h0, _triton_mul_rn(tl.load(q, mask=lm, other=0.0), a)), h0)
+                if cn > 1:
+                    h1 = tl.where(lm, _triton_add_rn(h1, _triton_mul_rn(tl.load(q + 1, mask=lm, other=0.0), a)), h1)
+                if cn > 2:
+                    h2 = tl.where(lm, _triton_add_rn(h2, _triton_mul_rn(tl.load(q + 2, mask=lm, other=0.0), a)), h2)
+                if cn > 3:
+                    h3 = tl.where(lm, _triton_add_rn(h3, _triton_mul_rn(tl.load(q + 3, mask=lm, other=0.0), a)), h3)
+        if U8:
+            acc0 = _triton_add_rn(acc0, _triton_mul_rn(beta, h0))
+            acc1 = _triton_add_rn(acc1, _triton_mul_rn(beta, h1))
+            acc2 = _triton_add_rn(acc2, _triton_mul_rn(beta, h2))
+            acc3 = _triton_add_rn(acc3, _triton_mul_rn(beta, h3))
+        else:
+            acc0 = tl.where(ylive, _triton_add_rn(acc0, _triton_mul_rn(beta, h0)), acc0)
+            acc1 = tl.where(ylive, _triton_add_rn(acc1, _triton_mul_rn(beta, h1)), acc1)
+            acc2 = tl.where(ylive, _triton_add_rn(acc2, _triton_mul_rn(beta, h2)), acc2)
+            acc3 = tl.where(ylive, _triton_add_rn(acc3, _triton_mul_rn(beta, h3)), acc3)
+    if U8:
+        tl.store(dp, tl.minimum(tl.maximum(_triton_rint(acc0), 0.0), 255.0).to(tl.uint8), mask=m)
+        if cn > 1:
+            tl.store(dp + 1, tl.minimum(tl.maximum(_triton_rint(acc1), 0.0), 255.0).to(tl.uint8), mask=m)
+        if cn > 2:
+            tl.store(dp + 2, tl.minimum(tl.maximum(_triton_rint(acc2), 0.0), 255.0).to(tl.uint8), mask=m)
+        if cn > 3:
+            tl.store(dp + 3, tl.minimum(tl.maximum(_triton_rint(acc3), 0.0), 255.0).to(tl.uint8), mask=m)
+    else:
+        tl.store(dp, acc0, mask=m)
+        if cn > 1:
+            tl.store(dp + 1, acc1, mask=m)
+        if cn > 2:
+            tl.store(dp + 2, acc2, mask=m)
+        if cn > 3:
+            tl.store(dp + 3, acc3, mask=m)
+
+
+@triton.jit(do_not_specialize=['src', 'dst', 'xofs', 'ax', 'yofs', 'by', 'byf', 'src_h', 'src_w', 'dst_h', 'W', 'xmax', 'src_rs', 'dst_rs', 'src_bs', 'dst_bs'])
+def _resize_cpu_sep_reuse_kernel(src, dst, xofs, ax, yofs, by, byf,
+                    src_h, src_w, dst_h, W, cn: tl.constexpr, xmax,
+                    src_rs, dst_rs, src_bs, dst_bs,
+                    KSIZE: tl.constexpr, U8: tl.constexpr,
+                    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    """Generic separable path: LINEAR / AREA-upscale emulation (KSIZE=2), CUBIC (KSIZE=4).
+    Row-sliding: see the comment above _resize_cpu_nearest_kernel."""
+    # xofs/yofs are source base indices; CUBIC starts one pixel/row before the base.
+    # ax/by carry fixed-point weights for U8; byf carries floating vertical weights.
+    # r0 is the first destination row of this tile.
+    e = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
+    m = e < W
+    pm = m
+    px = e // cn
+    ch = e - px * cn
+    b = tl.program_id(2).to(tl.int64)
+    sx = tl.load(xofs + px, mask=pm, other=0)
+    base = src + b * src_bs
+    db = dst + b * dst_bs
+    do = e
+    r0 = tl.program_id(0) * BLOCK_H
+    r1 = tl.minimum(r0 + BLOCK_H, dst_h)
+    prev = tl.load(yofs + r0)
+    if KSIZE == 2:
+        a0 = tl.load(ax + px * 2, mask=pm, other=0)
+        a1 = tl.load(ax + px * 2 + 1, mask=pm, other=0)
+        o0 = sx * cn + ch
+        o1 = tl.minimum(sx + 1, src_w - 1) * cn + ch
+        inside = px < xmax
+        h0 = _cpu_hlin(_cpu_row(base, prev, 0, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+        h1 = _cpu_hlin(_cpu_row(base, prev, 1, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+        for r in range(r0, r1):
+            sy = tl.load(yofs + r)
+            if sy != prev:
+                if sy == prev + 1:
+                    h0 = h1
+                    h1 = _cpu_hlin(_cpu_row(base, sy, 1, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+                else:
+                    h0 = _cpu_hlin(_cpu_row(base, sy, 0, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+                    h1 = _cpu_hlin(_cpu_row(base, sy, 1, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+                prev = sy
+            b0 = tl.load(by + r * 2)
+            b1 = tl.load(by + r * 2 + 1)
+            if U8:
+                v = ((((b0 * (h0 >> 4)) >> 16) + ((b1 * (h1 >> 4)) >> 16) + 2) >> 2) & 255
+                out = v.to(tl.uint8)
+            else:
+                out = _triton_add_rn(_triton_mul_rn(h0, b0), _triton_mul_rn(h1, b1))
+            tl.store(db + r.to(tl.int64) * dst_rs + do, out, mask=m)
+    else:
+        c0 = _cpu_tap(sx, -1, src_w, cn) + ch
+        c1 = _cpu_tap(sx, 0, src_w, cn) + ch
+        c2 = _cpu_tap(sx, 1, src_w, cn) + ch
+        c3 = _cpu_tap(sx, 2, src_w, cn) + ch
+        a0 = tl.load(ax + px * 4, mask=pm, other=0)
+        a1 = tl.load(ax + px * 4 + 1, mask=pm, other=0)
+        a2 = tl.load(ax + px * 4 + 2, mask=pm, other=0)
+        a3 = tl.load(ax + px * 4 + 3, mask=pm, other=0)
+        h0 = _cpu_hcub(_cpu_row(base, prev, -1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+        h1 = _cpu_hcub(_cpu_row(base, prev, 0, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+        h2 = _cpu_hcub(_cpu_row(base, prev, 1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+        h3 = _cpu_hcub(_cpu_row(base, prev, 2, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+        for r in range(r0, r1):
+            sy = tl.load(yofs + r)
+            if sy != prev:
+                if sy == prev + 1:
+                    h0 = h1
+                    h1 = h2
+                    h2 = h3
+                    h3 = _cpu_hcub(_cpu_row(base, sy, 2, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                elif sy == prev + 2:
+                    # The new four-row window overlaps the last two cached rows.
+                    h0 = h2
+                    h1 = h3
+                    h2 = _cpu_hcub(_cpu_row(base, sy, 1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                    h3 = _cpu_hcub(_cpu_row(base, sy, 2, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                elif sy == prev + 3:
+                    h0 = h3
+                    h1 = _cpu_hcub(_cpu_row(base, sy, 0, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                    h2 = _cpu_hcub(_cpu_row(base, sy, 1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                    h3 = _cpu_hcub(_cpu_row(base, sy, 2, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                else:
+                    h0 = _cpu_hcub(_cpu_row(base, sy, -1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                    h1 = _cpu_hcub(_cpu_row(base, sy, 0, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                    h2 = _cpu_hcub(_cpu_row(base, sy, 1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                    h3 = _cpu_hcub(_cpu_row(base, sy, 2, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                prev = sy
+            if U8:
+                # SIMD lanes (first (W//8)*8 elements of the row): float path ...
+                bf0 = tl.load(byf + r * 4)
+                bf1 = tl.load(byf + r * 4 + 1)
+                bf2 = tl.load(byf + r * 4 + 2)
+                bf3 = tl.load(byf + r * 4 + 3)
+                t3 = _triton_mul_rn(h3.to(tl.float32), bf3)
+                t2 = _triton_add_rn(_triton_mul_rn(h2.to(tl.float32), bf2), t3)
+                t1 = _triton_add_rn(_triton_mul_rn(h1.to(tl.float32), bf1), t2)
+                t0 = _triton_add_rn(_triton_mul_rn(h0.to(tl.float32), bf0), t1)
+                vf = tl.minimum(tl.maximum(_triton_rint(t0), 0.0), 255.0).to(tl.int32)
+                if W % 8 == 0:
+                    out = vf.to(tl.uint8)
+                else:
+                    # ... scalar tail: FixedPtCast<int, uchar, 22>
+                    ib0 = tl.load(by + r * 4)
+                    ib1 = tl.load(by + r * 4 + 1)
+                    ib2 = tl.load(by + r * 4 + 2)
+                    ib3 = tl.load(by + r * 4 + 3)
+                    s = h0 * ib0 + h1 * ib1 + h2 * ib2 + h3 * ib3
+                    vi = tl.minimum(tl.maximum((s + (1 << 21)) >> 22, 0), 255)
+                    out = tl.where(e < (W // 8) * 8, vf, vi).to(tl.uint8)
+            else:
+                b0 = tl.load(by + r * 4)
+                b1 = tl.load(by + r * 4 + 1)
+                b2 = tl.load(by + r * 4 + 2)
+                b3 = tl.load(by + r * 4 + 3)
+                p0 = _triton_mul_rn(h0, b0)
+                p1 = _triton_mul_rn(h1, b1)
+                p2 = _triton_mul_rn(h2, b2)
+                p3 = _triton_mul_rn(h3, b3)
+                vec = _triton_add_rn(p0, _triton_add_rn(p1, _triton_add_rn(p2, p3)))
+                tail = _triton_add_rn(_triton_add_rn(_triton_add_rn(p0, p1), p2), p3)
+                out = tl.where(e < (W // 4) * 4, vec, tail)
+            tl.store(db + r.to(tl.int64) * dst_rs + do, out, mask=m)
+
+
+@triton.jit(do_not_specialize=['src', 'dst', 'xofs', 'ax', 'yofs', 'by', 'byf', 'src_h', 'src_w', 'dst_h', 'W', 'xmax', 'src_rs', 'dst_rs', 'src_bs', 'dst_bs'])
+def _resize_cpu_sep_f32_aligned_kernel(src, dst, xofs, ax, yofs, by, byf,
+                    src_h, src_w, dst_h, W, cn: tl.constexpr, xmax,
+                    src_rs, dst_rs, src_bs, dst_bs,
+                    KSIZE: tl.constexpr, U8: tl.constexpr,
+                    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr):
+    """Generic separable path: LINEAR / AREA-upscale emulation (KSIZE=2), CUBIC (KSIZE=4).
+    Row-sliding: see the comment above _resize_cpu_nearest_kernel."""
+    tl.static_assert(not U8 and KSIZE == 4)
+    # xofs/yofs are source base indices; CUBIC starts one pixel/row before the base.
+    # ax/by carry fixed-point weights for U8; byf carries floating vertical weights.
+    # r0 is the first destination row of this tile.
+    e = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
+    m = e < W
+    pm = m
+    px = e // cn
+    ch = e - px * cn
+    b = tl.program_id(2).to(tl.int64)
+    sx = tl.load(xofs + px, mask=pm, other=0)
+    base = src + b * src_bs
+    db = dst + b * dst_bs
+    do = e
+    r0 = tl.program_id(0) * BLOCK_H
+    r1 = tl.minimum(r0 + BLOCK_H, dst_h)
+    prev = tl.load(yofs + r0)
+    if KSIZE == 2:
+        a0 = tl.load(ax + px * 2, mask=pm, other=0)
+        a1 = tl.load(ax + px * 2 + 1, mask=pm, other=0)
+        o0 = sx * cn + ch
+        o1 = tl.minimum(sx + 1, src_w - 1) * cn + ch
+        inside = px < xmax
+        h0 = _cpu_hlin(_cpu_row(base, prev, 0, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+        h1 = _cpu_hlin(_cpu_row(base, prev, 1, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+        for r in range(r0, r1):
+            sy = tl.load(yofs + r)
+            if sy != prev:
+                if sy == prev + 1:
+                    h0 = h1
+                    h1 = _cpu_hlin(_cpu_row(base, sy, 1, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+                else:
+                    h0 = _cpu_hlin(_cpu_row(base, sy, 0, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+                    h1 = _cpu_hlin(_cpu_row(base, sy, 1, src_h, src_rs), o0, o1, a0, a1, inside, m, U8)
+                prev = sy
+            b0 = tl.load(by + r * 2)
+            b1 = tl.load(by + r * 2 + 1)
+            if U8:
+                v = ((((b0 * (h0 >> 4)) >> 16) + ((b1 * (h1 >> 4)) >> 16) + 2) >> 2) & 255
+                out = v.to(tl.uint8)
+            else:
+                out = _triton_add_rn(_triton_mul_rn(h0, b0), _triton_mul_rn(h1, b1))
+            tl.store(db + r.to(tl.int64) * dst_rs + do, out, mask=m)
+    else:
+        c0 = _cpu_tap(sx, -1, src_w, cn) + ch
+        c1 = _cpu_tap(sx, 0, src_w, cn) + ch
+        c2 = _cpu_tap(sx, 1, src_w, cn) + ch
+        c3 = _cpu_tap(sx, 2, src_w, cn) + ch
+        a0 = tl.load(ax + px * 4, mask=pm, other=0)
+        a1 = tl.load(ax + px * 4 + 1, mask=pm, other=0)
+        a2 = tl.load(ax + px * 4 + 2, mask=pm, other=0)
+        a3 = tl.load(ax + px * 4 + 3, mask=pm, other=0)
+        h0 = _cpu_hcub(_cpu_row(base, prev, -1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+        h1 = _cpu_hcub(_cpu_row(base, prev, 0, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+        h2 = _cpu_hcub(_cpu_row(base, prev, 1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+        h3 = _cpu_hcub(_cpu_row(base, prev, 2, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+        for r in range(r0, r1):
+            sy = tl.load(yofs + r)
+            if sy != prev:
+                if sy == prev + 1:
+                    h0 = h1
+                    h1 = h2
+                    h2 = h3
+                    h3 = _cpu_hcub(_cpu_row(base, sy, 2, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                else:
+                    h0 = _cpu_hcub(_cpu_row(base, sy, -1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                    h1 = _cpu_hcub(_cpu_row(base, sy, 0, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                    h2 = _cpu_hcub(_cpu_row(base, sy, 1, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                    h3 = _cpu_hcub(_cpu_row(base, sy, 2, src_h, src_rs), c0, c1, c2, c3, a0, a1, a2, a3, m, U8)
+                prev = sy
+            if U8:
+                # SIMD lanes (first (W//8)*8 elements of the row): float path ...
+                bf0 = tl.load(byf + r * 4)
+                bf1 = tl.load(byf + r * 4 + 1)
+                bf2 = tl.load(byf + r * 4 + 2)
+                bf3 = tl.load(byf + r * 4 + 3)
+                t3 = _triton_mul_rn(h3.to(tl.float32), bf3)
+                t2 = _triton_add_rn(_triton_mul_rn(h2.to(tl.float32), bf2), t3)
+                t1 = _triton_add_rn(_triton_mul_rn(h1.to(tl.float32), bf1), t2)
+                t0 = _triton_add_rn(_triton_mul_rn(h0.to(tl.float32), bf0), t1)
+                vf = tl.minimum(tl.maximum(_triton_rint(t0), 0.0), 255.0).to(tl.int32)
+                if W % 8 == 0:
+                    out = vf.to(tl.uint8)
+                else:
+                    # ... scalar tail: FixedPtCast<int, uchar, 22>
+                    ib0 = tl.load(by + r * 4)
+                    ib1 = tl.load(by + r * 4 + 1)
+                    ib2 = tl.load(by + r * 4 + 2)
+                    ib3 = tl.load(by + r * 4 + 3)
+                    s = h0 * ib0 + h1 * ib1 + h2 * ib2 + h3 * ib3
+                    vi = tl.minimum(tl.maximum((s + (1 << 21)) >> 22, 0), 255)
+                    out = tl.where(e < (W // 8) * 8, vf, vi).to(tl.uint8)
+            else:
+                b0 = tl.load(by + r * 4)
+                b1 = tl.load(by + r * 4 + 1)
+                b2 = tl.load(by + r * 4 + 2)
+                b3 = tl.load(by + r * 4 + 3)
+                p0 = _triton_mul_rn(h0, b0)
+                p1 = _triton_mul_rn(h1, b1)
+                p2 = _triton_mul_rn(h2, b2)
+                p3 = _triton_mul_rn(h3, b3)
+                vec = _triton_add_rn(p0, _triton_add_rn(p1, _triton_add_rn(p2, p3)))
+                out = vec
+            tl.store(db + r.to(tl.int64) * dst_rs + do, out, mask=m)
 
 
 # HIP-specific complete-window area kernels.
