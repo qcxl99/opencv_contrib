@@ -654,6 +654,25 @@ sub("""    const char *wroute = wmode == cv_triton_warp::Mode::Nearest""",
     }
     const char *wroute = wmode == cv_triton_warp::Mode::Nearest""", 1)
 
+# Reuse validated aligned packing on gfx1100 and retain the generic
+# linear warp dispatcher for transforms with small cross-row motion.
+sub('    const bool cudaPacked = dev.arch == 936 && (spec.code == 0 || spec.code == 4) && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&\n',
+    '    const bool cudaPacked = (dev.arch == 936 || dev.arch == 1100) && (spec.code == 0 || spec.code == 4) && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&\n', 1)
+sub('    const bool packed = dev.arch == 936 && !n.u16 && !n.f32 && n.cols >= 1024 && n.cols % 4 == 0 &&\n',
+    '    const bool packed = (dev.arch == 936 || dev.arch == 1100) && !n.u16 && !n.f32 && n.cols >= 1024 && n.cols % 4 == 0 &&\n', 1)
+sub('    if (dev.arch == 936 && spec.code == 10 && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&\n',
+    '    if ((dev.arch == 936 || dev.arch == 1100) && spec.code == 10 && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&\n', 1)
+sub('    const bool packed4 = dev.arch == 936 && n.dst_h >= 64 && n.dst_w >= 256 && static_cast<long long>(n.dst_h) * n.dst_w >= 65536 && n.u8 && n.channels == 4 &&\n',
+    '    // gfx1100 needs cross-row source reuse to benefit from linear packing.\n    const bool gfx1100LinearFallback = dev.arch == 1100 &&\n        n.mode == cv_triton_warp::Mode::Linear && std::abs(n.A[3]) < 0.125;\n    const bool packed4 = (dev.arch == 936 || dev.arch == 1100) && !gfx1100LinearFallback && n.dst_h >= 64 && n.dst_w >= 256 && static_cast<long long>(n.dst_h) * n.dst_w >= 65536 && n.u8 && n.channels == 4 &&\n', 1)
+sub('    if (dev.arch == 936 && n.u8 && n.channels == 4 && n.border_mode_code == 1 &&\n',
+    '    if ((dev.arch == 936 || dev.arch == 1100) && n.u8 && n.channels == 4 && n.border_mode_code == 1 &&\n', 1)
+sub('    if (dev.arch == 936 && wmode == cv_triton_warp::Mode::Cubic && n.border_mode_code == 1 &&\n',
+    '    if ((dev.arch == 936 || (dev.arch == 1100 && std::strcmp(wkernel, "_warp_cubic_packed4_u8") == 0)) &&\n        wmode == cv_triton_warp::Mode::Cubic && n.border_mode_code == 1 &&\n', 1)
+sub('    if (dev.arch == 936 && n.u16 && n.channels == 4 && n.border_mode_code == 1 &&\n        wmode == cv_triton_warp::Mode::Nearest &&\n',
+    '    if ((dev.arch == 936 || dev.arch == 1100) && n.u16 && n.channels == 4 && n.border_mode_code == 1 &&\n        wmode == cv_triton_warp::Mode::Nearest &&\n', 1)
+sub('    if (dev.arch == 936 && req.src.type == ElemType::F32 && n.channels == 4 &&\n',
+    '    if ((dev.arch == 936 || dev.arch == 1100) && req.src.type == ElemType::F32 && n.channels == 4 &&\n', 1)
+
 dst = HERE / "src/runtime/hip_runtime.cpp"
 if "--check" in sys.argv[1:]:
     if not dst.is_file() or dst.read_text() != out:

@@ -1731,7 +1731,7 @@ Status cvtColor(const cv_triton_color::Request &req, const ExecContext &ex, std:
     if (!dev.ok) return error(Reason::ToolchainUnavailable, dev.why);
     // The key, built exactly as cvtcolor.cpp describes it. The kernel's constexpr list is
     // spelled out here because KernelKey stores it as name/value pairs.
-    const bool cudaPacked = dev.arch == 936 && (spec.code == 0 || spec.code == 4) && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&
+    const bool cudaPacked = (dev.arch == 936 || dev.arch == 1100) && (spec.code == 0 || spec.code == 4) && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&
                         req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 &&
                         req.src.step % 4 == 0 && req.dst.step % 4 == 0 &&
                         (spec.code == 0 || spec.code == 1 || spec.code == 4 || spec.code == 6);
@@ -1789,7 +1789,7 @@ Status cvtColor(const cv_triton_color::Request &req, const ExecContext &ex, std:
         key.constexprs = {{"BLOCK", key.cfg.block_w}, {"CODE", spec.code}};
     }
 
-    const bool packed = dev.arch == 936 && !n.u16 && !n.f32 && n.cols >= 1024 && n.cols % 4 == 0 &&
+    const bool packed = (dev.arch == 936 || dev.arch == 1100) && !n.u16 && !n.f32 && n.cols >= 1024 && n.cols % 4 == 0 &&
         req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 &&
         req.src.step % 4 == 0 && req.dst.step % 4 == 0 &&
         spec.code == 6 && n.n >= (1LL << 19);
@@ -1808,7 +1808,7 @@ Status cvtColor(const cv_triton_color::Request &req, const ExecContext &ex, std:
         for (auto &constant : key.constexprs)
             if (constant.first == "BLOCK") constant.second = 512;
     }
-    if (dev.arch == 936 && spec.code == 10 && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&
+    if ((dev.arch == 936 || dev.arch == 1100) && spec.code == 10 && !n.u16 && !n.f32 && n.n >= 65536 && n.cols % 4 == 0 &&
         req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 && req.src.step % 4 == 0 && req.dst.step % 4 == 0)
     {
         key.kernel = "_cvtcolor_hip_bgra_gray";
@@ -2030,7 +2030,10 @@ Status warpAffine(const cv_triton_warp::Request &req, const ExecContext &ex)
         n.block_w = 32;
         n.num_warps = 2;
     }
-    const bool packed4 = dev.arch == 936 && n.dst_h >= 64 && n.dst_w >= 256 && static_cast<long long>(n.dst_h) * n.dst_w >= 65536 && n.u8 && n.channels == 4 &&
+    // gfx1100 needs cross-row source reuse to benefit from linear packing.
+    const bool gfx1100LinearFallback = dev.arch == 1100 &&
+        n.mode == cv_triton_warp::Mode::Linear && std::abs(n.A[3]) < 0.125;
+    const bool packed4 = (dev.arch == 936 || dev.arch == 1100) && !gfx1100LinearFallback && n.dst_h >= 64 && n.dst_w >= 256 && static_cast<long long>(n.dst_h) * n.dst_w >= 65536 && n.u8 && n.channels == 4 &&
                          req.src.ptr % 4 == 0 &&
                          req.dst.ptr % 4 == 0 && req.src.step % 4 == 0 && req.dst.step % 4 == 0;
     if (packed4 && n.border_mode_code == 1 &&
@@ -2079,7 +2082,7 @@ Status warpAffine(const cv_triton_warp::Request &req, const ExecContext &ex)
         req.src.step <= offsetLimit / static_cast<std::size_t>(n.src_h) &&
         req.dst.step <= offsetLimit / static_cast<std::size_t>(n.dst_h))
         wkernel = "_warp_cubic_i32_hip_channels";
-    if (dev.arch == 936 && n.u8 && n.channels == 4 && n.border_mode_code == 1 &&
+    if ((dev.arch == 936 || dev.arch == 1100) && n.u8 && n.channels == 4 && n.border_mode_code == 1 &&
         wmode == cv_triton_warp::Mode::Cubic && n.dst_w >= 256 && n.dst_h >= 64 &&
         static_cast<long long>(n.dst_w) * n.dst_h >= 65536 &&
         req.src.ptr % 4 == 0 && req.dst.ptr % 4 == 0 &&
@@ -2092,7 +2095,8 @@ Status warpAffine(const cv_triton_warp::Request &req, const ExecContext &ex)
         n.block_w = 128;
         n.num_warps = 2;
     }
-    if (dev.arch == 936 && wmode == cv_triton_warp::Mode::Cubic && n.border_mode_code == 1 &&
+    if ((dev.arch == 936 || (dev.arch == 1100 && std::strcmp(wkernel, "_warp_cubic_packed4_u8") == 0)) &&
+        wmode == cv_triton_warp::Mode::Cubic && n.border_mode_code == 1 &&
         ((req.src.type == ElemType::F32 && n.channels == 1) ||
          ((n.u8 || n.u16) && n.channels == 4)) &&
         n.src_w == n.dst_w && n.src_h == n.dst_h && n.src_w < (1 << 23) && n.src_h < (1 << 23) &&
@@ -2107,7 +2111,7 @@ Status warpAffine(const cv_triton_warp::Request &req, const ExecContext &ex)
         else if (std::strcmp(wkernel, "_warp_cubic_packed4_u8") == 0)
             wkernel = "_warp_cubic_packed4_u8_halfpixel";
     }
-    if (dev.arch == 936 && n.u16 && n.channels == 4 && n.border_mode_code == 1 &&
+    if ((dev.arch == 936 || dev.arch == 1100) && n.u16 && n.channels == 4 && n.border_mode_code == 1 &&
         wmode == cv_triton_warp::Mode::Nearest &&
         req.src.ptr % 8 == 0 && req.dst.ptr % 8 == 0 &&
         req.src.step % 8 == 0 && req.dst.step % 8 == 0 &&
@@ -2118,7 +2122,7 @@ Status warpAffine(const cv_triton_warp::Request &req, const ExecContext &ex)
         n.block_w = 512;
         n.num_warps = 4;
     }
-    if (dev.arch == 936 && req.src.type == ElemType::F32 && n.channels == 4 &&
+    if ((dev.arch == 936 || dev.arch == 1100) && req.src.type == ElemType::F32 && n.channels == 4 &&
         n.border_mode_code == 1 && wmode == cv_triton_warp::Mode::Nearest &&
         std::abs(n.A[3]) >= 0.125 && req.src.ptr % 8 == 0 && req.dst.ptr % 8 == 0 &&
         req.src.step % 8 == 0 && req.dst.step % 8 == 0 &&
